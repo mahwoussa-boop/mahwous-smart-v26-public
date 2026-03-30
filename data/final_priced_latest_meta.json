@@ -1,0 +1,8 @@
+{
+  "status": "reset",
+  "generated_at_utc": null,
+  "rows": 0,
+  "reason": "manual_reset",
+  "changed_rows": 0,
+  "source_competitors_csv": "data/competitors_latest.csv"
+}
