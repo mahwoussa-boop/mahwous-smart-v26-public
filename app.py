@@ -13,8 +13,10 @@ app.py - نظام التسعير الذكي مهووس v26.0
 ✅ محرك أتمتة ذكي مع قواعد تسعير قابلة للتخصيص (v26.0)
 ✅ لوحة تحكم الأتمتة متصلة بالتنقل (v26.0)
 """
+import copy
 import json
 import os
+import pickle
 import streamlit as st
 import pandas as pd
 import threading
@@ -22,7 +24,11 @@ import time
 import uuid
 from datetime import datetime
 
-from async_scraper import run_scraper_sync
+from async_scraper import (
+    merge_scraper_bg_state,
+    read_scraper_bg_state,
+    run_scraper_sync,
+)
 from sitemap_resolve import resolve_store_to_sitemap_url
 
 try:
@@ -97,6 +103,47 @@ for k, v in _defaults.items():
 _db_hidden = get_hidden_product_keys()
 st.session_state.hidden_products = st.session_state.hidden_products | _db_hidden
 
+# ── نتائج جزئية أثناء الكشط → بطاقات الأقسام (ملف pickle + لقطة JSON) ──
+_LIVE_SNAP_PATH = os.path.join("data", "scrape_live_snapshot.json")
+_LIVE_SESSION_PKL = os.path.join("data", "live_session_results.pkl")
+
+
+def _hydrate_live_session_results_early():
+    """يحمّل نتائج التحليل المترافق إلى session أثناء الكشط حتى تُعرض البطاقات في الأقسام."""
+    if not os.path.isfile(_LIVE_SESSION_PKL) or not os.path.isfile(_LIVE_SNAP_PATH):
+        return
+    try:
+        with open(_LIVE_SNAP_PATH, encoding="utf-8") as f:
+            snap = json.load(f)
+    except Exception:
+        return
+    run_ok = snap.get("running") and not snap.get("done")
+    done_gap = snap.get("done") and snap.get("success") and st.session_state.get("results") is None
+    if not (run_ok or done_gap):
+        return
+    try:
+        with open(_LIVE_SESSION_PKL, "rb") as f:
+            blob = pickle.load(f)
+        st.session_state.results = blob["results"]
+        st.session_state.analysis_df = blob.get("analysis_df")
+        st.session_state.comp_dfs = blob.get("comp_dfs")
+        if blob.get("our_df") is not None:
+            st.session_state.our_df = blob["our_df"]
+    except Exception:
+        pass
+
+
+_hydrate_live_session_results_early()
+
+
+def _clear_live_session_pkl():
+    try:
+        if os.path.isfile(_LIVE_SESSION_PKL):
+            os.remove(_LIVE_SESSION_PKL)
+    except Exception:
+        pass
+
+
 # ════════════════════════════════════════════════
 #  دوال المعالجة — يجب تعريفها قبل استخدامها
 # ════════════════════════════════════════════════
@@ -114,6 +161,30 @@ def _split_results(df):
         "review":      df[_contains("القرار", "مراجعة")].reset_index(drop=True),
         "all":         df,
     }
+
+
+def _first_section_with_results(r: dict) -> str | None:
+    """أول قسم (تسمية الشريط الجانبي) يحتوي صفوفاً — لقفز المستخدم مباشرة لبطاقات المنتجات."""
+    if not r:
+        return None
+    priority = [
+        ("price_raise", "🔴 سعر أعلى"),
+        ("price_lower", "🟢 سعر أقل"),
+        ("review", "⚠️ تحت المراجعة"),
+        ("approved", "✅ موافق عليها"),
+        ("missing", "🔍 منتجات مفقودة"),
+    ]
+    for key, label in priority:
+        df = r.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty and label in SECTIONS:
+            return label
+    return "📊 لوحة التحكم" if "📊 لوحة التحكم" in SECTIONS else None
+
+
+def _focus_sidebar_on_analysis_results(r: dict) -> None:
+    target = _first_section_with_results(r)
+    if target:
+        st.session_state.sidebar_page_radio = target
 
 
 def _safe_results_for_json(results_list):
@@ -157,7 +228,17 @@ def _restore_results_from_json(results_list):
 
 
 # ── تحميل تلقائي للنتائج المحفوظة عند فتح التطبيق ──
-if st.session_state.results is None and not st.session_state.job_running:
+_skip_last_job = False
+if os.path.isfile(_LIVE_SNAP_PATH):
+    try:
+        with open(_LIVE_SNAP_PATH, encoding="utf-8") as f:
+            _ls = json.load(f)
+        if _ls.get("running") and not _ls.get("done"):
+            _skip_last_job = True
+    except Exception:
+        pass
+
+if st.session_state.results is None and not st.session_state.job_running and not _skip_last_job:
     _auto_job = get_last_job()
     if _auto_job and _auto_job["status"] == "done" and _auto_job.get("results"):
         _auto_records = _restore_results_from_json(_auto_job["results"])
@@ -190,6 +271,99 @@ def decision_badge(action):
     }
     c, label = colors.get(action, ("#666", action))
     return f'<span style="font-size:.7rem;color:{c};font-weight:700">{label}</span>'
+
+
+def _comp_incremental_catalog_flush(comp_key: str = "Scraped_Competitor"):
+    """يُرجع دالة تُحدّث كتالوج المنافس على دفعات أثناء الكشط (مجموع الصفوف حتى الآن)."""
+
+    def _flush(rows_snap: list) -> None:
+        if not rows_snap:
+            return
+        cdf = pd.DataFrame(rows_snap)
+        if cdf.empty:
+            return
+        try:
+            upsert_comp_catalog({comp_key: cdf})
+        except Exception:
+            pass
+
+    return _flush
+
+
+def _persist_analysis_after_match(
+    job_id, our_df, comp_dfs, analysis_df, our_file_name, comp_names
+):
+    """بعد توفر جدول المطابقة: تاريخ أسعار، مفقود، حفظ job_progress، سجل التحليل."""
+    total = len(our_df)
+    processed = total
+    try:
+        for _, row in analysis_df.iterrows():
+            if safe_float(row.get("نسبة_التطابق", 0)) > 0:
+                upsert_price_history(
+                    str(row.get("المنتج", "")),
+                    str(row.get("المنافس", "")),
+                    safe_float(row.get("سعر_المنافس", 0)),
+                    safe_float(row.get("السعر", 0)),
+                    safe_float(row.get("الفرق", 0)),
+                    safe_float(row.get("نسبة_التطابق", 0)),
+                    str(row.get("القرار", "")),
+                )
+    except Exception:
+        pass
+    try:
+        raw_missing_df = find_missing_products(our_df, comp_dfs)
+        missing_df = smart_missing_barrier(raw_missing_df, our_df)
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        missing_df = pd.DataFrame()
+    try:
+        safe_records = _safe_results_for_json(analysis_df.to_dict("records"))
+        safe_missing = missing_df.to_dict("records") if not missing_df.empty else []
+
+        save_job_progress(
+            job_id,
+            total,
+            total,
+            safe_records,
+            "done",
+            our_file_name,
+            comp_names,
+            missing=safe_missing,
+        )
+        log_analysis(
+            our_file_name,
+            comp_names,
+            total,
+            int((analysis_df.get("نسبة_التطابق", pd.Series(dtype=float)) > 0).sum()),
+            len(missing_df),
+        )
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        try:
+            save_job_progress(
+                job_id,
+                total,
+                total,
+                _safe_results_for_json(analysis_df.to_dict("records")),
+                "done",
+                our_file_name,
+                comp_names,
+                missing=[],
+            )
+        except Exception:
+            save_job_progress(
+                job_id,
+                total,
+                processed,
+                [],
+                f"error: فشل الحفظ النهائي — {str(e)[:200]}",
+                our_file_name,
+                comp_names,
+            )
 
 
 def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names):
@@ -237,66 +411,440 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
         )
         return
 
-    # ── المرحلة 2: حفظ تاريخ الأسعار (لا يوقف المعالجة إذا فشل) ────
+    _persist_analysis_after_match(
+        job_id, our_df, comp_dfs, analysis_df, our_file_name, comp_names
+    )
+
+
+SCRAPE_BG_CONTEXT = os.path.join("data", "scrape_bg_context.pkl")
+SCRAPE_LIVE_SNAPSHOT = os.path.join("data", "scrape_live_snapshot.json")
+# تزامن بين خيط الكشط وخيط مسار التحليل عند كتابة اللقطة JSON
+_LIVE_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _default_scrape_live_snapshot():
+    return {
+        "running": False,
+        "done": False,
+        "success": False,
+        "error": None,
+        "scrape": {"current": 0, "total": 1, "label": ""},
+        "analysis": {
+            "phase": "idle",
+            "progress_pct": 0.0,
+            "ai_mode": "",
+            "counts": {
+                "price_raise": 0,
+                "price_lower": 0,
+                "approved": 0,
+                "review": 0,
+                "missing": 0,
+            },
+            "scraped_rows": 0,
+        },
+    }
+
+
+def _read_scrape_live_snapshot_inner():
+    d = _default_scrape_live_snapshot()
+    if not os.path.isfile(SCRAPE_LIVE_SNAPSHOT):
+        return d
     try:
-        for _, row in analysis_df.iterrows():
-            if safe_float(row.get("نسبة_التطابق", 0)) > 0:
-                upsert_price_history(
-                    str(row.get("المنتج",       "")),
-                    str(row.get("المنافس",       "")),
-                    safe_float(row.get("سعر_المنافس", 0)),
-                    safe_float(row.get("السعر",       0)),
-                    safe_float(row.get("الفرق",        0)),
-                    safe_float(row.get("نسبة_التطابق", 0)),
-                    str(row.get("القرار",         ""))
-                )
+        with open(SCRAPE_LIVE_SNAPSHOT, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            return d
+        for k, v in d.items():
+            if k not in loaded:
+                loaded[k] = v
+        if isinstance(loaded.get("scrape"), dict):
+            loaded["scrape"] = {**d["scrape"], **loaded["scrape"]}
+        if isinstance(loaded.get("analysis"), dict):
+            ac = loaded["analysis"].get("counts") or {}
+            merged_c = {**d["analysis"]["counts"], **ac} if isinstance(ac, dict) else d["analysis"]["counts"]
+            loaded["analysis"] = {**d["analysis"], **loaded["analysis"], "counts": merged_c}
+        return loaded
     except Exception:
-        pass  # تاريخ الأسعار ثانوي — لا نوقف المعالجة
+        return d
 
-    # ── المرحلة 3: المنتجات المفقودة (منفصلة عن التحليل) + الحاجز الذكي ──
-    try:
-        raw_missing_df = find_missing_products(our_df, comp_dfs)
-        missing_df = smart_missing_barrier(raw_missing_df, our_df)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        missing_df = pd.DataFrame()  # فشلت المفقودة لكن النتائج الرئيسية محفوظة
 
-    # ── المرحلة 4: الحفظ النهائي ────────────────────────────────────
-    try:
-        safe_records = _safe_results_for_json(analysis_df.to_dict("records"))
-        safe_missing = missing_df.to_dict("records") if not missing_df.empty else []
+def _read_scrape_live_snapshot():
+    with _LIVE_SNAPSHOT_LOCK:
+        return _read_scrape_live_snapshot_inner()
 
-        save_job_progress(
-            job_id, total, total,
-            safe_records,
-            "done",
-            our_file_name, comp_names,
-            missing=safe_missing
-        )
-        log_analysis(
-            our_file_name, comp_names, total,
-            int((analysis_df.get("نسبة_التطابق", pd.Series(dtype=float)) > 0).sum()),
-            len(missing_df)
-        )
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        # محاولة أخيرة — حفظ بدون missing
+
+def _merge_scrape_live_snapshot(**kwargs):
+    analysis_reset = kwargs.pop("analysis_reset", False)
+    with _LIVE_SNAPSHOT_LOCK:
+        cur = _read_scrape_live_snapshot_inner()
+        if analysis_reset:
+            cur["analysis"] = copy.deepcopy(_default_scrape_live_snapshot()["analysis"])
+            cur["analysis"]["phase"] = "بدء"
+            cur["analysis"]["ai_mode"] = "—"
+            cur["analysis"]["progress_pct"] = 0.0
+            cur["analysis"]["scraped_rows"] = 0
+        for k, v in kwargs.items():
+            if k == "scrape" and isinstance(v, dict) and isinstance(cur.get("scrape"), dict):
+                cur["scrape"].update(v)
+            elif k == "analysis" and isinstance(v, dict) and isinstance(cur.get("analysis"), dict):
+                if "counts" in v and isinstance(v["counts"], dict):
+                    cur["analysis"].setdefault("counts", {})
+                    cur["analysis"]["counts"].update(v["counts"])
+                for kk, vv in v.items():
+                    if kk != "counts":
+                        cur["analysis"][kk] = vv
+            else:
+                cur[k] = v
+        cur["updated_at"] = datetime.now().isoformat()
+        os.makedirs(os.path.dirname(SCRAPE_LIVE_SNAPSHOT), exist_ok=True)
+        tmp = SCRAPE_LIVE_SNAPSHOT + ".tmp"
         try:
-            save_job_progress(
-                job_id, total, total,
-                _safe_results_for_json(analysis_df.to_dict("records")),
-                "done",
-                our_file_name, comp_names,
-                missing=[]
-            )
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, SCRAPE_LIVE_SNAPSHOT)
         except Exception:
-            save_job_progress(
-                job_id, total, processed,
-                [], f"error: فشل الحفظ النهائي — {str(e)[:200]}",
-                our_file_name, comp_names
+            pass
+
+
+def _clear_scrape_live_snapshot():
+    try:
+        if os.path.isfile(SCRAPE_LIVE_SNAPSHOT):
+            os.remove(SCRAPE_LIVE_SNAPSHOT)
+    except Exception:
+        pass
+
+
+def _live_scrape_thread_done(success: bool, error=None):
+    _merge_scrape_live_snapshot(
+        running=False,
+        done=True,
+        success=success,
+        error=error,
+    )
+    if not success:
+        _clear_live_session_pkl()
+
+
+def _make_scrape_rows_tick_fn():
+    """يحدّث عدد الصفوف المكسوبة أثناء الكشط دون انتظار انتهاء دورة المحرك."""
+
+    def _tick(n: int):
+        if n <= 0:
+            return
+        _merge_scrape_live_snapshot(
+            analysis={
+                "scraped_rows": n,
+                "phase": f"🕸️ كشط: {n} صف — جاري الفرز عند كل دفعة",
+            }
+        )
+
+    return _tick
+
+
+def _make_on_pipeline_before_analysis():
+    """يُعلّم قبل run_full_analysis حتى لا تبدو أشرطة الفرز ثابتة أثناء المطابقة."""
+
+    def _before(rows_snap, is_final: bool):
+        if not rows_snap:
+            return
+        snap = _read_scrape_live_snapshot()
+        t = float((snap.get("scrape") or {}).get("total") or 1)
+        n = len(rows_snap)
+        prog_a = min(1.0, float(n) / max(t, 1.0))
+        _merge_scrape_live_snapshot(
+            analysis={
+                "scraped_rows": n,
+                "phase": (
+                    "⚙️ جاري المطابقة والفرز (قد يستغرق وقتاً)…"
+                    if not is_final
+                    else "⚙️ جولة فرز نهائية…"
+                ),
+                "progress_pct": prog_a,
+            }
+        )
+
+    return _before
+
+
+def _make_on_analysis_snapshot(our_df, use_ai_partial: bool = False):
+    def _cb(rows_snap, analysis_df, is_final):
+        r = _split_results(analysis_df)
+        missing_df = pd.DataFrame()
+        try:
+            cdf = pd.DataFrame(rows_snap)
+            comp_dfs = {"Scraped_Competitor": cdf}
+            raw_m = find_missing_products(our_df, comp_dfs)
+            missing_df = smart_missing_barrier(raw_m, our_df)
+            missing_n = len(missing_df)
+        except Exception:
+            missing_n = 0
+        _r = dict(r)
+        _r["missing"] = missing_df
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open(_LIVE_SESSION_PKL, "wb") as f:
+                pickle.dump(
+                    {
+                        "results": _r,
+                        "analysis_df": analysis_df,
+                        "comp_dfs": {"Scraped_Competitor": pd.DataFrame(rows_snap)},
+                        "our_df": our_df,
+                        "is_partial": not is_final,
+                        "updated_at": datetime.now().isoformat(),
+                    },
+                    f,
+                )
+        except Exception:
+            pass
+        snap = _read_scrape_live_snapshot()
+        t = float((snap.get("scrape") or {}).get("total") or 1)
+        prog_a = min(1.0, float(len(rows_snap)) / max(t, 1.0))
+        if is_final:
+            prog_a = 1.0
+        if use_ai_partial:
+            ai_hint = "محرك + Gemini (لقطات جزئية)"
+        elif is_final:
+            ai_hint = "محرك + Gemini (جولة نهائية دقيقة)"
+        else:
+            ai_hint = "محرك مطابقة سريع — AI في الجولة النهائية"
+        _merge_scrape_live_snapshot(
+            analysis={
+                "phase": "نهائي" if is_final else "لقطة دورية",
+                "progress_pct": prog_a,
+                "ai_mode": ai_hint,
+                "counts": {
+                    "price_raise": len(r["price_raise"]),
+                    "price_lower": len(r["price_lower"]),
+                    "approved": len(r["approved"]),
+                    "review": len(r["review"]),
+                    "missing": missing_n,
+                },
+                "scraped_rows": len(rows_snap),
+            },
+        )
+
+    return _cb
+
+
+def _render_live_scrape_dashboard(snap: dict):
+    sc = snap.get("scrape") or {}
+    an = snap.get("analysis") or {}
+    counts = an.get("counts") or {}
+    pct = float(sc.get("current", 0)) / max(float(sc.get("total", 1)), 1.0)
+    st.progress(min(pct, 1.0), sc.get("label") or "🕸️ جاري الكشط...")
+    st.caption(
+        f"**التحليل:** {an.get('phase', '—')} — "
+        f"صفوف منافس مكسوبة (تراكمية): **{an.get('scraped_rows', 0)}**"
+    )
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("🔴 سعر أعلى", int(counts.get("price_raise", 0)))
+    c2.metric("🟢 سعر أقل", int(counts.get("price_lower", 0)))
+    c3.metric("✅ موافق عليها", int(counts.get("approved", 0)))
+    c4.metric("🔍 منتجات مفقودة", int(counts.get("missing", 0)))
+    c5.metric("⚠️ تحت المراجعة", int(counts.get("review", 0)))
+    st.caption(
+        "لقطة تحليل على المنتجات المكسوبة حتى الآن — تُحدَّث في الأقسام تلقائياً؛ "
+        "الجولة النهائية والـ Job عبر الشريط الجانبي."
+    )
+
+
+def _run_scrape_chain_background():
+    """كشط في الخيط: لوحة مباشرة + حفظ دفعات + تحليل مترافق + إنهاء job."""
+    try:
+        with open(SCRAPE_BG_CONTEXT, "rb") as f:
+            ctx = pickle.load(f)
+    except Exception as e:
+        merge_scraper_bg_state(
+            active=False,
+            phase="error",
+            error=f"تعذر تحميل سياق الكشط: {e}",
+            progress=0.0,
+            message="",
+        )
+        _live_scrape_thread_done(False, f"سياق: {e}")
+        return
+    try:
+        os.remove(SCRAPE_BG_CONTEXT)
+    except Exception:
+        pass
+
+    scrape_bg = bool(ctx.get("scrape_bg", False))
+    our_df = ctx["our_df"]
+    pipeline_inline = bool(ctx.get("pipeline_inline", True))
+    pl_every = int(ctx.get("pl_every") or 100)
+    use_ai_partial = bool(ctx.get("use_ai_partial"))
+    our_file_name = str(ctx.get("our_file_name") or "mahwous_catalog.csv")
+    _raw_inc = os.environ.get("SCRAPER_INCREMENTAL_EVERY", "").strip()
+    inc_every = int(_raw_inc) if _raw_inc.isdigit() else pl_every
+    flush_cb = _comp_incremental_catalog_flush("Scraped_Competitor")
+
+    _merge_scrape_live_snapshot(
+        analysis_reset=True,
+        running=True,
+        done=False,
+        success=False,
+        scrape={"current": 0, "total": 1, "label": "🕸️ جاري الكشط..."},
+    )
+    if scrape_bg:
+        merge_scraper_bg_state(
+            active=True,
+            phase="scrape",
+            progress=0.0,
+            message="🕸️ جاري الكشط...",
+            error=None,
+            job_id=None,
+            rows=0,
+        )
+
+    pl_dict = None
+    if pipeline_inline:
+        pl_dict = {
+            "our_df": our_df,
+            "comp_key": "Scraped_Competitor",
+            "every": pl_every,
+            "use_ai_partial": use_ai_partial,
+            "incremental_every": max(1, inc_every),
+            "on_incremental_flush": flush_cb,
+            "on_analysis_snapshot": _make_on_analysis_snapshot(our_df, use_ai_partial),
+            "on_scrape_rows_tick": _make_scrape_rows_tick_fn(),
+            "on_pipeline_before_analysis": _make_on_pipeline_before_analysis(),
+        }
+    else:
+        pl_dict = {
+            "incremental_every": max(1, inc_every),
+            "on_incremental_flush": flush_cb,
+        }
+
+    _last_merge = [0.0]
+    _last_live = [0.0]
+
+    def scrape_cb(current, total, last_name):
+        now = time.time()
+        pct = current / max(total, 1)
+        nm = (last_name or "")[:80]
+        if scrape_bg:
+            if now - _last_merge[0] >= 1.2 or pct >= 1.0:
+                _last_merge[0] = now
+                merge_scraper_bg_state(
+                    progress=min(pct, 1.0),
+                    message=f"🕸️ {current}/{total} | {nm}",
+                )
+        if now - _last_live[0] >= 0.35 or current >= total:
+            _last_live[0] = now
+            _merge_scrape_live_snapshot(
+                scrape={
+                    "current": current,
+                    "total": total,
+                    "label": f"🕸️ كشط: {current}/{total} | {nm}",
+                }
             )
+
+    try:
+        nrows = run_scraper_sync(progress_cb=scrape_cb, pipeline=pl_dict)
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        merge_scraper_bg_state(
+            active=False,
+            phase="error",
+            error=f"فشل الكشط: {str(e)[:300]}",
+            progress=0.0,
+            message="",
+        )
+        _live_scrape_thread_done(False, f"فشل الكشط: {str(e)[:300]}")
+        return
+
+    if not nrows or not os.path.isfile("data/competitors_latest.csv"):
+        merge_scraper_bg_state(
+            active=False,
+            phase="error",
+            error="لم يُنتج الكشط بياناتاً كافية أو الملف مفقود.",
+        )
+        _live_scrape_thread_done(False, "لم يُنتج الكشط ملفاً صالحاً.")
+        return
+
+    try:
+        comp_df = pd.read_csv("data/competitors_latest.csv")
+    except Exception as e:
+        merge_scraper_bg_state(active=False, phase="error", error=f"قراءة CSV: {e}")
+        _live_scrape_thread_done(False, str(e))
+        return
+
+    if comp_df.empty:
+        merge_scraper_bg_state(
+            active=False, phase="error", error="ملف المنافس فارغ بعد الكشط."
+        )
+        _live_scrape_thread_done(False, "ملف المنافس فارغ.")
+        return
+
+    try:
+        upsert_our_catalog(
+            our_df,
+            name_col="اسم المنتج",
+            id_col="رقم المنتج",
+            price_col="السعر",
+        )
+        comp_dfs = {"Scraped_Competitor": comp_df}
+        upsert_comp_catalog(comp_dfs)
+    except Exception as e:
+        merge_scraper_bg_state(active=False, phase="error", error=f"الكتالوج: {e}")
+        _live_scrape_thread_done(False, str(e))
+        return
+
+    pl_out = (pl_dict or {}).get("out") or {}
+    if (
+        pipeline_inline
+        and pl_out.get("analysis_df") is not None
+        and not pl_out.get("error")
+        and pl_out.get("is_final")
+    ):
+        job_id = str(uuid.uuid4())[:8]
+        comp_names = ",".join(comp_dfs.keys())
+        merge_scraper_bg_state(
+            progress=1.0,
+            message=f"✅ اكتمل المسار ({len(comp_df)} صف) — حفظ النتائج...",
+            rows=len(comp_df),
+            phase="analysis",
+            job_id=job_id,
+            active=True,
+        )
+        t_done = threading.Thread(
+            target=_persist_analysis_after_match,
+            args=(
+                job_id,
+                our_df,
+                comp_dfs,
+                pl_out["analysis_df"],
+                our_file_name,
+                comp_names,
+            ),
+            daemon=True,
+        )
+        add_script_run_ctx(t_done)
+        t_done.start()
+        _live_scrape_thread_done(True)
+        return
+
+    job_id = str(uuid.uuid4())[:8]
+    comp_names = ",".join(comp_dfs.keys())
+    merge_scraper_bg_state(
+        progress=1.0,
+        message=f"✅ اكتمل الكشط ({len(comp_df)} صف) — جاري التحليل...",
+        rows=len(comp_df),
+        phase="analysis",
+        job_id=job_id,
+        active=True,
+    )
+
+    t2 = threading.Thread(
+        target=_run_analysis_background,
+        args=(job_id, our_df, comp_dfs, our_file_name, comp_names),
+        daemon=True,
+    )
+    add_script_run_ctx(t2)
+    t2.start()
+    _live_scrape_thread_done(True)
 
 
 # ════════════════════════════════════════════════
@@ -784,6 +1332,97 @@ with st.sidebar:
                 except:
                     st.warning(f"❌ {key_name} غير موجود")
 
+    # كشط خلفي — التنقل بين الأقسام أثناء الجلب
+    _sbg = read_scraper_bg_state()
+    if _sbg.get("phase") == "error" and _sbg.get("error"):
+        st.error(f"❌ كشط خلفي: {str(_sbg['error'])[:220]}")
+        if st.button("✓ تجاهل الرسالة", key="dismiss_scrape_bg_err"):
+            merge_scraper_bg_state(
+                phase="idle",
+                error=None,
+                active=False,
+                progress=0.0,
+                message="",
+            )
+            st.rerun()
+
+    _live_sb = _read_scrape_live_snapshot()
+    _live_run = _live_sb.get("running") and not _live_sb.get("done")
+
+    if _live_run:
+        st.markdown(
+            '<div style="background:#1B5E2022;border:1px solid #4CAF50;'
+            'border-radius:8px;padding:8px;margin-bottom:8px;font-size:.78rem">'
+            "<b>⚡ كشط + تحليل متزامنان</b> — يعملان في الخلفية دون إيقاف الواجهة.</div>",
+            unsafe_allow_html=True,
+        )
+        _sc = _live_sb.get("scrape") or {}
+        _an = _live_sb.get("analysis") or {}
+        _pct_s = float(_sc.get("current", 0)) / max(float(_sc.get("total", 1)), 1.0)
+        st.caption("🕸️ **1 — جلب صفحات المنافس**")
+        st.progress(
+            min(_pct_s, 0.99),
+            _sc.get("label") or f"🕸️ {_sc.get('current', 0)}/{_sc.get('total', 1)}",
+        )
+        _pct_a = float(_an.get("progress_pct") or 0)
+        if _pct_a <= 0 and _sc.get("total"):
+            _pct_a = min(
+                1.0,
+                float(_an.get("scraped_rows", 0)) / max(float(_sc.get("total", 1)), 1.0),
+            )
+        _ai_cap = _an.get("ai_mode") or "محرك المطابقة + فرز الأقسام"
+        st.caption(
+            f"⚙️ **2 — تحليل وفرز المنتجات** — {_ai_cap}"
+            + (
+                f" | **{_an.get('phase', '—')}**"
+                if _an.get("phase") and str(_an.get("phase")) != "idle"
+                else ""
+            )
+        )
+        st.progress(
+            min(_pct_a, 0.99),
+            f"فرز ← 🔴{int((_an.get('counts') or {}).get('price_raise', 0))} "
+            f"🟢{int((_an.get('counts') or {}).get('price_lower', 0))} "
+            f"✅{int((_an.get('counts') or {}).get('approved', 0))} "
+            f"🔍{int((_an.get('counts') or {}).get('missing', 0))} "
+            f"⚠️{int((_an.get('counts') or {}).get('review', 0))}",
+        )
+        if "جاري المطابقة" in str(_an.get("phase", "")):
+            st.caption(
+                "⏳ **الأرقام أعلاه** تتحدّث بعد انتهاء المحرك من الدفعة الحالية — "
+                "شريط التقدم و«صفوف مكسوبة» يتحركان أثناء الكشط والمطابقة."
+            )
+        try:
+            from streamlit_autorefresh import st_autorefresh
+
+            st_autorefresh(interval=2500, key="sidebar_live_dual_refresh")
+        except ImportError:
+            time.sleep(2.5)
+            st.rerun()
+    elif _sbg.get("active") and _sbg.get("phase") == "scrape":
+        st.markdown(
+            '<div style="background:#1565C022;border:1px solid #42A5F5;'
+            'border-radius:6px;padding:8px;font-size:.78rem;margin-bottom:6px">'
+            "🌐 <b>كشط في الخلفية</b> — يمكنك فتح أي قسم؛ يتم تحديث التقدم تلقائياً.</div>",
+            unsafe_allow_html=True,
+        )
+        st.progress(
+            min(float(_sbg.get("progress", 0)), 0.99),
+            _sbg.get("message") or "🕸️ جاري الكشط...",
+        )
+        try:
+            from streamlit_autorefresh import st_autorefresh
+
+            st_autorefresh(interval=3000, key="scrape_bg_refresh")
+        except ImportError:
+            time.sleep(3)
+            st.rerun()
+
+    if _sbg.get("active") and _sbg.get("phase") == "analysis" and _sbg.get("job_id"):
+        if st.session_state.get("job_id") != _sbg["job_id"]:
+            st.session_state.job_id = _sbg["job_id"]
+            st.session_state.job_running = True
+
     # حالة المعالجة — تحديث حي مع auto-rerun
     if st.session_state.job_id:
         job = get_job_progress(st.session_state.job_id)
@@ -810,14 +1449,38 @@ with st.sidebar:
                     _r["missing"] = missing_df
                     st.session_state.results     = _r
                     st.session_state.analysis_df = df_all
+                    _focus_sidebar_on_analysis_results(_r)
+                _sbg_done = read_scraper_bg_state()
+                if _sbg_done.get("job_id") and _sbg_done.get("job_id") == st.session_state.job_id:
+                    merge_scraper_bg_state(
+                        active=False,
+                        phase="idle",
+                        job_id=None,
+                        progress=0.0,
+                        message="",
+                        error=None,
+                    )
                 st.session_state.job_running = False
+                _clear_live_session_pkl()
                 st.balloons()
                 st.rerun()
             elif job["status"].startswith("error"):
                 st.error(f"❌ فشل: {job['status'][7:80]}")
+                _sbg_e = read_scraper_bg_state()
+                if _sbg_e.get("job_id") == st.session_state.job_id:
+                    merge_scraper_bg_state(
+                        active=False,
+                        phase="idle",
+                        job_id=None,
+                    )
                 st.session_state.job_running = False
 
-    page = st.radio("الأقسام", SECTIONS, label_visibility="collapsed")
+    page = st.radio(
+        "الأقسام",
+        SECTIONS,
+        label_visibility="collapsed",
+        key="sidebar_page_radio",
+    )
 
     st.markdown("---")
     if st.session_state.results:
@@ -951,6 +1614,7 @@ if page == "📊 لوحة التحكم":
                     _r["missing"] = missing_df
                     st.session_state.results     = _r
                     st.session_state.analysis_df = df_all
+                    _focus_sidebar_on_analysis_results(_r)
                     st.rerun()
         else:
             st.info("👈 ارفع ملفاتك من قسم 'رفع الملفات'")
@@ -960,19 +1624,47 @@ if page == "📊 لوحة التحكم":
 #  2. رفع الملفات — كشط الويب + تحليل
 # ════════════════════════════════════════════════
 elif page == "📂 رفع الملفات":
+    _snap_live = _read_scrape_live_snapshot()
+    if _snap_live.get("running") and not _snap_live.get("done"):
+        with st.container(border=True):
+            st.markdown("### 📡 مباشر — الكشط والتحليل على الدفعات")
+            _render_live_scrape_dashboard(_snap_live)
+        try:
+            from streamlit_autorefresh import st_autorefresh
+
+            st_autorefresh(interval=2000, key="scrape_live_dashboard_refresh")
+        except ImportError:
+            time.sleep(2)
+            st.rerun()
+        st.markdown("---")
+    elif _snap_live.get("done"):
+        if not _snap_live.get("success") and _snap_live.get("error"):
+            st.error(f"❌ {_snap_live['error'][:400]}")
+        else:
+            st.success(
+                "✅ انتهت مرحلة الكشط والتحضير — راقب **الشريط الجانبي** لاكتمال التحليل (Job) أو النتائج."
+            )
+        _clear_live_session_pkl()
+        _clear_scrape_live_snapshot()
+        st.rerun()
+
     st.header("🕸️ كشط الويب والتحليل")
     db_log("upload", "view")
 
     if "scraper_urls" not in st.session_state:
-        st.session_state.scraper_urls = [""]
+        st.session_state.scraper_urls = ["https://worldgivenchy.com/ar/"]
 
     st.markdown("🔗 **روابط متاجر المنافسين (سلة أو زد)**")
+    st.caption(
+        "مضاد الحظر: يُفضَّل تثبيت `curl-cffi` و`playwright` ثم `playwright install chromium`. "
+        "عند الحظر يُعاد البحث تلقائيًا عبر Chromium. يمكن أيضًا لصق رابط .xml أو استيراد CSV."
+    )
     for i in range(len(st.session_state.scraper_urls)):
         st.caption(f"متجر {i+1}")
         st.text_input(
             "رابط",
             key=f"comp_url_{i}",
-            placeholder="https://example.com",
+            placeholder="https://worldgivenchy.com/ar/",
             label_visibility="collapsed",
         )
 
@@ -980,15 +1672,38 @@ elif page == "📂 رفع الملفات":
         st.session_state.scraper_urls.append("")
         st.rerun()
 
-    col_opt1, col_opt2 = st.columns(2)
+    col_opt1, col_opt2, col_opt3 = st.columns(3)
     with col_opt1:
-        bg_mode = st.checkbox(
-            "⚡ معالجة خلفية للتحليل (يمكنك التنقل أثناء التحليل)", value=True
+        scrape_bg = st.checkbox(
+            "🌐 كشط في الخلفية (التنقل أثناء الكشط)",
+            value=False,
+            help="يُكمِل الجلب في خيط؛ مع حفظ CSV وتحديث كتالوج المنافس على دفعات، ومسار تحليل مترافق داخل الخيط. بعد الانتهاء يُحفظ التحليل كـ job.",
         )
     with col_opt2:
+        pipeline_inline = st.checkbox(
+            "⚡ تحليل مترافق مع الكشط (مطابقة أثناء الجلب — أسرع للنهاية)",
+            value=True,
+            disabled=scrape_bg,
+            help="للكشط على الصفحة فقط: مطابقة على لقطات تراكمية أثناء الجلب ثم جولة نهائية. الكشط الخلفي يفعّل مساراً مماثلاً تلقائياً.",
+        )
+    with col_opt3:
         max_rows = st.number_input("حد الصفوف للمعالجة (0=كل)", 0, step=500)
 
-    if st.button("🚀 بدء الكشط والتحليل", type="primary"):
+    st.caption(
+        "بعد انتهاء الكشط يُجدول **التحليل** تلقائياً (Job في الشريط الجانبي) — يمكنك التنقل أثناء التحليل."
+    )
+    st.caption(
+        "💾 **دفعات أثناء الكشط:** يُحدَّث `data/competitors_latest.csv` وكتالوج المنافس كلّما تجاوز العدد "
+        "`SCRAPER_INCREMENTAL_EVERY` (أو نفس خطوة المسار المترافق `SCRAPER_PIPELINE_EVERY`). "
+        "المسار المترافق يُعيد المطابقة على **جميع** المنتجات المكسوبة حتى تلك اللحظة — دون انتظار نهاية الكشط."
+    )
+
+    pipeline_inline = bool(pipeline_inline) and (not scrape_bg)
+
+    _snap_busy = _read_scrape_live_snapshot()
+    _scrape_busy = _snap_busy.get("running") and not _snap_busy.get("done")
+
+    if st.button("🚀 بدء الكشط والتحليل", type="primary", disabled=_scrape_busy):
         valid_urls = []
         for i in range(len(st.session_state.scraper_urls)):
             v = (st.session_state.get(f"comp_url_{i}") or "").strip()
@@ -1019,114 +1734,70 @@ elif page == "📂 رفع الملفات":
                 st.success(
                     f"✅ تم العثور على {len(valid_sitemaps)} متجر صالح. جاري بدء الكشط..."
                 )
-                os.makedirs("data", exist_ok=True)
-                with open("data/competitors_list.json", "w", encoding="utf-8") as f:
-                    json.dump(valid_sitemaps, f, ensure_ascii=False)
-
-                prog_scrape = st.progress(0, "🕸️ جاري الكشط... (سيتم حفظ التقدم تلقائياً)")
-
-                def scrape_cb(current, total, last_name):
-                    pct = current / max(total, 1)
-                    nm = (last_name or "")[:30]
-                    prog_scrape.progress(
-                        min(pct, 1.0),
-                        f"🕸️ كشط: {current}/{total} | {nm}",
-                    )
-
-                run_scraper_sync(progress_cb=scrape_cb)
-                prog_scrape.progress(1.0, "✅ اكتمل الكشط بنجاح!")
-
-                if not os.path.exists("data/competitors_latest.csv"):
-                    st.error("❌ فشل الكشط أو لم يتم العثور على منتجات.")
+                our_path = os.path.join("data", "mahwous_catalog.csv")
+                our_df_pre = None
+                if not os.path.isfile(our_path):
+                    st.error("❌ لم يُعثر على ملف الكتالوج المحلي data/mahwous_catalog.csv")
                 else:
-                    our_path = os.path.join("data", "mahwous_catalog.csv")
-                    if not os.path.isfile(our_path):
-                        st.error("❌ لم يُعثر على ملف الكتالوج المحلي data/mahwous_catalog.csv")
+                    try:
+                        our_df_pre = pd.read_csv(our_path)
+                    except Exception as e:
+                        st.error(f"❌ تعذر قراءة الكتالوج المحلي: {e}")
+                        our_df_pre = None
+
+                if our_df_pre is not None:
+                    if max_rows > 0:
+                        our_df_pre = our_df_pre.head(int(max_rows))
+                    os.makedirs("data", exist_ok=True)
+                    with open("data/competitors_list.json", "w", encoding="utf-8") as f:
+                        json.dump(valid_sitemaps, f, ensure_ascii=False)
+
+                    ctx = {
+                        "our_df": our_df_pre,
+                        "pipeline_inline": True if scrape_bg else pipeline_inline,
+                        "pl_every": int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100")),
+                        "use_ai_partial": os.environ.get(
+                            "SCRAPER_PIPELINE_AI_PARTIAL", ""
+                        ).strip().lower()
+                        in ("1", "true", "yes"),
+                        "our_file_name": "mahwous_catalog.csv",
+                        "scrape_bg": scrape_bg,
+                    }
+                    try:
+                        with open(SCRAPE_BG_CONTEXT, "wb") as fctx:
+                            pickle.dump(ctx, fctx)
+                    except Exception as e:
+                        st.error(f"❌ تعذر حفظ سياق الكشط: {e}")
                     else:
-                        try:
-                            our_df = pd.read_csv(our_path)
-                        except Exception as e:
-                            st.error(f"❌ تعذر قراءة الكتالوج المحلي: {e}")
-                            our_df = None
-                        if our_df is not None:
-                            if max_rows > 0:
-                                our_df = our_df.head(int(max_rows))
+                        _clear_live_session_pkl()
+                        st.session_state.results = None
+                        st.session_state.analysis_df = None
+                        _merge_scrape_live_snapshot(
+                            analysis_reset=True,
+                            running=True,
+                            done=False,
+                            success=False,
+                            scrape={"current": 0, "total": 1, "label": "🕸️ يبدأ الكشط..."},
+                        )
+                        t_sc = threading.Thread(
+                            target=_run_scrape_chain_background,
+                            daemon=True,
+                        )
+                        add_script_run_ctx(t_sc)
+                        t_sc.start()
+                        if scrape_bg:
+                            st.success(
+                                "✅ **الكشط** يعمل في الخيط — يمكنك التنقل. "
+                                "اللوحة المباشرة أدناه عند العودة لـ «رفع الملفات»؛ الشريط الجانبي يعرض التقدم."
+                            )
+                        else:
+                            st.success(
+                                "✅ **الكشط** يعمل — **اللوحة المباشرة** تُحدَّث كل ثانيتين (أرقام الأقسام + شريط التقدم)."
+                            )
+                        st.rerun()
 
-                            comp_df = pd.read_csv("data/competitors_latest.csv")
-                            if comp_df.empty:
-                                st.error("❌ ملف المنافس فارغ بعد الكشط.")
-                            else:
-                                comp_dfs = {"Scraped_Competitor": comp_df}
-                                our_file_name = "mahwous_catalog.csv"
-
-                                with st.spinner("📦 تحديث الكتالوج اليومي..."):
-                                    r_our = upsert_our_catalog(
-                                        our_df,
-                                        name_col="اسم المنتج",
-                                        id_col="رقم المنتج",
-                                        price_col="السعر",
-                                    )
-                                    r_comp = upsert_comp_catalog(comp_dfs)
-                                    st.caption(
-                                        f"✅ كتالوجنا: {r_our['inserted']} جديد / {r_our['updated']} تحديث | "
-                                        f"المنافسين: {r_comp['new_products']} جديد"
-                                    )
-
-                                st.session_state.our_df = our_df
-                                st.session_state.comp_dfs = comp_dfs
-                                job_id = str(uuid.uuid4())[:8]
-                                st.session_state.job_id = job_id
-                                comp_names = ",".join(comp_dfs.keys())
-
-                                if bg_mode:
-                                    t = threading.Thread(
-                                        target=_run_analysis_background,
-                                        args=(job_id, our_df, comp_dfs, our_file_name, comp_names),
-                                        daemon=True,
-                                    )
-                                    add_script_run_ctx(t)
-                                    t.start()
-                                    st.session_state.job_running = True
-                                    st.success(f"✅ بدأ التحليل في الخلفية (Job: {job_id})")
-                                    st.rerun()
-                                else:
-                                    prog = st.progress(0, "جاري التحليل...")
-
-                                    def upd(p, _r=None):
-                                        prog.progress(min(float(p), 0.99), f"{float(p)*100:.0f}%")
-
-                                    df_all = run_full_analysis(our_df, comp_dfs, progress_callback=upd)
-                                    raw_missing_df = find_missing_products(our_df, comp_dfs)
-                                    missing_df = smart_missing_barrier(raw_missing_df, our_df)
-
-                                    for _, row in df_all.iterrows():
-                                        if row.get("نسبة_التطابق", 0) > 0:
-                                            upsert_price_history(
-                                                str(row.get("المنتج", "")),
-                                                str(row.get("المنافس", "")),
-                                                safe_float(row.get("سعر_المنافس", 0)),
-                                                safe_float(row.get("السعر", 0)),
-                                                safe_float(row.get("الفرق", 0)),
-                                                safe_float(row.get("نسبة_التطابق", 0)),
-                                                str(row.get("القرار", "")),
-                                            )
-
-                                    _r = _split_results(df_all)
-                                    _r["missing"] = missing_df
-                                    st.session_state.results = _r
-                                    st.session_state.analysis_df = df_all
-                                    log_analysis(
-                                        our_file_name,
-                                        comp_names,
-                                        len(our_df),
-                                        int(
-                                            (df_all.get("نسبة_التطابق", pd.Series(dtype=float)) > 0).sum()
-                                        ),
-                                        len(missing_df),
-                                    )
-                                    prog.progress(1.0, "✅ اكتمل!")
-                                    st.balloons()
-                                    st.rerun()
+                if our_df_pre is None:
+                    pass
 
 
 # ════════════════════════════════════════════════

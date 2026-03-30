@@ -3,5 +3,7 @@ pandas>=2.0.0
 openpyxl>=3.1.0
 rapidfuzz>=3.0.0
 requests>=2.31.0
+curl-cffi>=0.7.0
+playwright>=1.49.0
 plotly>=5.18.0
 streamlit-autorefresh>=1.0.1
