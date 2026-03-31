@@ -159,7 +159,11 @@ def diagnose_ai_providers() -> dict:
             if r.status_code == 200:
                 results["cohere"] = "✅ يعمل (command-a-03-2025)"
             elif r.status_code == 401:
-                results["cohere"] = "❌ 401 — مفتاح Cohere غير صحيح (اختياري: احذف المفتاح من Secrets إن لم تستخدم Cohere)"
+                # اختياري — لا يُعرض كخطأ أحمر؛ التطبيق يعمل بدون Cohere
+                results["cohere"] = (
+                    "⚠️ 401 — مفتاح Cohere غير صالح (اختياري). "
+                    "احذف COHERE_API_KEY من Secrets أو ضع مفتاحاً صحيحاً من dashboard.cohere.com"
+                )
             elif r.status_code == 402:
                 results["cohere"] = "❌ 402 — رصيد Cohere منتهٍ"
             else:
