@@ -81,9 +81,20 @@ def _parse_gemini_keys():
         if k and k not in keys:
             keys.append(k)
 
-    # تنظيف نهائي: إزالة المفاتيح الفارغة أو القصيرة
-    keys = [k.strip() for k in keys if k and len(k) > 20]
+    # ─── أسماء بديلة شائعة (Railway / Google AI Studio) ───
+    for n in ("GOOGLE_API_KEY", "GOOGLE_AI_API_KEY", "GENERATIVE_AI_API_KEY"):
+        k = _s(n, "")
+        if k and k not in keys:
+            keys.append(k)
+
+    # تنظيف نهائي: مفاتيح Google عادة ≥30 حرفاً؛ الحد الأدنى 12 لتجنب القيم الوهمية
+    keys = [k.strip() for k in keys if k and len(k.strip()) >= 12]
     return keys
+
+
+def get_gemini_api_keys():
+    """إعادة قراءة المفاتيح من البيئة (مفيد للعرض بعد تغيير Variables دون إعادة تشغيل العملية)."""
+    return _parse_gemini_keys()
 
 
 # ══════════════════════════════════════════════

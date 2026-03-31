@@ -1630,11 +1630,12 @@ with st.sidebar:
     st.markdown(f"## {APP_ICON} {APP_TITLE}")
     st.caption(f"الإصدار {APP_VERSION}")
 
-    # حالة AI — تشخيص مفصل
-    ai_ok = bool(GEMINI_API_KEYS)
+    # حالة AI — إعادة قراءة من البيئة (Railway Variables وليس فقط st.secrets)
+    _keys_live = get_gemini_api_keys()
+    ai_ok = bool(_keys_live)
     if ai_ok:
         ai_color = "#00C853"
-        ai_label = f"🤖 Gemini ✅ ({len(GEMINI_API_KEYS)} مفتاح)"
+        ai_label = f"🤖 Gemini ✅ ({len(_keys_live)} مفتاح)"
     else:
         ai_color = "#FF1744"
         ai_label = "🔴 AI غير متصل — تحقق من Secrets"
@@ -1649,8 +1650,18 @@ with st.sidebar:
     # زر تشخيص سريع
     if not ai_ok:
         if st.button("🔍 تشخيص المشكلة", key="diag_btn"):
-            import os
-            st.write("**الـ secrets المتاحة:**")
+            st.write("**متغيرات البيئة (Railway / Docker):**")
+            for key_name in [
+                "GEMINI_API_KEY", "GEMINI_API_KEYS", "GEMINI_KEY_1",
+                "GOOGLE_API_KEY", "GOOGLE_AI_API_KEY",
+            ]:
+                v = os.environ.get(key_name, "")
+                if v:
+                    masked = (v[:8] + "…" + v[-4:]) if len(v) > 12 else "***"
+                    st.success(f"✅ `{key_name}` موجود (طول {len(v)}) — `{masked}`")
+                else:
+                    st.caption(f"— `{key_name}` غير معرّف")
+            st.write("**Streamlit secrets (محلي / Cloud فقط):**")
             try:
                 available = list(st.secrets.keys())
                 for k in available:
@@ -1658,14 +1669,12 @@ with st.sidebar:
                     masked = val[:8] + "..." if len(val) > 8 else val
                     st.write(f"  `{k}` = `{masked}`")
             except Exception as e:
-                st.error(f"خطأ: {e}")
-            # محاولة مباشرة
-            for key_name in ["GEMINI_API_KEYS","GEMINI_API_KEY","GEMINI_KEY_1"]:
-                try:
-                    v = st.secrets[key_name]
-                    st.success(f"✅ وجدت {key_name} = {str(v)[:20]}...")
-                except:
-                    st.warning(f"❌ {key_name} غير موجود")
+                st.caption(f"لا secrets.toml: {e}")
+            st.info(
+                "على Railway: أضف المتغير **لنفس الخدمة** (Variables → New Variable). "
+                "إذا استخدمت Shared Variable اضغط **Add** حتى يصبح «in use». "
+                "الاسم الموصى به: `GEMINI_API_KEY`."
+            )
 
     # كشط خلفي — التنقل بين الأقسام أثناء الجلب
     _sbg = read_scraper_bg_state()
