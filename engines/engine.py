@@ -130,8 +130,11 @@ def _load_gemini_keys():
         k = _os.environ.get(f"GEMINI_KEY_{i}", "")
         if k.strip():
             keys.append(k.strip())
-    # طريقة 3: أسماء بديلة
-    for env_name in ["GEMINI_API_KEY", "GEMINI_KEY"]:
+    # طريقة 3: أسماء بديلة (يشمل أسماء Google / Railway)
+    for env_name in [
+        "GEMINI_API_KEY", "GEMINI_KEY", "GOOGLE_API_KEY",
+        "GOOGLE_AI_API_KEY", "GENERATIVE_AI_API_KEY",
+    ]:
         k = _os.environ.get(env_name, "")
         if k.strip():
             keys.append(k.strip())
