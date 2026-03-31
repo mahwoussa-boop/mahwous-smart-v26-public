@@ -153,6 +153,7 @@ def comp_strip(all_comps):
         c_price = float(cm.get("price", 0) or 0)
         c_pname = str(cm.get("name", "")).strip()
         c_score = float(cm.get("score", 0) or 0)
+        c_img = str(cm.get("image_url", "") or cm.get("image", "") or "").strip()
         is_leader = (i == 0)
         crown = "👑" if is_leader else ""
         bg = "rgba(255,152,0,.10)" if is_leader else "rgba(108,99,255,.05)"
@@ -161,11 +162,20 @@ def comp_strip(all_comps):
         # اسم المنتج لدى المنافس (مختصر)
         short_pname = c_pname[:50] + ".." if len(c_pname) > 50 else c_pname
         score_html = f'<span style="color:#888;font-size:.62rem">{c_score:.0f}%</span>' if c_score > 0 else ""
+        img_html = (
+            f'<img src="{_html_escape(c_img, quote=True)}" '
+            f'style="width:38px;height:38px;border-radius:8px;object-fit:cover;'
+            f'border:1px solid {border};background:#0e1628;flex:0 0 38px" '
+            f'onerror="this.style.display=\'none\'" />'
+            if c_img and c_img.lower() not in ("nan", "none")
+            else ""
+        )
         rows.append(
             f'<div style="display:flex;justify-content:space-between;align-items:center;'
             f'padding:5px 10px;background:{bg};border:1px solid {border};border-radius:8px;'
             f'margin:2px 0;gap:8px;flex-wrap:wrap">'
             f'<div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">'
+            f'{img_html}'
             f'<span style="font-weight:900;font-size:.8rem">{crown}</span>'
             f'<span style="font-weight:700;color:{name_color};font-size:.75rem;white-space:nowrap">{c_store}</span>'
             f'<span style="color:#aaa;font-size:.7rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px" title="{c_pname}">{short_pname}</span>'
