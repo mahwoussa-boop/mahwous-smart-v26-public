@@ -421,7 +421,7 @@ def _no_api_strong_signals(
     if our_pline and c_pl:
         if fuzz.token_sort_ratio(our_pline, c_pl) < 88:
             return False
-    elif our_pline and not c_pl:
+    elif (our_pline and not c_pl) or (not our_pline and c_pl):
         return False
     return True
 
@@ -611,7 +611,7 @@ def normalize(text):
 def normalize_name(text):
     """
     الدالة الموحدة للمطابقة — تُستخدم حصراً لمقارنة الأسماء.
-    تحذف: عطر/بارفيوم/بيرفيوم/تستر/مل/edp/edt/للجنسين/100/50/...
+    تحذف: عطر/بارفيوم/بيرفيوم/تستر/مل/edp/edt/للجنسين/... (لا تمسح الأرقام الهوائية مثل 212 في الاسم)
     توحّد: أ/إ/آ→ا  ة/ه→ه  ى→ي
     المثال: 'عطر ايسينشيال بيرفيوم فيج انفيوجن 100مل' → 'essential فيج infusion'
     """
@@ -626,8 +626,7 @@ def normalize_name(text):
         t = t.replace(k, v)
     # 3. حذف كلمات الضجيج
     t = _NOISE_RE.sub(' ', t)
-    # 4. حذف الأرقام المتبقية + الرموز
-    t = re.sub(r'\b\d+\b', ' ', t)
+    # 4. الرموز فقط — الأرقام تُبقى (هوية المنتج: 212، 360، إلخ)
     t = re.sub(r'[^\w\s\u0600-\u06FF]', ' ', t)
     return re.sub(r'\s+', ' ', t).strip()
 
@@ -806,8 +805,8 @@ def extract_product_line(text, brand=""):
             n = re.sub(r'\b' + re.escape(w) + r'\b', ' ', n, flags=re.IGNORECASE)
         else:
             n = re.sub(r'(?:^|\s)' + re.escape(w) + r'(?:\s|$)', ' ', n)
-    # إزالة الأرقام (الحجم) + مل/ml الملتصقة
-    n = re.sub(r'\d+(?:\.\d+)?\s*(?:ml|مل|ملي)?', ' ', n)
+    # إزالة الحجم فقط عند وجود وحدة قياس صريحة (لا تُمس الأرقام العارية)
+    n = re.sub(r'\d+(?:\.\d+)?\s*(ml|مل|ملي|oz|لتر)\b', ' ', n)
     # إزالة الرموز
     n = re.sub(r'[^\w\s\u0600-\u06FF]', ' ', n)
     # توحيد الهمزات
@@ -983,8 +982,6 @@ class CompIndex:
             # ═══ فلاتر سريعة ═══
             if our_br and c_br and normalize(our_br) != normalize(c_br):
                 continue
-            if our_pline and not c_pl:
-                continue
             if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 2.5:
                 continue
             # عزل تركيز العطر: EDP/EDT/EDC يجب أن يتطابق عندما يُستنتج من الاسم
@@ -1052,22 +1049,24 @@ class CompIndex:
             if our_pnums and c_pnums and our_pnums != c_pnums:
                 continue
 
-            # ═══ مقارنة خط الإنتاج (الحل الجذري) ═══
+            # ═══ مقارنة خط الإنتاج (الحل الجذري المحكم) ═══
             pline_penalty = 0
-            if our_pline and c_pl:
+            if our_pline or c_pl:
+                # إذا كان أحدهما يملك اسماً مميزاً والآخر لا يملك، ارفض التطابق فوراً
+                if (our_pline and not c_pl) or (not our_pline and c_pl):
+                    continue
+
+                # إذا كان كلاهما يملك خط إنتاج، نقارن بصرامة
                 pl_score = fuzz.token_sort_ratio(our_pline, c_pl)
                 if our_br and c_br:
-                    # نفس الماركة → مقارنة خط الإنتاج صارمة جداً
-                    # باروندا≠باردون(77%), الاباي≠اسبريت(75%)
-                    # سوفاج=سوفاج(100%), عود مود=عود سيلك مود(85%)
+                    # نفس الماركة: يجب أن يتطابق خط الإنتاج بشدة (212 مع 212)
                     if pl_score < 78:
-                        continue  # رفض نهائي - خطوط إنتاج مختلفة
+                        continue  # رفض نهائي - خطوط إنتاج مختلفة (مثل 212 مع باد بوي)
                     elif pl_score < 88:
                         pline_penalty = -20
                     elif pl_score < 94:
                         pline_penalty = -10
                 else:
-                    # ماركات مختلفة أو غير معروفة → مقارنة أكثر صرامة
                     if pl_score < 65:
                         pline_penalty = -35
                     elif pl_score < 80:
