@@ -90,6 +90,7 @@ _SITEMAP_LOC_CAP = _env_int("SCRAPER_SITEMAP_LOC_CAP", 200000)
 _MAX_SITEMAP_INDEX_ENTRIES = _env_int("SCRAPER_SITEMAP_INDEX_CAP", 200000)
 # حجم استجابة XML واحدة قبل التخطي (متاجر ضخمة قد تولّد ملفات > 8 ميجا)
 _MAX_SITEMAP_BYTES = _env_int("SCRAPER_MAX_SITEMAP_BYTES", 32 * 1024 * 1024)
+_SITEMAP_EXPAND_TIMEOUT_SEC = _env_int("SCRAPER_SITEMAP_EXPAND_TIMEOUT_SEC", 120)
 _CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
 _FETCH_WORKERS = max(1, min(16, int(os.environ.get("SCRAPER_FETCH_WORKERS", "3"))))
@@ -245,17 +246,25 @@ def _parse_sitemap_xml(content: bytes) -> tuple[list[str], bool]:
     return urls, is_index
 
 
-def _expand_sitemap_to_page_urls(session: Any, start_url: str) -> list[str]:
+def _expand_sitemap_to_page_urls(session: Any, start_url: str, progress_cb=None) -> list[str]:
     page_urls: list[str] = []
     seen_sm: set[str] = set()
     queue = [start_url]
+    t0 = _time.time()
     while queue and len(page_urls) < _SITEMAP_LOC_CAP:
+        if _SITEMAP_EXPAND_TIMEOUT_SEC > 0 and (_time.time() - t0) > _SITEMAP_EXPAND_TIMEOUT_SEC:
+            break
         sm_url = queue.pop(0)
         if sm_url in seen_sm:
             continue
         if len(seen_sm) >= _MAX_SITEMAP_INDEX_ENTRIES:
             continue
         seen_sm.add(sm_url)
+        if progress_cb:
+            try:
+                progress_cb(len(seen_sm), len(queue), len(page_urls))
+            except Exception:
+                pass
         _jitter_sleep()
         r = _http_get_armored(session, sm_url, timeout=30.0)
         if r is None or r.status_code != 200 or not r.content:
@@ -689,8 +698,29 @@ def run_scraper_sync(
     session = _session()
     all_page_urls: list[str] = []
     seen_u: set[str] = set()
-    for seed in seeds:
-        expanded = _expand_sitemap_to_page_urls(session, seed)
+    for si, seed in enumerate(seeds):
+        if progress_cb:
+            try:
+                progress_cb(
+                    si + 1,
+                    max(1, len(seeds)),
+                    f"🔍 فهرسة sitemap للمتجر {si + 1}/{len(seeds)}...",
+                )
+            except Exception:
+                pass
+        expanded = _expand_sitemap_to_page_urls(
+            session,
+            seed,
+            progress_cb=lambda seen_sm, queued, found: (
+                progress_cb(
+                    si + 1,
+                    max(1, len(seeds)),
+                    f"🔍 sitemap {si + 1}/{len(seeds)} | خرائط:{seen_sm} | queued:{queued} | روابط:{found}",
+                )
+                if progress_cb
+                else None
+            ),
+        )
         products = [x for x in expanded if _product_url_heuristic(x)]
         stats["sitemap_total"] += len(expanded)
         stats["heuristic_accepted"] += len(products)
@@ -813,13 +843,13 @@ def run_scraper_sync(
         return None
 
     pending = [u for u in all_page_urls if u not in processed_urls]
-    pref: dict[str, dict[str, Any] | None] = {}
     urls_processed_this_run = [0]
 
     if _FETCH_WORKERS > 1 and pending:
         dyn_workers = max(1, min(_FETCH_WORKERS, _MAX_ADAPTIVE_WORKERS))
         high_success_since: float | None = None
         p = 0
+        stop_early = False
         while p < len(pending):
             chunk = pending[p : p + max(dyn_workers * 4, dyn_workers)]
             p += len(chunk)
@@ -831,7 +861,19 @@ def run_scraper_sync(
                     except Exception:
                         u = fut_map[fut]
                         row = None
-                    pref[u] = row
+                    if u in processed_urls:
+                        continue
+                    if _max_fetch_urls_reached(urls_processed_this_run[0]):
+                        stop_early = True
+                        break
+                    processed_urls.add(u)
+                    urls_processed_this_run[0] += 1
+                    i_pos = max(0, urls_processed_this_run[0] - 1)
+                    if _consume_row(u, row, i_pos) == "stop_products":
+                        stop_early = True
+                        break
+            if stop_early:
+                break
             br = _recent_block_ratio()
             now = _time.time()
             with _HTTP_STATUS_LOCK:
@@ -852,18 +894,6 @@ def run_scraper_sync(
                         high_success_since = now
                 else:
                     high_success_since = None
-        for i, u in enumerate(all_page_urls):
-            if u in processed_urls:
-                if progress_cb:
-                    progress_cb(i + 1, total_urls, last_name)
-                continue
-            if _max_fetch_urls_reached(urls_processed_this_run[0]):
-                break
-            row = pref.get(u)
-            processed_urls.add(u)
-            urls_processed_this_run[0] += 1
-            if _consume_row(u, row, i) == "stop_products":
-                break
     else:
         for i, u in enumerate(all_page_urls):
             if u in processed_urls:
