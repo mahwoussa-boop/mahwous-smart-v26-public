@@ -29,6 +29,34 @@ except ImportError:
     import os
     DB_PATH = os.path.join("/tmp", "pricing_v18.db")
 
+# أقصى نسبة انخفاض مسموح بها تلقائياً (يمنع «السباق نحو الصفر» عند أخطاء بيانات المنافس)
+MAX_DROP_PCT = 0.25
+_SAFE_DROP_WARNING = (
+    "⚠️ تم إيقاف الخفض: الانخفاض يتجاوز الحد الأقصى للنزول الآمن (25%). يتطلب مراجعة يدوية."
+)
+
+
+def _apply_max_drop_safeguard(decision: Dict) -> Dict:
+    """
+    إذا تجاوزت نسبة الخفض عن سعرنا الحالي MAX_DROP_PCT → لا يُسمح بالدفع التلقائي:
+    يُحوَّل القرار إلى مراجعة ويُعاد السعر المقترح إلى السعر القديم.
+    """
+    if not isinstance(decision, dict):
+        return decision
+    old = float(decision.get("old_price", 0) or 0)
+    new = float(decision.get("new_price", 0) or 0)
+    if old <= 0 or new >= old:
+        return decision
+    drop_pct = (old - new) / old
+    if drop_pct <= MAX_DROP_PCT:
+        return decision
+    out = dict(decision)
+    orig_reason = str(out.get("reason", "")).strip()
+    out["action"] = "review"
+    out["new_price"] = round(old, 2)
+    out["reason"] = (orig_reason + " " if orig_reason else "").strip() + " " + _SAFE_DROP_WARNING
+    return out
+
 
 # ═══════════════════════════════════════════════════════
 #  1. محرك القواعد (Rules Engine)
@@ -121,6 +149,7 @@ class AutomationEngine:
                     "match_score": match_score,
                     "timestamp": datetime.now().isoformat(),
                 })
+                decision = _apply_max_drop_safeguard(decision)
                 with self._lock:
                     self.decisions_log.append(decision)
                 return decision
@@ -152,10 +181,12 @@ class AutomationEngine:
         lower_c = sum(1 for d in log if d["action"] == "lower_price")
         raise_c = sum(1 for d in log if d["action"] == "raise_price")
         keep_c = sum(1 for d in log if d["action"] == "keep_price")
+        review_c = sum(1 for d in log if d.get("action") == "review")
         savings = sum(d["old_price"] - d["new_price"] for d in log if d["action"] == "lower_price")
         gains = sum(d["new_price"] - d["old_price"] for d in log if d["action"] == "raise_price")
         return {
             "total": len(log), "lower": lower_c, "raise": raise_c, "keep": keep_c,
+            "review": review_c,
             "savings": round(savings, 2), "gains": round(gains, 2),
             "net_impact": round(gains - savings, 2),
         }

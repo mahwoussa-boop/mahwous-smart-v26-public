@@ -11,12 +11,39 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
   3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62-96%
   4. score ≥97% → تلقائي فوري  |  score <62% → مفقود
 """
-import re, io, json, hashlib, sqlite3, time
+import re, io, json, hashlib, logging, sqlite3, time
 from datetime import datetime
 import pandas as pd
 from rapidfuzz import fuzz, process as rf_process
 from rapidfuzz.distance import Indel
 import requests as _req
+
+logger = logging.getLogger(__name__)
+
+
+def _clean_ai_json(text: str) -> str:
+    """
+    يهيّئ نص الـ LLM للتحليل بـ json.loads: يزيل سياج markdown ويستخرج أول كائن/مصفوفة JSON.
+    إن تعذّر العثور على أقواس صالحة، يُعاد النص الأصلي ليحاول المتصل الفشل بشكل طبيعي.
+    """
+    if not isinstance(text, str):
+        return ""
+    original = text
+    t = re.sub(r"```\w*", "", text, flags=re.IGNORECASE)
+    t = t.replace("```", "")
+    t = t.strip()
+    i_arr = t.find("[")
+    i_obj = t.find("{")
+    if i_arr < 0 and i_obj < 0:
+        return original.strip()
+    if i_arr >= 0 and (i_obj < 0 or i_arr < i_obj):
+        start, end = i_arr, t.rfind("]")
+    else:
+        start, end = i_obj, t.rfind("}")
+    if start < 0 or end < 0 or end <= start:
+        return original.strip()
+    return t[start : end + 1].strip()
+
 
 try:
     from engines.mahwous_core import apply_strict_pipeline_filters
@@ -26,6 +53,10 @@ except ImportError:
 try:
     from config import AUTO_DECISION_CONFIDENCE
 except Exception:
+    logger.error(
+        "config AUTO_DECISION_CONFIDENCE import failed; using default 92",
+        exc_info=True,
+    )
     AUTO_DECISION_CONFIDENCE = 92
 
 # ─── استيراد الإعدادات ───────────────────────
@@ -34,7 +65,11 @@ try:
                         MATCH_THRESHOLD, HIGH_CONFIDENCE, REVIEW_THRESHOLD,
                         PRICE_TOLERANCE, TESTER_KEYWORDS, SET_KEYWORDS,
                         GEMINI_API_KEYS, OPENROUTER_API_KEY)
-except:
+except Exception:
+    logger.error(
+        "config import failed; using bundled defaults for REJECT_KEYWORDS/KNOWN_BRANDS/etc.",
+        exc_info=True,
+    )
     REJECT_KEYWORDS = ["sample","عينة","عينه","decant","تقسيم","split","miniature"]
     KNOWN_BRANDS = [
         "Dior","Chanel","Gucci","Tom Ford","Versace","Armani","YSL","Prada","Burberry",
@@ -112,7 +147,10 @@ try:
             dict.fromkeys(list(GEMINI_API_KEYS or []) + list(_cfg_keys))
         )
 except Exception:
-    pass
+    logger.warning(
+        "merge GEMINI_API_KEYS from config failed (step=config merge)",
+        exc_info=True,
+    )
 
 # ─── مرادفات ذكية للعطور ────────────────────
 _SYN = {
@@ -294,14 +332,21 @@ def _init_db():
         cn = sqlite3.connect(_DB, check_same_thread=False)
         cn.execute("CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, v TEXT, ts TEXT)")
         cn.commit(); cn.close()
-    except: pass
+    except Exception:
+        logger.error("match cache DB init failed path=%s", _DB, exc_info=True)
 
 def _cget(k):
     try:
         cn = sqlite3.connect(_DB, check_same_thread=False)
         r = cn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
         cn.close(); return json.loads(r[0]) if r else None
-    except: return None
+    except Exception:
+        logger.error(
+            "match cache read failed key_prefix=%s",
+            (k[:32] + "…") if len(k) > 32 else k,
+            exc_info=True,
+        )
+        return None
 
 def _cset(k, v):
     try:
@@ -309,7 +354,12 @@ def _cset(k, v):
         cn.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",
                    (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat()))
         cn.commit(); cn.close()
-    except: pass
+    except Exception:
+        logger.error(
+            "match cache write failed key_prefix=%s",
+            (k[:32] + "…") if len(k) > 32 else k,
+            exc_info=True,
+        )
 
 _init_db()
 
@@ -325,7 +375,14 @@ def read_file(f):
                     df = pd.read_csv(f, encoding=enc, on_bad_lines='skip')
                     if len(df) > 0 and not df.columns[0].startswith('\ufeff'): 
                         break
-                except: continue
+                except Exception:
+                    logger.warning(
+                        "read_file CSV parse step failed encoding=%s file=%s",
+                        enc,
+                        getattr(f, "name", "?"),
+                        exc_info=True,
+                    )
+                    continue
             if df is None:
                 return None, "فشل قراءة الملف بجميع الترميزات"
         elif name.endswith(('.xlsx','.xls')):
@@ -341,6 +398,11 @@ def read_file(f):
         df = _smart_rename_columns(df)
         return df, None
     except Exception as e:
+        logger.error(
+            "read_file failed file=%s",
+            getattr(f, "name", "?"),
+            exc_info=True,
+        )
         return None, str(e)
 
 
@@ -387,8 +449,13 @@ def _smart_rename_columns(df):
                 try:
                     float(str(v).replace(',', ''))
                     numeric_count += 1
-                except:
-                    pass
+                except Exception:
+                    logger.warning(
+                        "_smart_rename_columns: numeric probe failed col=%r sample_val=%r",
+                        col,
+                        v,
+                        exc_info=True,
+                    )
             if numeric_count >= len(sample) * 0.7:
                 new_cols[col] = 'السعر'
             else:
@@ -471,6 +538,56 @@ def extract_size(text):
     # البحث عن ml
     ml = re.findall(r'(\d+(?:\.\d+)?)\s*(?:ml|مل|ملي|milliliter)', tl)
     return float(ml[0]) if ml else 0.0
+
+
+# ── Capacity & bundle guardrail (reject high fuzzy scores on wrong SKU/volume/bundle)
+_CAP_VOL_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(ml|milliliter|millilitres?|oz|ounce|ounces|مل|ملي)",
+    re.IGNORECASE | re.UNICODE,
+)
+_BUNDLE_KW_RE = re.compile(
+    r"(?:طقم|مجموعة|بكج|باكج|gift\s*set|طقم\s*هدايا|\bset\b|\bbundle\b|\bkit\b)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _first_capacity_ml_from_title(text: str) -> float | None:
+    """First explicit volume in a product title (ml equivalent), or None if absent."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    m = _CAP_VOL_RE.search(text)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1).replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+    unit = (m.group(2) or "").lower()
+    if unit.startswith("oz") or "ounce" in unit:
+        return round(val * 29.5735, 2)
+    return round(val, 2)
+
+
+def _has_bundle_keyword(text: str) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_BUNDLE_KW_RE.search(text))
+
+
+def _capacity_bundle_guardrail_ok(our_name: str, comp_name: str) -> bool:
+    """
+    False → force reject (do not treat as same product), regardless of fuzzy score.
+    - Both titles must show an explicit volume; if both exist and differ → reject.
+    - Bundle/set keywords on one side only → reject.
+    """
+    a = _first_capacity_ml_from_title(our_name)
+    b = _first_capacity_ml_from_title(comp_name)
+    if a is not None and b is not None and abs(a - b) > 1.5:
+        return False
+    if _has_bundle_keyword(our_name) != _has_bundle_keyword(comp_name):
+        return False
+    return True
+
 
 def extract_brand(text):
     if not isinstance(text, str): return ""
@@ -576,13 +693,12 @@ def extract_product_line(text, brand=""):
         'نيكولاي','nicolai',
         'ارماف','armaf',
     ]
-    # إزالة الكلمات الطويلة (4+ حروف) بـ replace عادي
-    # والكلمات القصيرة (1-3 حروف) بـ word boundary لمنع حذف أجزاء من كلمات أخرى
+    # إزالة كلمات التوقف: إنجليزي (رمز توكن واحد) → \b؛ عربي أو عبارات متعددة → حدود مسافة/نص (لا replace خام)
     for w in _STOP:
-        if len(w) <= 3:
-            n = re.sub(r'(?:^|\s)' + re.escape(w) + r'(?:\s|$)', ' ', n)
+        if re.match(r'^[a-zA-Z0-9_]+$', w):
+            n = re.sub(r'\b' + re.escape(w) + r'\b', ' ', n, flags=re.IGNORECASE)
         else:
-            n = n.replace(w, ' ')
+            n = re.sub(r'(?:^|\s)' + re.escape(w) + r'(?:\s|$)', ' ', n)
     # إزالة الأرقام (الحجم) + مل/ml الملتصقة
     n = re.sub(r'\d+(?:\.\d+)?\s*(?:ml|مل|ملي)?', ' ', n)
     # إزالة الرموز
@@ -626,15 +742,25 @@ def _price(row):
     for c in ["السعر","Price","price","سعر","PRICE"]:
         if c in row.index:
             try: return float(str(row[c]).replace(",",""))
-            except: pass
+            except Exception:
+                logger.warning(
+                    "_price: parse failed column=%r raw=%r",
+                    c,
+                    row.get(c),
+                    exc_info=True,
+                )
     # احتياطي: ابحث عن أي عمود رقمي يشبه السعر
     for c in row.index:
         try:
             v = float(str(row[c]).replace(",",""))
             if 1 <= v <= 99999:  # نطاق سعر معقول
                 return v
-        except:
-            pass
+        except Exception:
+            logger.warning(
+                "_price: heuristic column parse failed col=%r",
+                c,
+                exc_info=True,
+            )
     return 0.0
 
 def _pid(row, col):
@@ -647,7 +773,12 @@ def _pid(row, col):
         if fv == int(fv):
             return str(int(fv))
     except (ValueError, TypeError):
-        pass
+        logger.warning(
+            "_pid: float/int normalize failed col=%r v=%r",
+            col,
+            v,
+            exc_info=True,
+        )
     return str(v).strip()
 
 def _fcol(df, cands):
@@ -656,13 +787,15 @@ def _fcol(df, cands):
     # بحث 1: تطابق تام
     for c in cands:
         if c in cols: return c
-    # بحث 2: تطبيع الهمزات (أ/إ/آ → ا)
+    # بحث 2: تطبيع الهمزات (أ/إ/آ → ا) — قائمة موازية لـ cols لتجنب سقوط أعمدة متعددة في نفس مفتاح dict
     def _norm_ar(s):
         return str(s).replace('أ','ا').replace('إ','ا').replace('آ','ا').strip()
-    norm_cols = {_norm_ar(c): c for c in cols}
+    norm_cols = [_norm_ar(c) for c in cols]
     for c in cands:
         nc = _norm_ar(c)
-        if nc in norm_cols: return norm_cols[nc]
+        for j, ncol in enumerate(norm_cols):
+            if ncol == nc:
+                return cols[j]
     # بحث 3: بحث جزئي (العمود يحتوي على الكلمة المفتاحية)
     for c in cands:
         for col in cols:
@@ -694,7 +827,7 @@ class CompIndex:
         self.plines     = [extract_product_line(n, self.brands[i]) for i, n in enumerate(self.raw_names)]
         self.prices     = [_price(row) for _, row in df.iterrows()]
         self.ids        = [_pid(row, id_col) for _, row in df.iterrows()]
-        _img_cands = ["رابط_الصورة", "صورة_المنافس", "image_url", "صورة", "image"]
+        _img_cands = ["رابط_الصورة", "image_url", "صورة", "image"]
         img_col = next((c for c in _img_cands if c in df.columns), None)
         if img_col is None:
             for c in df.columns:
@@ -708,7 +841,7 @@ class CompIndex:
             else [""] * len(self.df)
         )
 
-    def search(self, our_norm, our_br, our_sz, our_tp, our_gd, our_pline="", top_n=6):
+    def search(self, our_norm, our_br, our_sz, our_tp, our_gd, our_pline="", top_n=6, our_raw=""):
         """بحث vectorized بـ rapidfuzz process.extract مع مقارنة خط الإنتاج"""
         if not self.norm_names: return []
 
@@ -764,6 +897,11 @@ class CompIndex:
                 # التستر يقارن فقط مع التستر، العطر الأساسي فقط مع الأساسي
                 if (our_class == 'tester') != (c_class == 'tester'):
                     continue
+
+            # ═══ سعة العبوة + طقم/مجموعة (قبل النقاط العالية للـ fuzzy) ═══
+            _our_nm = our_raw if our_raw else our_norm
+            if not _capacity_bundle_guardrail_ok(_our_nm, name):
+                continue
 
             # ═══ مقارنة الأرقام في أسماء المنتجات (نمبر 11 ≠ نمبر 10) ═══
             _NUM_WORDS = {
@@ -925,17 +1063,26 @@ def _ai_batch(batch):
     def _parse(txt):
         """يحلل استجابة AI إلى قائمة أرقام"""
         try:
-            clean = re.sub(r'```json|```', '', txt).strip()
-            s = clean.find('{'); e = clean.rfind('}') + 1
-            if s < 0 or e <= s:
-                return None
-            raw = json.loads(clean[s:e]).get("results", [])
+            clean = _clean_ai_json(txt)
+            data = json.loads(clean)
+            if isinstance(data, dict):
+                raw = data.get("results", [])
+            elif isinstance(data, list):
+                raw = data
+            else:
+                raw = []
             out = []
             for j, it in enumerate(batch):
                 n = raw[j] if j < len(raw) else 1
                 try:
                     n = int(float(str(n)))
                 except Exception:
+                    logger.warning(
+                        "_parse: candidate index parse failed j=%s raw_n=%r",
+                        j,
+                        raw[j] if j < len(raw) else None,
+                        exc_info=True,
+                    )
                     n = 1
                 if 1 <= n <= len(it["candidates"]):
                     out.append(n - 1)
@@ -945,6 +1092,11 @@ def _ai_batch(batch):
                     out.append(0)
             return out if len(out) == len(batch) else None
         except Exception:
+            logger.error(
+                "_parse: AI JSON response parse failed batch_size=%s",
+                len(batch),
+                exc_info=True,
+            )
             return None
 
     # ── 1. Gemini ─────────────────────────────────────────────────────────
@@ -975,9 +1127,17 @@ def _ai_batch(batch):
                             _cset(ck, out)
                             return out
                 except Exception:
-                    pass
+                    logger.error(
+                        "Gemini retry POST after 429 failed (same key)",
+                        exc_info=True,
+                    )
             # 403/400 → جرب المفتاح التالي فوراً
         except Exception:
+            logger.error(
+                "Gemini primary POST failed key_configured=%s",
+                bool(key),
+                exc_info=True,
+            )
             continue
 
     # ── 2. OpenRouter fallback ────────────────────────────────────────────
@@ -1005,6 +1165,11 @@ def _ai_batch(batch):
                 elif r.status_code in (401, 402):
                     break
             except Exception:
+                logger.error(
+                    "OpenRouter request failed model=%r",
+                    model,
+                    exc_info=True,
+                )
                 continue
 
     # ── 3. Fuzzy fallback — لا يتوقف أبداً ──────────────────────────────
@@ -1142,6 +1307,11 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         try:
             idxs = _ai_batch(pending)
         except Exception:
+            logger.error(
+                "_flush: _ai_batch failed pending_items=%s",
+                len(pending),
+                exc_info=True,
+            )
             # فشل AI → fallback: استخدم أفضل مرشح fuzzy
             idxs = []
             for it in pending:
@@ -1169,14 +1339,21 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                 if rr is not None:
                     results.append(rr)
             except Exception:
-                # خطأ في منتج واحد → تخطيه وأكمل
+                logger.error(
+                    "_flush: single row build failed product=%r",
+                    it.get("product"),
+                    exc_info=True,
+                )
                 continue
         pending.clear()
         # تأخير صغير بين الباتشات لمنع rate limit
         try:
             time.sleep(0.5)
         except Exception:
-            pass
+            logger.warning(
+                "sleep between AI batches interrupted",
+                exc_info=True,
+            )
 
     for i, (_, row) in enumerate(our_df.iterrows()):
         product = str(row.get(our_col, "")).strip()
@@ -1190,7 +1367,12 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             try:
                 our_price = float(str(row[our_price_col]).replace(",", ""))
             except Exception:
-                pass
+                logger.error(
+                    "run_full_analysis: our_price parse failed product=%r col=%r",
+                    product,
+                    our_price_col,
+                    exc_info=True,
+                )
 
         our_id  = _pid(row, our_id_col)
         our_img = ""
@@ -1200,6 +1382,12 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                 if pd.notna(_vim):
                     our_img = str(_vim).strip()
             except Exception:
+                logger.error(
+                    "run_full_analysis: our_img read failed product=%r col=%r",
+                    product,
+                    our_img_col,
+                    exc_info=True,
+                )
                 our_img = ""
         brand   = extract_brand(product)
         size    = extract_size(product)
@@ -1212,7 +1400,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         all_cands = []
         for idx_obj in indices.values():
             all_cands.extend(idx_obj.search(our_n, brand, size, ptype, gender,
-                                            our_pline=our_pl, top_n=6))
+                                            our_pline=our_pl, top_n=6, our_raw=product))
 
         if not all_cands:
             # ← الإصلاح الجوهري: لا يوجد أي منافس لهذا المنتج إطلاقاً
@@ -1291,6 +1479,12 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                         if len(pending) >= BATCH:
                             _flush()
                 except Exception:
+                    logger.error(
+                        "run_full_analysis: vision_match_court branch failed product=%r best=%r",
+                        product,
+                        best0.get("name"),
+                        exc_info=True,
+                    )
                     pending.append(dict(
                         product=product, our_price=our_price, our_id=our_id,
                         brand=brand, size=size, ptype=ptype, gender=gender,
@@ -1413,6 +1607,8 @@ def find_missing_products(our_df, comp_dfs):
         best_variant= (0, None, "")   # تستر ↔ أساسي
 
         for p in candidates[:400]:
+            if not _capacity_bundle_guardrail_ok(cp_raw, p["raw"]):
+                continue
             # ← المقارنة على bare (agg بدون تستر) بدل norm
             o_bare = p["bare"]
             base, set_sc, pline_sc = _score_pair(bare_cn, o_bare, c_pline, p["pline"])
@@ -1521,7 +1717,7 @@ def find_missing_products(our_df, comp_dfs):
             if not found:
                 for p in our_items:
                     direct = fuzz.token_set_ratio(bare_ck, p["bare"])
-                    if direct >= 82:   # 82% بعد الـ normalize_aggressive = تطابق فعلي
+                    if direct >= 82 and _capacity_bundle_guardrail_ok(cp, p["raw"]):
                         found = True
                         break
 
@@ -1682,7 +1878,11 @@ def smart_missing_barrier(
                 if fv == int(fv):
                     our_skus.add(str(int(fv)))
             except Exception:
-                pass
+                logger.warning(
+                    "find_missing_products: SKU float normalize failed v=%r",
+                    s,
+                    exc_info=True,
+                )
 
     keep_rows: list = []
     for idx, row in filtered_df.iterrows():
@@ -1696,13 +1896,22 @@ def smart_missing_barrier(
             if fv == int(fv) and str(int(fv)) in our_skus:
                 continue
         except Exception:
-            pass
+            logger.warning(
+                "find_missing_products: comp_sku float check failed comp_sku=%r comp_name=%r",
+                comp_sku,
+                comp_name[:80] if comp_name else "",
+                exc_info=True,
+            )
 
         if our_names and comp_name:
             match = rf_process.extractOne(
                 comp_name, our_names, scorer=fuzz.token_set_ratio
             )
-            if match and match[1] >= threshold:
+            if (
+                match
+                and match[1] >= threshold
+                and _capacity_bundle_guardrail_ok(match[0], comp_name)
+            ):
                 continue
 
         keep_rows.append(idx)

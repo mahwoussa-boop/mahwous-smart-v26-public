@@ -15,6 +15,11 @@ import os as _os
 import requests, json, re, time, traceback
 from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
+try:
+    from engines.engine import _clean_ai_json
+except ImportError:
+    from engine import _clean_ai_json
+
 _GM  = "gemini-2.0-flash"  # ← النموذج المستقر الموصى به (يدعم الرؤية)
 _GV = _os.environ.get("GEMINI_VISION_MODEL", _GM)
 _GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
@@ -215,11 +220,13 @@ def vision_match_court(
             if r.status_code != 200:
                 continue
             txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            clean = re.sub(r"```json|```", "", txt).strip()
-            s, e = clean.find("{"), clean.rfind("}") + 1
-            if s < 0 or e <= s:
+            clean = _clean_ai_json(txt)
+            try:
+                obj = json.loads(clean)
+            except json.JSONDecodeError:
                 continue
-            obj = json.loads(clean[s:e])
+            if not isinstance(obj, dict):
+                continue
             out["same_product"] = bool(obj.get("same_product"))
             out["reason"] = str(obj.get("reason", "")).strip() or "—"
             out["ok"] = True
@@ -435,12 +442,11 @@ def _call_cohere(prompt, system=""):
     return None
 
 def _parse_json(txt):
-    if not txt: return None
+    if not txt:
+        return None
     try:
-        clean = re.sub(r'```json|```','',txt).strip()
-        s = clean.find('{'); e = clean.rfind('}')+1
-        if s >= 0 and e > s:
-            return json.loads(clean[s:e])
+        clean = _clean_ai_json(txt)
+        return json.loads(clean)
     except Exception as e:
         _log_err("_parse_json", str(e)[:120])
     return None
