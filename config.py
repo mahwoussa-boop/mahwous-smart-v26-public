@@ -100,13 +100,22 @@ def get_gemini_api_keys():
     return _parse_gemini_keys()
 
 
+def get_openrouter_api_key() -> str:
+    """إعادة قراءة المفتاح من البيئة (Railway / Secrets دون إعادة تشغيل العملية)."""
+    return _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
+
+
+def get_cohere_api_key() -> str:
+    return _s("COHERE_API_KEY") or ""
+
+
 # ══════════════════════════════════════════════
 #  المفاتيح الفعلية
 # ══════════════════════════════════════════════
 GEMINI_API_KEYS    = _parse_gemini_keys()
 GEMINI_API_KEY     = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
-OPENROUTER_API_KEY = _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
-COHERE_API_KEY     = _s("COHERE_API_KEY") or ""
+OPENROUTER_API_KEY = get_openrouter_api_key()
+COHERE_API_KEY     = get_cohere_api_key()
 EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 
 # ══════════════════════════════════════════════

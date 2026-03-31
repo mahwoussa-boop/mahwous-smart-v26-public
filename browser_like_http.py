@@ -9,6 +9,8 @@
   SCRAPER_DISABLE_CURL_CFFI — 1 لتعطيل curl_cffi والاكتفاء بـ requests
   SCRAPER_USE_PLAYWRIGHT — 1 لتفعيل مسار Playwright في اكتشاف الخريطة عند الفشل
   SCRAPER_PW_SETTLE_MS — انتظار بعد تحميل الصفحة الرئيسية (افتراضي 2500)
+  SCRAPER_PROXY_LIST — قائمة بروكسيات مفصولة بفاصلة أو سطر (http://user:pass@host:port)
+  SCRAPER_UA_ROTATE_EVERY — تدوير User-Agent كل N طلبات (0 = معطّل)
 """
 from __future__ import annotations
 
@@ -75,6 +77,18 @@ def create_browser_tls_session() -> Any:
 
     s = curl_cffi_safe_session(curl_requests)
     return s
+
+
+def _parse_proxy_list_env() -> list[str]:
+    raw = (os.environ.get("SCRAPER_PROXY_LIST") or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    for part in raw.replace("\n", ",").split(","):
+        p = part.strip()
+        if p.startswith("http://") or p.startswith("https://"):
+            out.append(p)
+    return out
 
 
 def curl_cffi_safe_session(curl_requests_module) -> Any:
@@ -312,6 +326,9 @@ class AsyncScraperHTTP:
         self._curl: Any = None
         self._httpx: Any = None
         self._curl_entered = False
+        self._proxy_urls = _parse_proxy_list_env()
+        self._proxy_idx = 0
+        self._request_seq = 0
 
     async def __aenter__(self) -> "AsyncScraperHTTP":
         import httpx
@@ -360,6 +377,22 @@ class AsyncScraperHTTP:
                 self._curl = None
         return self
 
+    def _next_proxy_url(self) -> str | None:
+        if not self._proxy_urls:
+            return None
+        u = self._proxy_urls[self._proxy_idx % len(self._proxy_urls)]
+        self._proxy_idx += 1
+        return u
+
+    def _rotate_ua_headers(self) -> dict[str, str]:
+        every = int(os.environ.get("SCRAPER_UA_ROTATE_EVERY") or "0")
+        if every <= 0:
+            return {}
+        self._request_seq += 1
+        if self._request_seq % every != 0:
+            return {}
+        return {"User-Agent": random.choice(_USER_AGENTS)}
+
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._curl is not None:
             try:
@@ -385,9 +418,17 @@ class AsyncScraperHTTP:
     async def get_text_once(self, url: str, timeout: float = 25.0) -> tuple[int, str | None]:
         """طلب GET واحد: curl أولاً ثم httpx. يعيد (status_code, نص أو None)."""
         t = float(timeout)
+        px = self._next_proxy_url()
+        curl_proxies = {"http": px, "https": px} if px else None
+        extra_h = self._rotate_ua_headers()
         if self._curl is not None:
             try:
-                r = await self._curl.get(url, timeout=t, allow_redirects=True)
+                kwargs: dict[str, Any] = {"timeout": t, "allow_redirects": True}
+                if curl_proxies:
+                    kwargs["proxies"] = curl_proxies
+                if extra_h:
+                    kwargs["headers"] = extra_h
+                r = await self._curl.get(url, **kwargs)
                 code = int(getattr(r, "status_code", 0) or 0)
                 body = getattr(r, "text", None)
                 if body is None and getattr(r, "content", None) is not None:
@@ -400,7 +441,12 @@ class AsyncScraperHTTP:
             except Exception:
                 pass
         try:
-            r = await self._httpx.get(url, timeout=t)
+            kw: dict[str, Any] = {"timeout": t}
+            if extra_h:
+                kw["headers"] = extra_h
+            if px:
+                kw["proxy"] = px
+            r = await self._httpx.get(url, **kw)
             code = int(r.status_code)
             body = r.text or ""
             return code, (body if body else None)

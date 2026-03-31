@@ -14,6 +14,7 @@ app.py - نظام التسعير الذكي مهووس v26.0
 ✅ لوحة تحكم الأتمتة متصلة بالتنقل (v26.0)
 """
 import copy
+import hashlib
 from html import escape as _html_escape
 from textwrap import dedent as _dedent
 import json
@@ -69,7 +70,8 @@ from engines.automation import (AutomationEngine, ScheduledSearchManager,
 from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             export_multiple_sheets, parse_pasted_text,
                             safe_float, format_price, format_diff,
-                            export_missing_products_to_salla_csv_bytes)
+                            export_missing_products_to_salla_csv_bytes,
+                            make_salla_desc_fn)
 from utils.make_helper import (send_price_updates, send_new_products,
                                 send_missing_products, send_single_product,
                                 verify_webhook_connection, export_to_make_format,
@@ -84,6 +86,30 @@ from utils.db_manager import (init_db, log_event, log_decision,
                                merged_comp_dfs_for_analysis, load_all_comp_catalog_as_comp_dfs,
                                save_processed, get_processed, undo_processed,
                                get_processed_keys, migrate_db_v26)
+
+
+def _format_elapsed_compact(sec: float | int) -> str:
+    """عرض مدة قصيرة للواجهة: ١٢٣ث أو ٤:٠٥."""
+    try:
+        s = int(float(sec))
+    except (TypeError, ValueError):
+        return "—"
+    if s < 0:
+        s = 0
+    if s < 3600:
+        m, r = divmod(s, 60)
+        return f"{m}:{r:02d}" if m else f"{r}ث"
+    h, r2 = divmod(s, 3600)
+    m, r = divmod(r2, 60)
+    return f"{h}:{m:02d}:{r:02d}"
+
+
+def _missing_df_fingerprint(edf: pd.DataFrame) -> str:
+    """بصمة جدول المفقودات لتتبّع ما إذا تغيّر العرض بعد التجهيز."""
+    try:
+        return hashlib.sha256(edf.to_csv(index=False).encode("utf-8", errors="replace")).hexdigest()
+    except Exception:
+        return str(int(edf.shape[0]))
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -250,11 +276,11 @@ def _infer_api_diag_summary(diag: dict) -> dict:
                 out["gemini"] = "bad"
             else:
                 out["gemini"] = "unknown"
-    if not OPENROUTER_API_KEY:
+    if not get_openrouter_api_key():
         out["openrouter"] = "absent"
     else:
         out["openrouter"] = _classify_provider_line(diag.get("openrouter", ""))
-    if not COHERE_API_KEY:
+    if not get_cohere_api_key():
         out["cohere"] = "absent"
     else:
         out["cohere"] = _classify_provider_line(diag.get("cohere", ""))
@@ -267,8 +293,8 @@ def _presence_api_summary() -> dict:
     """بدون تشخيص — الوجود فقط (مفتاح مضاف أم لا)."""
     return {
         "gemini": "ok" if get_gemini_api_keys() else "absent",
-        "openrouter": "ok" if OPENROUTER_API_KEY else "absent",
-        "cohere": "ok" if COHERE_API_KEY else "absent",
+        "openrouter": "ok" if get_openrouter_api_key() else "absent",
+        "cohere": "ok" if get_cohere_api_key() else "absent",
         "wh_price": "ok" if WEBHOOK_UPDATE_PRICES else "absent",
         "wh_new": "ok" if WEBHOOK_NEW_PRODUCTS else "absent",
     }
@@ -831,7 +857,14 @@ def _default_scrape_live_snapshot():
         "done": False,
         "success": False,
         "error": None,
-        "scrape": {"current": 0, "total": 1, "label": ""},
+        "scrape": {
+            "current": 0,
+            "total": 1,
+            "label": "",
+            "elapsed_sec": 0,
+            "urls_per_min": 0.0,
+            "products_per_min": 0.0,
+        },
         "analysis": {
             "phase": "idle",
             "progress_pct": 0.0,
@@ -1046,9 +1079,18 @@ def _render_live_scrape_dashboard(snap: dict):
     counts = an.get("counts") or {}
     pct = float(sc.get("current", 0)) / max(float(sc.get("total", 1)), 1.0)
     st.progress(min(pct, 1.0), sc.get("label") or "🕸️ جاري الكشط...")
+    _es = int(sc.get("elapsed_sec") or 0)
+    _upm = sc.get("urls_per_min")
+    _ppm = sc.get("products_per_min")
+    _rate = ""
+    if _upm:
+        _rate += f" · ~{float(_upm):.1f} صفحة/د"
+    if _ppm:
+        _rate += f" · ~{float(_ppm):.1f} منتج/د"
     st.caption(
+        f"⏱️ **{_format_elapsed_compact(_es)}**{_rate} — "
         f"**التحليل:** {an.get('phase', '—')} — "
-        f"صفوف منافس مكسوبة (تراكمية): **{an.get('scraped_rows', 0)}**"
+        f"صفوف مكسوبة: **{an.get('scraped_rows', 0)}**"
     )
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("🔴 سعر أعلى", int(counts.get("price_raise", 0)))
@@ -1142,6 +1184,7 @@ def _run_scrape_chain_background():
     last_comp_df_ok: pd.DataFrame | None = None
     stores_completed = 0
     total_rows_across = 0
+    chain_t0 = time.time()
 
     for store_idx, job in enumerate(scrape_queue):
         comp_key = str(job.get("comp_key") or "Scraped_Competitor").strip() or "Scraped_Competitor"
@@ -1175,8 +1218,21 @@ def _run_scrape_chain_background():
                 "on_scrape_rows_tick": _make_scrape_rows_tick_fn(),
             }
 
-        def scrape_cb(current, total, last_name, _si=store_idx, _ts=total_stores):
+        def scrape_cb(current, total, last_name, _si=store_idx, _ts=total_stores, _t0=chain_t0):
             now = time.time()
+            elapsed = max(0.001, now - _t0)
+            elapsed_i = int(elapsed)
+            urls_pm = 0.0
+            ppm = 0.0
+            if elapsed > 2.0 and current > 0:
+                urls_pm = (float(current) / elapsed) * 60.0
+            try:
+                _snap_r = _read_scrape_live_snapshot()
+                sr = int((_snap_r.get("analysis") or {}).get("scraped_rows") or 0)
+                if elapsed > 2.0 and sr > 0:
+                    ppm = (float(sr) / elapsed) * 60.0
+            except Exception:
+                pass
             span = 1.0 / max(_ts, 1)
             base = _si / max(_ts, 1)
             pct = base + span * (current / max(total, 1))
@@ -1188,6 +1244,9 @@ def _run_scrape_chain_background():
                     merge_scraper_bg_state(
                         progress=min(pct, 0.998),
                         message=lbl[:220],
+                        elapsed_sec=elapsed_i,
+                        urls_per_min=round(urls_pm, 1),
+                        products_per_min=round(ppm, 1),
                     )
             if now - _last_live[0] >= 0.35 or current >= total:
                 _last_live[0] = now
@@ -1196,6 +1255,9 @@ def _run_scrape_chain_background():
                         "current": current,
                         "total": total,
                         "label": lbl[:240],
+                        "elapsed_sec": elapsed_i,
+                        "urls_per_min": round(urls_pm, 1),
+                        "products_per_min": round(ppm, 1),
                     }
                 )
 
@@ -1268,8 +1330,11 @@ def _run_scrape_chain_background():
 
     pl_out = (pl_dict_last or {}).get("out") or {}
     comp_names = ",".join(sorted(comp_dfs.keys()))
+    _scrape_elapsed_total = int(time.time() - chain_t0)
+    # متجر واحد فقط: يمكن الاعتماد على لقطة الـ pipeline النهائية. عدة متاجر: دائماً تحليل شامل على كل الكتالوج.
     if (
-        pipeline_inline_effective
+        total_stores == 1
+        and pipeline_inline_effective
         and pl_out.get("analysis_df") is not None
         and not pl_out.get("error")
         and pl_out.get("is_final")
@@ -1277,11 +1342,14 @@ def _run_scrape_chain_background():
         job_id = str(uuid.uuid4())[:8]
         merge_scraper_bg_state(
             progress=1.0,
-            message=f"✅ متجر واحد — حفظ النتائج ({total_rows_across} صف)...",
+            message=(
+                f"✅ كشط {_scrape_elapsed_total}ث — حفظ مقارنة المتجر ({total_rows_across} صف)…"
+            ),
             rows=total_rows_across,
             phase="analysis",
             job_id=job_id,
             active=True,
+            elapsed_sec=_scrape_elapsed_total,
         )
         t_done = threading.Thread(
             target=_persist_analysis_after_match,
@@ -1303,11 +1371,15 @@ def _run_scrape_chain_background():
     job_id = str(uuid.uuid4())[:8]
     merge_scraper_bg_state(
         progress=1.0,
-        message=f"✅ اكتمل كشط {stores_completed}/{total_stores} متجراً (~{total_rows_across} صف) — جاري التحليل الشامل...",
+        message=(
+            f"✅ كشط {stores_completed}/{total_stores} متجراً في {_scrape_elapsed_total}ث "
+            f"(~{total_rows_across} صف) — جاري المقارنة الشاملة على كل المنافسين…"
+        ),
         rows=total_rows_across,
         phase="analysis",
         job_id=job_id,
         active=True,
+        elapsed_sec=_scrape_elapsed_total,
     )
 
     t2 = threading.Thread(
@@ -1894,6 +1966,15 @@ with st.sidebar:
             min(_pct_s, 0.99),
             _sc.get("label") or f"🕸️ {_sc.get('current', 0)}/{_sc.get('total', 1)}",
         )
+        _el = int(_sc.get("elapsed_sec") or 0)
+        _um = _sc.get("urls_per_min") or 0
+        _pm = _sc.get("products_per_min") or 0
+        _line = f"⏱️ {_format_elapsed_compact(_el)}"
+        if _um:
+            _line += f" · ~{_um} صفحة/د"
+        if _pm:
+            _line += f" · ~{_pm} منتج/د"
+        st.caption(_line)
         _pct_a = float(_an.get("progress_pct") or 0)
         if _pct_a <= 0 and _sc.get("total"):
             _pct_a = min(
@@ -1940,6 +2021,14 @@ with st.sidebar:
             min(float(_sbg.get("progress", 0)), 0.99),
             _sbg.get("message") or "🕸️ جاري الكشط...",
         )
+        _sbg_es = int(_sbg.get("elapsed_sec") or 0)
+        if _sbg_es or _sbg.get("urls_per_min") or _sbg.get("products_per_min"):
+            _ln = f"⏱️ {_format_elapsed_compact(_sbg_es)}"
+            if _sbg.get("urls_per_min"):
+                _ln += f" · ~{_sbg.get('urls_per_min')} صفحة/د"
+            if _sbg.get("products_per_min"):
+                _ln += f" · ~{_sbg.get('products_per_min')} منتج/د"
+            st.caption(_ln)
         try:
             from streamlit_autorefresh import st_autorefresh
 
@@ -2678,6 +2767,27 @@ elif page == "🔍 منتجات مفقودة":
                 for _iss in _export_issues[:25]:
                     st.warning(_iss)
 
+            _salla_ai = st.checkbox(
+                "🤖 وصف «خبير مهووس» بالذكاء الاصطناعي في ملف استيراد سلة (عمود الوصف HTML)",
+                value=False,
+                key="miss_salla_ai_desc",
+                help="يستخرج مكونات الهرم العطري من الويب (Fragrantica عبر fetch_fragrantica_info) ثم يدمجها مع وصف AI. يُلحق قسماً مرجعياً بالمكونات في HTML. يستهلك رصيد API.",
+            )
+            _salla_ai_n = 500
+            if _salla_ai:
+                _salla_ai_n = int(
+                    st.number_input(
+                        "أقصى عدد منتجات يُوصَف بالذكاء الاصطناعي (الباقي قالب HTML ثابت)",
+                        min_value=1,
+                        max_value=2000,
+                        value=min(500, max(1, len(_export_df) if _export_ok and len(_export_df) > 0 else 500)),
+                        key="miss_salla_ai_n",
+                        help="زر «تجهيز ملف سلة» يولّد وصف AI حتى هذا الحد، ثم قالب ثابت لباقي الصفوف.",
+                    )
+                )
+
+            _miss_fp = _missing_df_fingerprint(_export_df) if _export_ok and len(_export_df) > 0 else ""
+
             cc1, cc2, cc3, cc4 = st.columns(4)
             with cc1:
                 if _export_ok:
@@ -2694,17 +2804,42 @@ elif page == "🔍 منتجات مفقودة":
                     st.caption("📄 CSV — يتطلب إصلاح الأخطاء أعلاه")
             with cc3:
                 if _export_ok and len(_export_df) > 0:
-                    _salla_b = export_missing_products_to_salla_csv_bytes(_export_df)
-                    st.download_button(
-                        "🛒 سلة CSV",
-                        data=_salla_b,
-                        file_name="missing_salla_import.csv",
-                        mime="text/csv; charset=utf-8",
-                        key="miss_salla_csv",
-                        help="استيراد جماعي سلة — UTF-8 BOM، صفّا رأس مطابقان لقالب سلة",
-                    )
+                    st.markdown("**استيراد سلة**")
+                    if st.button(
+                        "⚙️ تجهيز ملف سلة (كل المنتجات المعروضة)",
+                        key="miss_salla_prepare",
+                        help="يبني ملف CSV جاهز للاستيراد في سلة ثم يمكنك تحميله من الزر التالي.",
+                    ):
+                        _n = len(_export_df)
+                        _ai_n = min(_n, _salla_ai_n) if _salla_ai else 0
+                        if _salla_ai and _ai_n > 60:
+                            st.info(
+                                f"ℹ️ سيتم توليد وصف AI لـ {_ai_n} منتجاً (من أصل {_n}) — قد يستغرق وقتاً ويستهلك رصيد API."
+                            )
+                        with st.spinner(f"جاري تجهيز {_n} منتجاً لملف سلة…"):
+                            _salla_kw = {}
+                            if _salla_ai and _ai_n > 0:
+                                _salla_kw["generate_description"] = make_salla_desc_fn(True, _ai_n)
+                            _blob = export_missing_products_to_salla_csv_bytes(_export_df, **_salla_kw)
+                            st.session_state["missing_salla_csv_blob"] = _blob
+                            st.session_state["missing_salla_csv_src_fp"] = _miss_fp
+                        st.success(f"✅ تم تجهيز {_n} منتجاً — استخدم زر التحميل أدناه.")
+
+                    _blob_ok = st.session_state.get("missing_salla_csv_blob")
+                    _fp_saved = st.session_state.get("missing_salla_csv_src_fp")
+                    if _blob_ok and _fp_saved == _miss_fp:
+                        st.download_button(
+                            "📥 تحميل ملف سلة CSV",
+                            data=_blob_ok,
+                            file_name="missing_salla_import.csv",
+                            mime="text/csv; charset=utf-8",
+                            key="miss_salla_csv_dl",
+                            help="UTF-8 BOM — جاهز للاستيراد الجماعي في سلة.",
+                        )
+                    elif _blob_ok and _fp_saved != _miss_fp:
+                        st.warning("⚠️ الفلاتر أو البيانات تغيّرت — اضغط «تجهيز» من جديد قبل التحميل.")
                 else:
-                    st.caption("🛒 سلة CSV — يتطلب بيانات صالحة")
+                    st.caption("🛒 سلة — يتطلب بيانات صالحة")
             with cc4:
                 # ── خيارات الإرسال الذكي ─────────────────────────────
                 _conf_opts = {"🟢 مؤكدة فقط": "green", "🟡 محتملة": "yellow", "🔵 الكل": ""}

@@ -116,6 +116,17 @@ _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip()
 
 _PIPELINE_STOP = object()
 _RECENT_HTTP_STATUS = deque(maxlen=10)
+_SALLA_FAST_PATH = (os.environ.get("SCRAPER_SALLA_FAST_PATH") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+_SALLA_MAX_PAGES = max(1, min(2000, _env_int("SCRAPER_SALLA_MAX_PAGES", 500)))
+_SALLA_MERGE_SITEMAP = os.environ.get("SCRAPER_SALLA_MERGE_SITEMAP", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 _NON_PRODUCT_URL_TOKENS = (
     "/privacy", "/policy", "/policies", "/terms", "/shipping", "/returns",
     "/refund", "/contact", "/about", "/faq", "/blog", "/track", "/cart",
@@ -758,6 +769,7 @@ async def _run_scraper_async(
     if not seeds:
         return 0
 
+    scrape_wall_t0 = _time.time()
     seeds_fp = _seeds_fingerprint(seeds)
     if _CLEAR_CK:
         _clear_checkpoint_files()
@@ -773,12 +785,49 @@ async def _run_scraper_async(
         "dup_name": 0,
         "skip_non_product": 0,
         "skip_zero_price": 0,
+        "salla_fast": 0,
     }
 
     async with AsyncScraperHTTP() as fetcher:
+        from engines.salla_storefront import collect_salla_products_fast_path
+
+        seeds_for_sitemap: list[str] = list(seeds)
+        salla_pre: list[tuple[str, dict[str, Any]]] = []
+        if _SALLA_FAST_PATH:
+            seeds_for_sitemap = []
+            for seed in seeds:
+                batch: list[dict[str, Any]] = []
+                try:
+                    batch = await collect_salla_products_fast_path(
+                        fetcher,
+                        seed,
+                        max_pages=_SALLA_MAX_PAGES,
+                    )
+                except Exception:
+                    logger.exception("salla fast path failed seed=%s", (seed or "")[:200])
+                if batch:
+                    stats["salla_fast"] += len(batch)
+                    for p in batch:
+                        u = str(p.get("url") or seed)
+                        salla_pre.append(
+                            (
+                                u,
+                                {
+                                    "name": p["name"],
+                                    "price": p["price"],
+                                    "image": str(p.get("image") or ""),
+                                    "url": u,
+                                },
+                            )
+                        )
+                    if _SALLA_MERGE_SITEMAP:
+                        seeds_for_sitemap.append(seed)
+                else:
+                    seeds_for_sitemap.append(seed)
+
         all_page_urls: list[str] = []
         seen_u: set[str] = set()
-        for si, seed in enumerate(seeds):
+        for si, seed in enumerate(seeds_for_sitemap):
             if progress_cb:
                 try:
                     progress_cb(
@@ -834,7 +883,7 @@ async def _run_scraper_async(
             if _max_sitemap_urls_reached(len(all_page_urls)):
                 break
 
-        total_urls = len(all_page_urls)
+        total_urls = len(all_page_urls) + len(salla_pre)
         last_name = "جاري البحث..."
 
         pipeline_q: queue.Queue | None = None
@@ -968,8 +1017,17 @@ async def _run_scraper_async(
                 return "stop_products"
             return None
 
+        salla_stop_early = False
+        for si, (u, row) in enumerate(salla_pre):
+            if u in processed_urls:
+                continue
+            processed_urls.add(u)
+            if _consume_row(u, row, si) == "stop_products":
+                salla_stop_early = True
+                break
+
         pending = [u for u in all_page_urls if u not in processed_urls]
-        urls_processed_this_run = [0]
+        urls_processed_this_run = [len(salla_pre)]
         sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCH)
 
         async def _bounded_fetch_one(page_url: str) -> tuple[str, dict[str, Any] | None]:
@@ -983,7 +1041,7 @@ async def _run_scraper_async(
                     logger.exception("async scrape failed url=%s", page_url[:200])
                     return page_url, None
 
-        if pending:
+        if pending and not salla_stop_early:
             tasks = [asyncio.create_task(_bounded_fetch_one(u)) for u in pending]
             stop_early = False
             try:
@@ -1018,29 +1076,34 @@ async def _run_scraper_async(
         pipeline_q.put(_PIPELINE_STOP)
         pipeline_thread.join(timeout=7200)
 
+    _wall_sec = _time.time() - scrape_wall_t0
     if not rows:
         print(
             f"[SCRAPER] sitemap_total={stats['sitemap_total']} accepted={stats['heuristic_accepted']} "
-            f"rejected={stats['heuristic_rejected']} extract_ok={stats['extract_ok']} "
-            f"extract_fail={stats['extract_fail']} dup_name={stats['dup_name']} "
-            f"skip_non_product={stats['skip_non_product']} skip_zero_price={stats['skip_zero_price']}",
+            f"rejected={stats['heuristic_rejected']} salla_fast={stats.get('salla_fast', 0)} "
+            f"extract_ok={stats['extract_ok']} extract_fail={stats['extract_fail']} dup_name={stats['dup_name']} "
+            f"skip_non_product={stats['skip_non_product']} skip_zero_price={stats['skip_zero_price']} "
+            f"duration_sec={_wall_sec:.1f} product_rows=0",
             flush=True,
         )
         return 0
 
     write_competitors_csv(rows)
+    _nrows = len(rows)
+    _ppm = (_nrows / _wall_sec) * 60.0 if _wall_sec > 0.1 else 0.0
     print(
         f"[SCRAPER] sitemap_total={stats['sitemap_total']} accepted={stats['heuristic_accepted']} "
-        f"rejected={stats['heuristic_rejected']} extract_ok={stats['extract_ok']} "
-        f"extract_fail={stats['extract_fail']} dup_name={stats['dup_name']} "
-        f"skip_non_product={stats['skip_non_product']} skip_zero_price={stats['skip_zero_price']}",
+        f"rejected={stats['heuristic_rejected']} salla_fast={stats.get('salla_fast', 0)} "
+        f"extract_ok={stats['extract_ok']} extract_fail={stats['extract_fail']} dup_name={stats['dup_name']} "
+        f"skip_non_product={stats['skip_non_product']} skip_zero_price={stats['skip_zero_price']} "
+        f"duration_sec={_wall_sec:.1f} product_rows={_nrows} products_per_min≈{_ppm:.1f}",
         flush=True,
     )
 
     # اكتمال ناجح → حذف نقاط الحفظ ليبدأ الجلسة القادمة من جديد
     _clear_checkpoint_files()
 
-    return len(rows)
+    return _nrows
 
 
 def run_scraper_sync(
