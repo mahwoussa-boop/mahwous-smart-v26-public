@@ -23,11 +23,13 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from urllib.parse import urlparse
 
 from async_scraper import (
     merge_scraper_bg_state,
     read_scraper_bg_state,
     run_scraper_sync,
+    _load_sitemap_seeds,
 )
 from sitemap_resolve import resolve_store_to_sitemap_url
 
@@ -53,7 +55,8 @@ from engines.ai_engine import (call_ai, gemini_chat, chat_with_ai,
                                 fetch_fragrantica_info, fetch_product_images,
                                 generate_mahwous_description,
                                 analyze_paste, reclassify_review_items,
-                                ai_deep_analysis)
+                                ai_deep_analysis,
+                                apply_gemini_reclassify_to_analysis_df)
 from engines.automation import (AutomationEngine, ScheduledSearchManager,
                                  auto_push_decisions, auto_process_review_items,
                                  log_automation_decision, get_automation_log,
@@ -72,6 +75,7 @@ from utils.db_manager import (init_db, log_event, log_decision,
                                save_job_progress, get_job_progress, get_last_job,
                                save_hidden_product, get_hidden_product_keys,
                                init_db_v26, upsert_our_catalog, upsert_comp_catalog,
+                               merged_comp_dfs_for_analysis, load_all_comp_catalog_as_comp_dfs,
                                save_processed, get_processed, undo_processed,
                                get_processed_keys, migrate_db_v26)
 
@@ -94,6 +98,7 @@ _defaults = {
     "decisions_pending": {},   # {product_name: action}
     "our_df": None, "comp_dfs": None,  # حفظ الملفات للمنتجات المفقودة
     "hidden_products": set(),  # منتجات أُرسلت لـ Make أو أُزيلت
+    "scrape_preset_selection": [],  # أسماء منافسين من preset_competitors.json
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -161,6 +166,37 @@ def _split_results(df):
         "review":      df[_contains("القرار", "مراجعة")].reset_index(drop=True),
         "all":         df,
     }
+
+
+def _merge_verified_review_into_session(confirmed: pd.DataFrame) -> int:
+    """يدمج صفوفاً مؤكدة من تحت المراجعة في analysis_df ويعيد تقسيم الأقسام."""
+    if confirmed is None or confirmed.empty:
+        return 0
+    adf = st.session_state.get("analysis_df")
+    if adf is None or getattr(adf, "empty", True):
+        return 0
+    adf = adf.copy()
+    n = 0
+    for _, crow in confirmed.iterrows():
+        our_n = str(crow.get("المنتج", ""))
+        comp_n = str(crow.get("منتج_المنافس", ""))
+        new_dec = str(crow.get("القرار", "")).strip()
+        if not our_n or not new_dec:
+            continue
+        try:
+            mask = (adf["المنتج"].astype(str) == our_n) & (adf["منتج_المنافس"].astype(str) == comp_n)
+        except Exception:
+            continue
+        for ri in adf.index[mask]:
+            adf.at[ri, "القرار"] = new_dec
+            n += 1
+    st.session_state.analysis_df = adf
+    r_new = _split_results(adf)
+    prev = st.session_state.results or {}
+    if prev.get("missing") is not None:
+        r_new["missing"] = prev["missing"]
+    st.session_state.results = r_new
+    return n
 
 
 def _first_section_with_results(r: dict) -> str | None:
@@ -250,6 +286,12 @@ if st.session_state.results is None and not st.session_state.job_running and not
             st.session_state.results     = _auto_r
             st.session_state.analysis_df = _auto_df
             st.session_state.job_id      = _auto_job.get("job_id")
+            try:
+                _cdf_all = load_all_comp_catalog_as_comp_dfs()
+                if _cdf_all:
+                    st.session_state.comp_dfs = _cdf_all
+            except Exception:
+                pass
 
 
 # ── دوال مساعدة ───────────────────────────
@@ -271,6 +313,177 @@ def decision_badge(action):
     }
     c, label = colors.get(action, ("#666", action))
     return f'<span style="font-size:.7rem;color:{c};font-weight:700">{label}</span>'
+
+
+def _derive_competitor_display_name(user_label: str, store_urls: list[str]) -> str:
+    """اسم يظهر في عمود «المنافس» والبطاقات: من إدخال المستخدم أو من نطاق الرابط."""
+    t = (user_label or "").strip()
+    if t:
+        return t[:120]
+    for raw in store_urls or []:
+        u = (raw or "").strip()
+        if not u:
+            continue
+        try:
+            if not u.startswith(("http://", "https://")):
+                u = "https://" + u
+            p = urlparse(u)
+            host = (p.netloc or "").strip().lower()
+            if not host and p.path:
+                host = p.path.split("/")[0].strip().lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if host:
+                return host[:120]
+        except Exception:
+            continue
+    return "Scraped_Competitor"
+
+
+def _host_from_url(url: str) -> str:
+    """نطاق (host) من رابط المتجر أو الخريطة."""
+    try:
+        u = (url or "").strip()
+        if not u:
+            return "competitor"
+        if not u.startswith(("http://", "https://")):
+            u = "https://" + u
+        p = urlparse(u)
+        h = (p.netloc or "").strip().lower()
+        if h.startswith("www."):
+            h = h[4:]
+        return h[:120] if h else "competitor"
+    except Exception:
+        return "competitor"
+
+
+def _comp_key_for_queue_entry(source_url: str, user_label: str, single_store: bool) -> str:
+    """مفتاح منافس فريد لكل متجر في الطابور. متجر واحد: يحترم تسمية المستخدم؛ عدة متاجر: نطاق + تسمية اختيارية."""
+    if single_store:
+        return _derive_competitor_display_name(user_label, [source_url])
+    host = _host_from_url(source_url)
+    t = (user_label or "").strip()
+    if t:
+        return f"{t} | {host}"[:120]
+    return host
+
+
+def _parse_bulk_competitor_urls(text: str) -> list[str]:
+    """سطور أو فواصل — روابط فريدة بالترتيب (بدون تاب ثلاثي الأعمدة)."""
+    if not (text or "").strip():
+        return []
+    parts: list[str] = []
+    for chunk in text.replace("\r\n", "\n").replace(",", "\n").split("\n"):
+        chunk = chunk.strip().strip(",;")
+        if not chunk or "\t" in chunk:
+            continue
+        u = chunk
+        if not u.startswith(("http://", "https://")):
+            u = "https://" + u.lstrip("/")
+        if "://" in u:
+            parts.append(u)
+    return list(dict.fromkeys(parts))
+
+
+def _parse_competitor_bulk_entries(text: str) -> list[dict]:
+    """جدول منسوخ: «اسم المنافس» ثم تاب ثم «رابط المتجر» ثم تاب ثم «sitemap» — أو رابط واحد لكل سطر.
+
+    يُعاد قائمة قواميس: label, store_url, sitemap_url (اختياري).
+    """
+    out: list[dict] = []
+    if not (text or "").strip():
+        return out
+    for line in text.replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" in line:
+            parts = [p.strip() for p in line.split("\t") if p.strip()]
+            if not parts:
+                continue
+            if len(parts) >= 3:
+                label, store, sm = parts[0], parts[1], parts[2]
+                if store.startswith(("http://", "https://")) and sm.startswith(
+                    ("http://", "https://")
+                ):
+                    out.append(
+                        {"label": label, "store_url": store, "sitemap_url": sm}
+                    )
+                    continue
+            if len(parts) == 2:
+                a, b = parts[0], parts[1]
+                if b.startswith(("http://", "https://")) and not a.startswith(
+                    ("http://", "https://")
+                ):
+                    out.append({"label": a, "store_url": b, "sitemap_url": None})
+                elif a.startswith(("http://", "https://")) and b.startswith(
+                    ("http://", "https://")
+                ):
+                    out.append({"label": "", "store_url": a, "sitemap_url": b})
+                continue
+            if len(parts) == 1 and parts[0].startswith(("http://", "https://")):
+                out.append({"label": "", "store_url": parts[0], "sitemap_url": None})
+            continue
+        for u in _parse_bulk_competitor_urls(line):
+            out.append({"label": "", "store_url": u, "sitemap_url": None})
+    return out
+
+
+def _dedupe_competitor_entries(entries: list[dict]) -> list[dict]:
+    """منع تكرار نفس خريطة الموقع أو نفس رابط المتجر."""
+    seen: set[str] = set()
+    res: list[dict] = []
+    for e in entries:
+        sm = (e.get("sitemap_url") or "").strip()
+        st = (e.get("store_url") or "").strip()
+        key = sm if sm else st
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        res.append(e)
+    return res
+
+
+def load_preset_competitors() -> list[dict]:
+    """قائمة المنافسين الثابتة من `data/preset_competitors.json` (اسم، متجر، sitemap)."""
+    path = PRESET_COMPETITORS_PATH
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        su = str(item.get("store_url") or "").strip()
+        sm = str(item.get("sitemap_url") or "").strip()
+        if not name:
+            continue
+        if not su.startswith(("http://", "https://")) and not sm.startswith(
+            ("http://", "https://")
+        ):
+            continue
+        out.append({"name": name, "store_url": su, "sitemap_url": sm})
+    return out
+
+
+def _comp_key_for_scrape_entry(
+    explicit_name: str,
+    source_url: str,
+    user_label: str,
+    single_store: bool,
+) -> str:
+    """اسم المنافس من عمود الجدول يتقدّم على الاشتقاق من النطاق."""
+    ex = (explicit_name or "").strip()
+    if ex:
+        return ex[:120]
+    return _comp_key_for_queue_entry(source_url, user_label, single_store)
 
 
 def _comp_incremental_catalog_flush(comp_key: str = "Scraped_Competitor"):
@@ -296,6 +509,10 @@ def _persist_analysis_after_match(
     """بعد توفر جدول المطابقة: تاريخ أسعار، مفقود، حفظ job_progress، سجل التحليل."""
     total = len(our_df)
     processed = total
+    try:
+        apply_gemini_reclassify_to_analysis_df(analysis_df)
+    except Exception:
+        pass
     try:
         for _, row in analysis_df.iterrows():
             if safe_float(row.get("نسبة_التطابق", 0)) > 0:
@@ -566,17 +783,29 @@ def _make_on_pipeline_before_analysis():
     return _before
 
 
-def _make_on_analysis_snapshot(our_df, use_ai_partial: bool = False):
+def _make_on_analysis_snapshot(
+    our_df,
+    use_ai_partial: bool = False,
+    comp_key: str = "Scraped_Competitor",
+):
+    ck = (comp_key or "Scraped_Competitor").strip() or "Scraped_Competitor"
+
     def _cb(rows_snap, analysis_df, is_final):
+        try:
+            apply_gemini_reclassify_to_analysis_df(analysis_df)
+        except Exception:
+            pass
         r = _split_results(analysis_df)
         missing_df = pd.DataFrame()
         try:
             cdf = pd.DataFrame(rows_snap)
-            comp_dfs = {"Scraped_Competitor": cdf}
+            comp_dfs = merged_comp_dfs_for_analysis(ck, cdf)
             raw_m = find_missing_products(our_df, comp_dfs)
             missing_df = smart_missing_barrier(raw_m, our_df)
             missing_n = len(missing_df)
         except Exception:
+            missing_df = pd.DataFrame()
+            comp_dfs = merged_comp_dfs_for_analysis(ck, pd.DataFrame(rows_snap))
             missing_n = 0
         _r = dict(r)
         _r["missing"] = missing_df
@@ -587,9 +816,10 @@ def _make_on_analysis_snapshot(our_df, use_ai_partial: bool = False):
                     {
                         "results": _r,
                         "analysis_df": analysis_df,
-                        "comp_dfs": {"Scraped_Competitor": pd.DataFrame(rows_snap)},
+                        "comp_dfs": comp_dfs,
                         "our_df": our_df,
                         "is_partial": not is_final,
+                        "comp_key": ck,
                         "updated_at": datetime.now().isoformat(),
                     },
                     f,
@@ -649,7 +879,7 @@ def _render_live_scrape_dashboard(snap: dict):
 
 
 def _run_scrape_chain_background():
-    """كشط في الخيط: لوحة مباشرة + حفظ دفعات + تحليل مترافق + إنهاء job."""
+    """كشط في الخيط: طابور متاجر بالتسلسل، ثم تحليل يشمل جميع المنافسين في الكتالوج."""
     try:
         with open(SCRAPE_BG_CONTEXT, "rb") as f:
             ctx = pickle.load(f)
@@ -670,112 +900,168 @@ def _run_scrape_chain_background():
 
     scrape_bg = bool(ctx.get("scrape_bg", False))
     our_df = ctx["our_df"]
-    pipeline_inline = bool(ctx.get("pipeline_inline", True))
+    user_label = str(ctx.get("user_comp_label") or "").strip()
+    pipeline_inline = bool(ctx.get("pipeline_inline", True)) and (not scrape_bg)
     pl_every = int(ctx.get("pl_every") or 100)
     use_ai_partial = bool(ctx.get("use_ai_partial"))
     our_file_name = str(ctx.get("our_file_name") or "mahwous_catalog.csv")
     _raw_inc = os.environ.get("SCRAPER_INCREMENTAL_EVERY", "").strip()
     inc_every = int(_raw_inc) if _raw_inc.isdigit() else pl_every
-    flush_cb = _comp_incremental_catalog_flush("Scraped_Competitor")
+
+    scrape_queue = ctx.get("scrape_queue")
+    if not scrape_queue:
+        seeds = _load_sitemap_seeds()
+        n_seeds = len(seeds)
+        scrape_queue = [
+            {
+                "sitemap": s,
+                "comp_key": _comp_key_for_queue_entry(s, user_label, n_seeds <= 1),
+                "source_url": s,
+            }
+            for s in seeds
+            if isinstance(s, str) and s.startswith("http")
+        ]
+    if not scrape_queue:
+        merge_scraper_bg_state(
+            active=False,
+            phase="error",
+            error="لا توجد خرائط مواقع في الطابور.",
+        )
+        _live_scrape_thread_done(False, "طابور الكشط فارغ.")
+        return
+
+    total_stores = len(scrape_queue)
+    pipeline_inline_effective = bool(pipeline_inline) and total_stores <= 1
 
     _merge_scrape_live_snapshot(
         analysis_reset=True,
         running=True,
         done=False,
         success=False,
-        scrape={"current": 0, "total": 1, "label": "🕸️ جاري الكشط..."},
+        scrape={"current": 0, "total": 1, "label": f"🕸️ طابور: 0/{total_stores} متجر..."},
     )
     if scrape_bg:
         merge_scraper_bg_state(
             active=True,
             phase="scrape",
             progress=0.0,
-            message="🕸️ جاري الكشط...",
+            message=f"🕸️ طابور {total_stores} متجر — يبدأ الأول...",
             error=None,
             job_id=None,
             rows=0,
         )
 
-    pl_dict = None
-    if pipeline_inline:
-        pl_dict = {
-            "our_df": our_df,
-            "comp_key": "Scraped_Competitor",
-            "every": pl_every,
-            "use_ai_partial": use_ai_partial,
-            "incremental_every": max(1, inc_every),
-            "on_incremental_flush": flush_cb,
-            "on_analysis_snapshot": _make_on_analysis_snapshot(our_df, use_ai_partial),
-            "on_scrape_rows_tick": _make_scrape_rows_tick_fn(),
-            "on_pipeline_before_analysis": _make_on_pipeline_before_analysis(),
-        }
-    else:
-        pl_dict = {
-            "incremental_every": max(1, inc_every),
-            "on_incremental_flush": flush_cb,
-        }
-
     _last_merge = [0.0]
     _last_live = [0.0]
+    pl_dict_last: dict | None = None
+    last_comp_df_ok: pd.DataFrame | None = None
+    stores_completed = 0
+    total_rows_across = 0
 
-    def scrape_cb(current, total, last_name):
-        now = time.time()
-        pct = current / max(total, 1)
-        nm = (last_name or "")[:80]
-        if scrape_bg:
-            if now - _last_merge[0] >= 1.2 or pct >= 1.0:
-                _last_merge[0] = now
-                merge_scraper_bg_state(
-                    progress=min(pct, 1.0),
-                    message=f"🕸️ {current}/{total} | {nm}",
+    for store_idx, job in enumerate(scrape_queue):
+        comp_key = str(job.get("comp_key") or "Scraped_Competitor").strip() or "Scraped_Competitor"
+        sm = str(job.get("sitemap") or "").strip()
+        if not sm.startswith("http"):
+            continue
+
+        os.makedirs("data", exist_ok=True)
+        with open("data/competitors_list.json", "w", encoding="utf-8") as f:
+            json.dump([sm], f, ensure_ascii=False)
+
+        flush_cb = _comp_incremental_catalog_flush(comp_key)
+        if pipeline_inline_effective:
+            pl_dict: dict | None = {
+                "our_df": our_df,
+                "comp_key": comp_key,
+                "every": pl_every,
+                "use_ai_partial": use_ai_partial,
+                "incremental_every": max(1, inc_every),
+                "on_incremental_flush": flush_cb,
+                "on_analysis_snapshot": _make_on_analysis_snapshot(
+                    our_df, use_ai_partial, comp_key
+                ),
+                "on_scrape_rows_tick": _make_scrape_rows_tick_fn(),
+                "on_pipeline_before_analysis": _make_on_pipeline_before_analysis(),
+            }
+        else:
+            pl_dict = {
+                "incremental_every": max(1, inc_every),
+                "on_incremental_flush": flush_cb,
+            }
+
+        def scrape_cb(current, total, last_name, _si=store_idx, _ts=total_stores):
+            now = time.time()
+            span = 1.0 / max(_ts, 1)
+            base = _si / max(_ts, 1)
+            pct = base + span * (current / max(total, 1))
+            nm = (last_name or "")[:80]
+            lbl = f"🏪 متجر {_si + 1}/{_ts} | 🕸️ {current}/{total} | {nm}"
+            if scrape_bg:
+                if now - _last_merge[0] >= 1.2 or current >= total:
+                    _last_merge[0] = now
+                    merge_scraper_bg_state(
+                        progress=min(pct, 0.998),
+                        message=lbl[:220],
+                    )
+            if now - _last_live[0] >= 0.35 or current >= total:
+                _last_live[0] = now
+                _merge_scrape_live_snapshot(
+                    scrape={
+                        "current": current,
+                        "total": total,
+                        "label": lbl[:240],
+                    }
                 )
-        if now - _last_live[0] >= 0.35 or current >= total:
-            _last_live[0] = now
-            _merge_scrape_live_snapshot(
-                scrape={
-                    "current": current,
-                    "total": total,
-                    "label": f"🕸️ كشط: {current}/{total} | {nm}",
-                }
-            )
+
+        try:
+            nrows = run_scraper_sync(progress_cb=scrape_cb, pipeline=pl_dict)
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            if scrape_bg:
+                merge_scraper_bg_state(
+                    message=f"⚠️ متجر {store_idx + 1}/{total_stores}: {str(e)[:180]} — يُكمل للتالي",
+                )
+            continue
+
+        pl_dict_last = pl_dict
+
+        if not nrows or not os.path.isfile("data/competitors_latest.csv"):
+            continue
+
+        try:
+            comp_df = pd.read_csv("data/competitors_latest.csv")
+        except Exception:
+            continue
+
+        if comp_df.empty:
+            continue
+
+        try:
+            upsert_comp_catalog({comp_key: comp_df})
+        except Exception:
+            continue
+
+        stores_completed += 1
+        total_rows_across += int(nrows)
+        last_comp_df_ok = comp_df
 
     try:
-        nrows = run_scraper_sync(progress_cb=scrape_cb, pipeline=pl_dict)
-    except Exception as e:
-        import traceback
+        all_smaps = [j.get("sitemap") for j in scrape_queue if j.get("sitemap")]
+        if all_smaps:
+            with open("data/competitors_list.json", "w", encoding="utf-8") as f:
+                json.dump(all_smaps, f, ensure_ascii=False)
+    except Exception:
+        pass
 
-        traceback.print_exc()
+    if stores_completed == 0:
         merge_scraper_bg_state(
             active=False,
             phase="error",
-            error=f"فشل الكشط: {str(e)[:300]}",
-            progress=0.0,
-            message="",
+            error="لم يُكمل أي متجر في الطابور (تحقق من الخرائط والكشط).",
         )
-        _live_scrape_thread_done(False, f"فشل الكشط: {str(e)[:300]}")
-        return
-
-    if not nrows or not os.path.isfile("data/competitors_latest.csv"):
-        merge_scraper_bg_state(
-            active=False,
-            phase="error",
-            error="لم يُنتج الكشط بياناتاً كافية أو الملف مفقود.",
-        )
-        _live_scrape_thread_done(False, "لم يُنتج الكشط ملفاً صالحاً.")
-        return
-
-    try:
-        comp_df = pd.read_csv("data/competitors_latest.csv")
-    except Exception as e:
-        merge_scraper_bg_state(active=False, phase="error", error=f"قراءة CSV: {e}")
-        _live_scrape_thread_done(False, str(e))
-        return
-
-    if comp_df.empty:
-        merge_scraper_bg_state(
-            active=False, phase="error", error="ملف المنافس فارغ بعد الكشط."
-        )
-        _live_scrape_thread_done(False, "ملف المنافس فارغ.")
+        _live_scrape_thread_done(False, "فشل كشط كل المتاجر في الطابور.")
         return
 
     try:
@@ -785,26 +1071,28 @@ def _run_scrape_chain_background():
             id_col="رقم المنتج",
             price_col="السعر",
         )
-        comp_dfs = {"Scraped_Competitor": comp_df}
-        upsert_comp_catalog(comp_dfs)
+        comp_dfs = load_all_comp_catalog_as_comp_dfs()
+        if not comp_dfs and last_comp_df_ok is not None:
+            _lck = str(scrape_queue[-1].get("comp_key") or "Scraped_Competitor")
+            comp_dfs = merged_comp_dfs_for_analysis(_lck, last_comp_df_ok)
     except Exception as e:
         merge_scraper_bg_state(active=False, phase="error", error=f"الكتالوج: {e}")
         _live_scrape_thread_done(False, str(e))
         return
 
-    pl_out = (pl_dict or {}).get("out") or {}
+    pl_out = (pl_dict_last or {}).get("out") or {}
+    comp_names = ",".join(sorted(comp_dfs.keys()))
     if (
-        pipeline_inline
+        pipeline_inline_effective
         and pl_out.get("analysis_df") is not None
         and not pl_out.get("error")
         and pl_out.get("is_final")
     ):
         job_id = str(uuid.uuid4())[:8]
-        comp_names = ",".join(comp_dfs.keys())
         merge_scraper_bg_state(
             progress=1.0,
-            message=f"✅ اكتمل المسار ({len(comp_df)} صف) — حفظ النتائج...",
-            rows=len(comp_df),
+            message=f"✅ متجر واحد — حفظ النتائج ({total_rows_across} صف)...",
+            rows=total_rows_across,
             phase="analysis",
             job_id=job_id,
             active=True,
@@ -827,11 +1115,10 @@ def _run_scrape_chain_background():
         return
 
     job_id = str(uuid.uuid4())[:8]
-    comp_names = ",".join(comp_dfs.keys())
     merge_scraper_bg_state(
         progress=1.0,
-        message=f"✅ اكتمل الكشط ({len(comp_df)} صف) — جاري التحليل...",
-        rows=len(comp_df),
+        message=f"✅ اكتمل كشط {stores_completed}/{total_stores} متجراً (~{total_rows_across} صف) — جاري التحليل الشامل...",
+        rows=total_rows_across,
         phase="analysis",
         job_id=job_id,
         active=True,
@@ -978,6 +1265,12 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         page_num = 1
     start = (page_num - 1) * PAGE_SIZE
     page_df = filtered.iloc[start:start + PAGE_SIZE]
+    _deep_section_for_prefix = {
+        "raise": "🔴 سعر أعلى",
+        "lower": "🟢 سعر أقل",
+        "review": "⚠️ تحت المراجعة",
+        "approved": "✅ موافق",
+    }.get(prefix, "⚠️ تحت المراجعة")
 
        # ── الجدول البصري ─────────────────────
     for idx, row in page_df.iterrows():
@@ -1076,7 +1369,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
             st.markdown(comp_strip(all_comps), unsafe_allow_html=True)
 
         # ── أزرار لكل منتج ─────────────────────
-        b1, b2, b3, b4, b5, b6, b7, b8, b9 = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1])
+        b1, b2, b3, b4, b5, b6, b7, b8, b9, b10 = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
 
         with b1:  # AI تحقق ذكي — يُصحح القسم
             _ai_label = {"raise": "🤖 هل نخفض؟", "lower": "🤖 هل نرفع؟",
@@ -1285,6 +1578,21 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 else:
                     st.info("لا يوجد تاريخ بعد")
 
+        with b10:  # تحليل عميق (سوق + Gemini)
+            if st.button("🔬 عميق", key=f"deep_{prefix}_{idx}"):
+                with st.spinner("🔬 تحليل عميق..."):
+                    r_deep = ai_deep_analysis(
+                        our_name, our_price, comp_name, comp_price,
+                        section=_deep_section_for_prefix, brand=brand,
+                    )
+                    if r_deep.get("success"):
+                        st.markdown(
+                            f'<div class="ai-box">{r_deep.get("response", "")}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.warning(str(r_deep.get("response", "فشل التحليل")))
+
         st.markdown('<hr style="border:none;border-top:1px solid #1a1a2e;margin:6px 0">', unsafe_allow_html=True)
 
 
@@ -1449,6 +1757,12 @@ with st.sidebar:
                     _r["missing"] = missing_df
                     st.session_state.results     = _r
                     st.session_state.analysis_df = df_all
+                    try:
+                        _cdf_done = load_all_comp_catalog_as_comp_dfs()
+                        if _cdf_done:
+                            st.session_state.comp_dfs = _cdf_done
+                    except Exception:
+                        pass
                     _focus_sidebar_on_analysis_results(_r)
                 _sbg_done = read_scraper_bg_state()
                 if _sbg_done.get("job_id") and _sbg_done.get("job_id") == st.session_state.job_id:
@@ -1614,6 +1928,12 @@ if page == "📊 لوحة التحكم":
                     _r["missing"] = missing_df
                     st.session_state.results     = _r
                     st.session_state.analysis_df = df_all
+                    try:
+                        _cdf_last = load_all_comp_catalog_as_comp_dfs()
+                        if _cdf_last:
+                            st.session_state.comp_dfs = _cdf_last
+                    except Exception:
+                        pass
                     _focus_sidebar_on_analysis_results(_r)
                     st.rerun()
         else:
@@ -1659,6 +1979,56 @@ elif page == "📂 رفع الملفات":
         "مضاد الحظر: يُفضَّل تثبيت `curl-cffi` و`playwright` ثم `playwright install chromium`. "
         "عند الحظر يُعاد البحث تلقائيًا عبر Chromium. يمكن أيضًا لصق رابط .xml أو استيراد CSV."
     )
+
+    _presets_ui = load_preset_competitors()
+    with st.expander("📌 **المنافسون المحفوظون** (ملف `data/preset_competitors.json`)", expanded=True):
+        if not _presets_ui:
+            st.warning(
+                "تعذر تحميل القائمة. أنشئ أو راجع الملف: **`data/preset_competitors.json`** "
+                "(مصفوفة JSON: `name`, `store_url`, `sitemap_url` لكل متجر)."
+            )
+        else:
+            _plabels = [p["name"] for p in _presets_ui]
+            _bp1, _bp2, _bp3 = st.columns([1, 1, 2])
+            with _bp1:
+                if st.button(
+                    "✅ تحديد الكل",
+                    key="preset_select_all_btn",
+                    help=f"اختيار كل المنافسين ({len(_plabels)})",
+                ):
+                    st.session_state.scrape_preset_selection = list(_plabels)
+                    st.rerun()
+            with _bp2:
+                if st.button("⏹️ مسح التحديد", key="preset_clear_btn"):
+                    st.session_state.scrape_preset_selection = []
+                    st.rerun()
+            st.multiselect(
+                "اختر منافساً واحداً أو عدة منافسين من القائمة",
+                options=_plabels,
+                key="scrape_preset_selection",
+                help="يُدمج مع المربع المجمّع والحقول أدناه عند **بدء الكشط**. لمتجر واحد فقط اختر اسماً واحداً.",
+            )
+            st.caption(
+                f"**{len(_presets_ui)}** متجر في القائمة — عدّل الملف لتغيير الروابط الدائمة دون تعديل الكود."
+            )
+
+    st.text_area(
+        "روابط مجمّعة أو جدول منسوخ (Excel / Sheets)",
+        key="bulk_competitor_urls",
+        height=140,
+        placeholder=(
+            "سطر لكل متجر — إما رابط فقط، أو ثلاثة أعمدة مفصولة بـ Tab:\n"
+            "الاسم العربي\thttps://المتجر/\thttps://المتجر/sitemap.xml"
+        ),
+        help=(
+            "يدعم لصق جدول ثلاثي الأعمدة: اسم المنافس، رابط المتجر، رابط sitemap.xml "
+            "— يُستخدم الـ sitemap مباشرة دون بحث. يُدمج مع حقول «متجر 1، 2…»."
+        ),
+    )
+    st.caption(
+        "**عدة متاجر:** يُكشط كل متجر **بالتسلسل** ويُسجَّل في الكتالوج تحت مفتاحه، ثم يعمل **تحليل واحد** "
+        "يشمل جميع المنافسين. عند **أكثر من متجر** يُعطَّل التحليل المترافق أثناء الجلب (لأسباب دقة وزمن)."
+    )
     for i in range(len(st.session_state.scraper_urls)):
         st.caption(f"متجر {i+1}")
         st.text_input(
@@ -1671,6 +2041,13 @@ elif page == "📂 رفع الملفات":
     if st.button("➕ إضافة متجر آخر"):
         st.session_state.scraper_urls.append("")
         st.rerun()
+
+    st.text_input(
+        "اسم المنافس للعرض (في البطاقات والجداول)",
+        key="competitor_display_name",
+        placeholder="مثال: عالم جيفنشي — يُشتق تلقائياً من نطاق الرابط إذا تُرك فارغاً",
+        help="يُمرَّر إلى المحرك وعمود «المنافس» بدل الاسم البرمجي. عند الفراغ يُستخدم النطاق من الرابط (مثل worldgivenchy.com).",
+    )
 
     col_opt1, col_opt2, col_opt3 = st.columns(3)
     with col_opt1:
@@ -1704,36 +2081,72 @@ elif page == "📂 رفع الملفات":
     _scrape_busy = _snap_busy.get("running") and not _snap_busy.get("done")
 
     if st.button("🚀 بدء الكشط والتحليل", type="primary", disabled=_scrape_busy):
-        valid_urls = []
+        entries: list[dict] = []
+        _preset_map = {p["name"]: p for p in load_preset_competitors()}
+        for _pname in st.session_state.get("scrape_preset_selection") or []:
+            _pr = _preset_map.get(_pname)
+            if _pr:
+                entries.append(
+                    {
+                        "label": _pr["name"],
+                        "store_url": str(_pr.get("store_url") or ""),
+                        "sitemap_url": str(_pr.get("sitemap_url") or ""),
+                    }
+                )
+        entries.extend(
+            _parse_competitor_bulk_entries(
+                str(st.session_state.get("bulk_competitor_urls") or "")
+            )
+        )
         for i in range(len(st.session_state.scraper_urls)):
             v = (st.session_state.get(f"comp_url_{i}") or "").strip()
-            if v:
-                valid_urls.append(v)
-        if not valid_urls:
-            st.warning("⚠️ الرجاء إدخال رابط متجر واحد على الأقل.")
+            if not v:
+                continue
+            if not v.startswith(("http://", "https://")):
+                v = "https://" + v.lstrip("/")
+            entries.append({"label": "", "store_url": v, "sitemap_url": None})
+        entries = _dedupe_competitor_entries(entries)
+        if not entries:
+            st.warning(
+                "⚠️ اختر منافساً من **المنافسين المحفوظين**، أو أدخل رابطاً في الحقول / المربع المجمّع."
+            )
         else:
-            valid_sitemaps = []
-            prog_resolve = st.progress(0, "🔍 جاري البحث عن خرائط المواقع...")
+            resolved_triples: list[tuple[str, str, str]] = []
+            prog_resolve = st.progress(0, "🔍 جاري تجهيز خرائط المواقع...")
+            n_entries = len(entries)
 
-            for i, url in enumerate(valid_urls):
+            for i, e in enumerate(entries):
+                label = str(e.get("label") or "")
+                store = str(e.get("store_url") or "").strip()
+                sm_direct = str(e.get("sitemap_url") or "").strip()
+                hint = (label[:28] + "…") if len(label) > 28 else (label or store[:48])
                 prog_resolve.progress(
-                    (i) / max(len(valid_urls), 1),
-                    f"البحث عن خريطة: {url[:60]}...",
+                    (i) / max(n_entries, 1),
+                    f"({i + 1}/{n_entries}) {hint}",
                 )
-                sitemap_url, msg = resolve_store_to_sitemap_url(url)
-                if sitemap_url:
-                    valid_sitemaps.append(sitemap_url)
-                else:
-                    st.error(f"❌ فشل في {url}: {msg}")
+                if sm_direct.startswith(("http://", "https://")):
+                    src = store if store.startswith(("http://", "https://")) else sm_direct
+                    resolved_triples.append((label, src, sm_direct))
+                    continue
+                if store.startswith(("http://", "https://")):
+                    sitemap_url, msg = resolve_store_to_sitemap_url(store)
+                    if sitemap_url:
+                        resolved_triples.append((label, store, sitemap_url))
+                    else:
+                        st.error(f"❌ {hint or store}: {msg}")
+                    continue
+                st.error(f"❌ سطر بدون رابط صالح: {hint}")
 
-            prog_resolve.progress(1.0, "✅ اكتمل البحث عن الخرائط")
+            prog_resolve.progress(1.0, "✅ اكتمل تجهيز الخرائط")
 
-            if not valid_sitemaps:
+            if not resolved_triples:
                 st.error("❌ لم يتم العثور على أي خريطة موقع صالحة. لا يمكن بدء الكشط.")
             else:
-                st.success(
-                    f"✅ تم العثور على {len(valid_sitemaps)} متجر صالح. جاري بدء الكشط..."
-                )
+                _fail_n = n_entries - len(resolved_triples)
+                if _fail_n:
+                    st.warning(
+                        f"⚠️ تُجاهل {_fail_n} سطراً دون خريطة صالحة — يُكشط **{len(resolved_triples)}** متجراً في الطابور."
+                    )
                 our_path = os.path.join("data", "mahwous_catalog.csv")
                 our_df_pre = None
                 if not os.path.isfile(our_path):
@@ -1749,9 +2162,25 @@ elif page == "📂 رفع الملفات":
                     if max_rows > 0:
                         our_df_pre = our_df_pre.head(int(max_rows))
                     os.makedirs("data", exist_ok=True)
+                    _all_smaps = [p[2] for p in resolved_triples]
                     with open("data/competitors_list.json", "w", encoding="utf-8") as f:
-                        json.dump(valid_sitemaps, f, ensure_ascii=False)
+                        json.dump(_all_smaps, f, ensure_ascii=False)
 
+                    _comp_label = str(
+                        st.session_state.get("competitor_display_name") or ""
+                    ).strip()
+                    _n_res = len(resolved_triples)
+                    _single = _n_res <= 1
+                    _scrape_queue = [
+                        {
+                            "sitemap": sm,
+                            "comp_key": _comp_key_for_scrape_entry(
+                                lbl, src, _comp_label, _single
+                            ),
+                            "source_url": src,
+                        }
+                        for lbl, src, sm in resolved_triples
+                    ]
                     ctx = {
                         "our_df": our_df_pre,
                         "pipeline_inline": True if scrape_bg else pipeline_inline,
@@ -1762,6 +2191,8 @@ elif page == "📂 رفع الملفات":
                         in ("1", "true", "yes"),
                         "our_file_name": "mahwous_catalog.csv",
                         "scrape_bg": scrape_bg,
+                        "user_comp_label": _comp_label,
+                        "scrape_queue": _scrape_queue,
                     }
                     try:
                         with open(SCRAPE_BG_CONTEXT, "wb") as fctx:
@@ -1770,8 +2201,7 @@ elif page == "📂 رفع الملفات":
                         st.error(f"❌ تعذر حفظ سياق الكشط: {e}")
                     else:
                         _clear_live_session_pkl()
-                        st.session_state.results = None
-                        st.session_state.analysis_df = None
+                        # لا تُفرغ نتائج الأقسام — تبقى معروضة حتى تُستبدل بنتائج التحليل المندمج بعد اكتمال الجولة
                         _merge_scrape_live_snapshot(
                             analysis_reset=True,
                             running=True,
@@ -1785,14 +2215,18 @@ elif page == "📂 رفع الملفات":
                         )
                         add_script_run_ctx(t_sc)
                         t_sc.start()
+                        _qk = "، ".join([str(j.get("comp_key", ""))[:40] for j in _scrape_queue[:5]])
+                        _more = f" (+{_n_res - 5})" if _n_res > 5 else ""
                         if scrape_bg:
                             st.success(
                                 "✅ **الكشط** يعمل في الخيط — يمكنك التنقل. "
                                 "اللوحة المباشرة أدناه عند العودة لـ «رفع الملفات»؛ الشريط الجانبي يعرض التقدم."
+                                f" — الطابور (**{_n_res}**): {_qk}{_more}"
                             )
                         else:
                             st.success(
-                                "✅ **الكشط** يعمل — **اللوحة المباشرة** تُحدَّث كل ثانيتين (أرقام الأقسام + شريط التقدم)."
+                                "✅ **الكشط** يعمل — **اللوحة المباشرة** تُحدَّث دورياً (تقدّم لكل متجر بالتسلسل)."
+                                f" — الطابور (**{_n_res}**): {_qk}{_more}"
                             )
                         st.rerun()
 
@@ -2312,11 +2746,15 @@ elif page == "⚠️ تحت المراجعة":
         df = st.session_state.results["review"]
         if df is not None and not df.empty:
             st.warning(f"⚠️ {len(df)} منتج بمطابقة غير مؤكدة — يحتاج مراجعة بشرية أو AI")
+            st.caption(
+                "بعد كل جولة تحليل يُعاد تصنيف المراجعة تلقائياً عبر Gemini (ثقة ≥ 75%). "
+                "الزر أدناه يعيد التشغيل يدوياً على أول 30 صفاً ويحدّث الجدول."
+            )
 
             # ── تصنيف تلقائي بـ AI ────────────────────────────────────────
             col_r1, col_r2 = st.columns([2, 1])
             with col_r1:
-                if st.button("🤖 إعادة تصنيف بالذكاء الاصطناعي", type="primary", key="reclassify_review"):
+                if st.button("🤖 إعادة تصنيف يدوي (أول 30)", type="primary", key="reclassify_review"):
                     with st.spinner("🤖 AI يعيد تصنيف المنتجات..."):
                         _items_rc = []
                         for _, rr in df.head(30).iterrows():
@@ -2329,11 +2767,52 @@ elif page == "⚠️ تحت المراجعة":
                         _rc_results = reclassify_review_items(_items_rc)
                         if _rc_results:
                             _moved = 0
-                            for rc in _rc_results:
-                                _sec = rc.get("section","")
-                                if _sec and "مراجعة" not in _sec and rc.get("confidence",0) >= 75:
-                                    _moved += 1
-                            st.success(f"✅ AI نقل {_moved} منتج إلى قسمه الصحيح")
+                            adf = st.session_state.get("analysis_df")
+                            if adf is not None and not getattr(adf, "empty", True):
+                                for rc in _rc_results:
+                                    _sec = str(rc.get("section", "") or "")
+                                    try:
+                                        _conf = float(rc.get("confidence", 0) or 0)
+                                    except (TypeError, ValueError):
+                                        _conf = 0.0
+                                    if not _sec or "مراجعة" in _sec or _conf < 75:
+                                        continue
+                                    try:
+                                        _ixi = int(rc.get("idx"))
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if _ixi < 1 or _ixi > len(_items_rc):
+                                        continue
+                                    _it = _items_rc[_ixi - 1]
+                                    try:
+                                        _mask = (
+                                            adf["المنتج"].astype(str) == _it["our"]
+                                        ) & (
+                                            adf["منتج_المنافس"].astype(str) == _it["comp"]
+                                        )
+                                    except Exception:
+                                        continue
+                                    for _ri in adf.index[_mask]:
+                                        if "مراجعة" in str(adf.at[_ri, "القرار"]):
+                                            adf.at[_ri, "القرار"] = _sec
+                                            _moved += 1
+                                            break
+                                st.session_state.analysis_df = adf
+                                _r_new = _split_results(adf)
+                                _miss = st.session_state.results.get("missing")
+                                if _miss is not None:
+                                    _r_new["missing"] = _miss
+                                st.session_state.results = _r_new
+                                st.success(f"✅ حُدّث الجدول: نقل {_moved} صفاً بحسب Gemini")
+                                st.rerun()
+                            else:
+                                for rc in _rc_results:
+                                    _sec = rc.get("section", "")
+                                    if _sec and "مراجعة" not in _sec and rc.get("confidence", 0) >= 75:
+                                        _moved += 1
+                                st.warning(
+                                    f"اقتراحات AI: {_moved} — حمّل تحليلاً كاملاً من «رفع الملفات» لتطبيقها على الأقسام."
+                                )
                         else:
                             st.warning("لم يتمكن AI من إعادة التصنيف")
             with col_r2:
@@ -2408,7 +2887,7 @@ elif page == "⚠️ تحت المراجعة":
                 </div>""", unsafe_allow_html=True)
 
                 # ── أزرار المراجعة ─────────────────────────────────────
-                ba,bb,bc,bd,be = st.columns(5)
+                ba, bb, bc, bd, be, bf = st.columns(6)
 
                 with ba:
                     if st.button("🤖 تحقق AI", key=f"rv_verify_{idx}"):
@@ -2466,6 +2945,21 @@ elif page == "⚠️ تحت المراجعة":
                                        old_price=our_price,
                                        notes="تجاهل من تحت المراجعة")
                         st.rerun()
+
+                with bf:
+                    if st.button("🔬 عميق", key=f"rv_deep_{idx}"):
+                        with st.spinner("🔬 تحليل عميق..."):
+                            r_d = ai_deep_analysis(
+                                our_name, our_price, comp_name, comp_price,
+                                section="⚠️ تحت المراجعة", brand=brand,
+                            )
+                            if r_d.get("success"):
+                                st.markdown(
+                                    f'<div class="ai-box">{r_d.get("response", "")}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.warning(str(r_d.get("response", "فشل")))
 
                 st.markdown('<hr style="border:none;border-top:1px solid #0d1a2e;margin:6px 0">',
                             unsafe_allow_html=True)
@@ -3229,9 +3723,13 @@ elif page == "🔄 الأتمتة الذكية":
                     with st.spinner("🤖 AI يتحقق من المطابقات..."):
                         confirmed = auto_process_review_items(rev_df.head(15))
                     if not confirmed.empty:
-                        st.success(f"✅ تم تأكيد {len(confirmed)} منتج من أصل {min(15, len(rev_df))}")
+                        _n_applied = _merge_verified_review_into_session(confirmed)
+                        st.success(
+                            f"✅ دُمج {_n_applied} صفاً في التحليل — {len(confirmed)} مؤكّداً من AI. انتقل للأقسام المحدَّثة."
+                        )
                         st.dataframe(confirmed[["المنتج", "منتج_المنافس", "القرار"]].head(20),
                                      use_container_width=True)
+                        st.rerun()
                     else:
                         st.info("لم يتم تأكيد أي مطابقة — المنتجات تحتاج مراجعة يدوية")
             else:

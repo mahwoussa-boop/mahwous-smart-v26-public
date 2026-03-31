@@ -18,13 +18,16 @@ import pandas as pd
 
 try:
     from config import (AUTOMATION_RULES_DEFAULT, AUTO_DECISION_CONFIDENCE,
-                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES, DB_PATH)
+                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES,
+                        DB_PATH, REVIEW_VERIFY_MIN_CONFIDENCE)
 except ImportError:
     AUTOMATION_RULES_DEFAULT = []
     AUTO_DECISION_CONFIDENCE = 92
+    REVIEW_VERIFY_MIN_CONFIDENCE = 72
     AUTO_PUSH_TO_MAKE = False
     AUTO_SEARCH_INTERVAL_MINUTES = 360
-    DB_PATH = "perfume_pricing.db"
+    import os
+    DB_PATH = os.path.join("/tmp", "pricing_v18.db")
 
 
 # ═══════════════════════════════════════════════════════
@@ -216,13 +219,12 @@ def auto_process_review_items(review_df: pd.DataFrame) -> pd.DataFrame:
             v = verify_match(our_name, comp_name,
                              float(row.get("السعر", 0) or 0),
                              float(row.get("سعر_المنافس", 0) or 0))
-            if v.get("match") and float(v.get("confidence", 0)) >= AUTO_DECISION_CONFIDENCE:
-                rd = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
-                cs = v.get("correct_section", "")
-                if cs:
-                    rd["القرار"] = cs
+            conf = float(v.get("confidence", 0) or 0)
+            if v.get("match") and conf >= REVIEW_VERIFY_MIN_CONFIDENCE:
+                rd = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+                rd["القرار"] = v.get("ui_decision") or rd.get("القرار", "")
                 rd["_auto_verified"] = True
-                rd["_verification_confidence"] = v.get("confidence", 0)
+                rd["_verification_confidence"] = conf
                 confirmed.append(rd)
         except Exception:
             continue

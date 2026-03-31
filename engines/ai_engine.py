@@ -441,7 +441,8 @@ def _parse_json(txt):
         s = clean.find('{'); e = clean.rfind('}')+1
         if s >= 0 and e > s:
             return json.loads(clean[s:e])
-    except: pass
+    except Exception as e:
+        _log_err("_parse_json", str(e)[:120])
     return None
 
 def _search_ddg(query, num_results=5):
@@ -725,6 +726,7 @@ def generate_mahwous_description(product_name, price, fragrantica_data=None, ext
 
 # ══ تحقق منتج + تحديد القسم الصحيح ════════════════════════════════════════
 def verify_match(p1, p2, pr1=0, pr2=0):
+    from utils.decision_labels import ui_decision_from_verify_section
     diff = pr1 - pr2 if pr1 > 0 and pr2 > 0 else 0
     if pr1 > 0 and pr2 > 0:
         if diff > 10:     expected = "سعر اعلى"
@@ -752,7 +754,8 @@ def verify_match(p1, p2, pr1=0, pr2=0):
     sys = PAGE_PROMPTS["verify"]
     txt = _call_gemini(prompt, sys, temperature=0.1) or _call_openrouter(prompt, sys)
     if not txt:
-        return {"success":False,"match":False,"confidence":0,"reason":"فشل AI","correct_section":"تحت المراجعة","suggested_price":0}
+        return {"success":False,"match":False,"confidence":0,"reason":"فشل AI","correct_section":"تحت المراجعة","suggested_price":0,
+                "ui_decision": ui_decision_from_verify_section("تحت المراجعة", False)}
     data = _parse_json(txt)
     if data:
         sec = data.get("correct_section","")
@@ -761,9 +764,12 @@ def verify_match(p1, p2, pr1=0, pr2=0):
         elif "موافق" in sec:                 data["correct_section"] = "موافق"
         elif "مفقود" in sec:                 data["correct_section"] = "مفقود"
         else: data["correct_section"] = expected if data.get("match") else "مفقود"
+        data["ui_decision"] = ui_decision_from_verify_section(data.get("correct_section", ""), bool(data.get("match")))
         return {"success":True, **data}
     match = "true" in txt.lower() or "نعم" in txt
-    return {"success":True,"match":match,"confidence":65,"reason":txt[:200],"correct_section":expected if match else "مفقود","suggested_price":0}
+    cs = expected if match else "مفقود"
+    return {"success":True,"match":match,"confidence":65,"reason":txt[:200],"correct_section":cs,"suggested_price":0,
+            "ui_decision": ui_decision_from_verify_section(cs, match)}
 
 # ══ إعادة تصنيف قسم "تحت المراجعة" ════════════════════════════════════════
 def reclassify_review_items(items):
@@ -791,8 +797,78 @@ def reclassify_review_items(items):
             elif "موافق" in sec:                 r["section"] = "✅ موافق"
             elif "مفقود" in sec:                 r["section"] = "🔵 مفقود"
             else:                                 r["section"] = "⚠️ تحت المراجعة"
+            try:
+                r["confidence"] = float(r.get("confidence") or 0)
+            except (TypeError, ValueError):
+                r["confidence"] = 0.0
         return data["results"]
     return []
+
+
+def apply_gemini_reclassify_to_analysis_df(analysis_df, min_confidence: float = 75.0, batch_size: int = 30):
+    """
+    بعد المطابقة: يمرّ على صفوف «⚠️ تحت المراجعة» ويطلب من Gemini إعادة التصنيف على دفعات.
+    يحدّث عمود «القرار» في نفس DataFrame عند ثقة كافية (مثل زر المراجعة اليدوي).
+    """
+    if analysis_df is None or getattr(analysis_df, "empty", True):
+        return analysis_df
+    if "القرار" not in analysis_df.columns:
+        return analysis_df
+    try:
+        mask = analysis_df["القرار"].astype(str).str.contains("مراجعة", na=False)
+    except Exception:
+        return analysis_df
+    row_indices = analysis_df.index[mask].tolist()
+    if not row_indices:
+        return analysis_df
+
+    for start in range(0, len(row_indices), batch_size):
+        chunk_idx = row_indices[start : start + batch_size]
+        items = []
+        for ri in chunk_idx:
+            r = analysis_df.loc[ri]
+            try:
+                op = float(r.get("السعر", 0) or 0)
+            except (TypeError, ValueError):
+                op = 0.0
+            try:
+                cp = float(r.get("سعر_المنافس", 0) or 0)
+            except (TypeError, ValueError):
+                cp = 0.0
+            items.append({
+                "our": str(r.get("المنتج", "")),
+                "comp": str(r.get("منتج_المنافس", "")),
+                "our_price": op,
+                "comp_price": cp,
+            })
+        try:
+            results = reclassify_review_items(items)
+        except Exception:
+            continue
+        if not results:
+            continue
+        by_idx = {}
+        for res in results:
+            ix = res.get("idx")
+            if ix is None:
+                continue
+            try:
+                ix = int(ix)
+            except (TypeError, ValueError):
+                continue
+            by_idx[ix] = res
+        for pos, ri in enumerate(chunk_idx, start=1):
+            res = by_idx.get(pos)
+            if not res:
+                continue
+            sec = str(res.get("section", "") or "")
+            try:
+                conf = float(res.get("confidence", 0) or 0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            if sec and "مراجعة" not in sec and conf >= min_confidence:
+                analysis_df.at[ri, "القرار"] = sec
+    return analysis_df
 
 # ══ بحث أسعار السوق ══════════════════════════════════════════════════════
 def search_market_price(product_name, our_price=0):

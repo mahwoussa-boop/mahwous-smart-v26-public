@@ -19,11 +19,41 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
 from browser_like_http import create_scraper_session
+
+
+def _is_ld_product_group_node(node: dict) -> bool:
+    raw = node.get("@type")
+    parts = raw if isinstance(raw, list) else [raw]
+    for p in parts:
+        if p is None:
+            continue
+        s = str(p)
+        if re.search(r"(^|/|#)ProductGroup$", s, re.I):
+            return True
+        if str(p).strip().lower() == "productgroup":
+            return True
+    return False
+
+
+def _is_ld_product_node(node: dict) -> bool:
+    """Product في JSON-LD بما فيها http://schema.org/Product."""
+    raw = node.get("@type")
+    parts = raw if isinstance(raw, list) else [raw]
+    for p in parts:
+        if p is None:
+            continue
+        s = str(p)
+        if re.search(r"(^|/|#)Product$", s, re.I):
+            return True
+        if str(p).strip().lower() == "product":
+            return True
+    return False
+
 
 DATA_DIR = "data"
 LIST_PATH = os.path.join(DATA_DIR, "competitors_list.json")
@@ -33,11 +63,33 @@ SCRAPER_BG_STATE_PATH = os.path.join(DATA_DIR, "scraper_bg_state.json")
 CHECKPOINT_JSON = os.path.join(DATA_DIR, "scraper_checkpoint.json")
 CHECKPOINT_CSV = os.path.join(DATA_DIR, "competitors_checkpoint.csv")
 
-_MAX_URLS = int(os.environ.get("SCRAPER_MAX_URLS", "2500"))
-# حدّ جمع عناوين من ملفات sitemap فقط — منفصل عن حد الكشط حتى لا نُغلق الفهرس قبل sitemap-2.xml
-_SITEMAP_LOC_CAP = int(os.environ.get("SCRAPER_SITEMAP_LOC_CAP", "200000"))
-_MAX_SITEMAP_BYTES = 8 * 1024 * 1024
-_CHECKPOINT_EVERY = int(os.environ.get("SCRAPER_CHECKPOINT_EVERY", "100"))
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# 0 = بلا حد. فصل واضح:
+# - SCRAPER_MAX_FETCH_URLS: أقصى عدد روابط يُجلب ويُعالج (يتضمّن تخطّي المُعالَج سابقاً من checkpoint)
+# - SCRAPER_MAX_PRODUCT_ROWS: أقصى عدد صفوف منتجات تُضاف إلى rows
+# SCRAPER_MAX_URLS (قديم): يُطبَّق على جمع عناوين الـ sitemap فقط إن لم تُضبط SCRAPER_MAX_FETCH_URLS صراحةً
+_LEGACY_MAX = _env_int("SCRAPER_MAX_URLS", 0)
+_MAX_FETCH_URLS = _env_int("SCRAPER_MAX_FETCH_URLS", 0)
+if _MAX_FETCH_URLS <= 0 and _LEGACY_MAX > 0:
+    _MAX_FETCH_URLS = _LEGACY_MAX
+# افتراضي مرتفع للمتاجر الكبيرة (~8000+ منتج) — 0 يعني بلا حد
+_MAX_PRODUCT_ROWS = _env_int("SCRAPER_MAX_PRODUCT_ROWS", 0)
+# حدّ جمع عناوين URL من ملفات sitemap (صفحات وليست ملفات الفهرس)
+_SITEMAP_LOC_CAP = _env_int("SCRAPER_SITEMAP_LOC_CAP", 200000)
+# أقصى عدد ملفات sitemap مميّزة في فهرس (sitemapindex) — كان 400 ويُعطّل المتاجر الكبيرة
+_MAX_SITEMAP_INDEX_ENTRIES = _env_int("SCRAPER_SITEMAP_INDEX_CAP", 200000)
+# حجم استجابة XML واحدة قبل التخطي (متاجر ضخمة قد تولّد ملفات > 8 ميجا)
+_MAX_SITEMAP_BYTES = _env_int("SCRAPER_MAX_SITEMAP_BYTES", 32 * 1024 * 1024)
+_CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
 _FETCH_WORKERS = max(1, min(16, int(os.environ.get("SCRAPER_FETCH_WORKERS", "1"))))
 _PIPELINE_EVERY = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100"))
@@ -48,6 +100,22 @@ _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip()
 )
 
 _PIPELINE_STOP = object()
+
+
+def _max_sitemap_urls_reached(n: int) -> bool:
+    """سقف جمع عناوين URL من الـ sitemap (متوافق مع المتغير القديم SCRAPER_MAX_URLS)."""
+    return _LEGACY_MAX > 0 and n >= _LEGACY_MAX
+
+
+def _max_fetch_urls_reached(n_processed_urls: int) -> bool:
+    """سقف عدد الصفحات المستخرجة (بعد checkpoint)."""
+    return _MAX_FETCH_URLS > 0 and n_processed_urls >= _MAX_FETCH_URLS
+
+
+def _max_product_rows_reached(n_rows: int) -> bool:
+    """سقف عدد المنتجات المخزّنة في CSV/الدفعة."""
+    return _MAX_PRODUCT_ROWS > 0 and n_rows >= _MAX_PRODUCT_ROWS
+
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -172,7 +240,9 @@ def _expand_sitemap_to_page_urls(session: Any, start_url: str) -> list[str]:
     queue = [start_url]
     while queue and len(page_urls) < _SITEMAP_LOC_CAP:
         sm_url = queue.pop(0)
-        if sm_url in seen_sm or len(seen_sm) > 400:
+        if sm_url in seen_sm:
+            continue
+        if len(seen_sm) >= _MAX_SITEMAP_INDEX_ENTRIES:
             continue
         seen_sm.add(sm_url)
         _jitter_sleep()
@@ -215,8 +285,56 @@ def _product_url_heuristic(url: str) -> bool:
     return False
 
 
+def _ld_pick_first_image(val: Any) -> str | None:
+    """يستخرج رابط صورة من حقول JSON-LD (نص، ImageObject، قائمة، زد/سلة/Shopify)."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        s = val.strip()
+        return s if s else None
+    if isinstance(val, dict):
+        u = val.get("url") or val.get("contentUrl") or val.get("contentURL")
+        if isinstance(u, str) and u.strip():
+            return u.strip()
+        if isinstance(u, list) and u:
+            return _ld_pick_first_image(u[0])
+        nested = val.get("image")
+        if nested is not None and nested is not val:
+            got = _ld_pick_first_image(nested)
+            if got:
+                return got
+        uid = val.get("@id")
+        if isinstance(uid, str) and uid.startswith("http"):
+            return uid.strip()
+        return None
+    if isinstance(val, list):
+        for x in val:
+            got = _ld_pick_first_image(x)
+            if got:
+                return got
+    return None
+
+
+def _iter_ld_product_dicts(node: Any, out: list[dict[str, Any]]) -> None:
+    """يجمع كائنات Product من JSON-LD (بما فيها @graph) دون الخلط مع ProductGroup."""
+    if isinstance(node, dict):
+        if _is_ld_product_group_node(node):
+            for sub in node.get("hasVariant") or []:
+                _iter_ld_product_dicts(sub, out)
+        elif _is_ld_product_node(node):
+            out.append(node)
+        g = node.get("@graph")
+        if isinstance(g, list):
+            for x in g:
+                _iter_ld_product_dicts(x, out)
+    elif isinstance(node, list):
+        for x in node:
+            _iter_ld_product_dicts(x, out)
+
+
 def _extract_from_json_ld(html: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    fallback_img: str | None = None
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html,
@@ -227,33 +345,25 @@ def _extract_from_json_ld(html: str) -> dict[str, Any]:
             data = json.loads(raw)
         except Exception:
             continue
-        items = data if isinstance(data, list) else [data]
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            t = str(it.get("@type", "")).lower()
-            if "product" not in t and "product" not in str(it.get("@graph", "")).lower():
-                if "Product" not in str(it.get("@type", "")):
-                    g = it.get("@graph")
-                    if isinstance(g, list):
-                        for g0 in g:
-                            if isinstance(g0, dict) and "Product" in str(g0.get("@type", "")):
-                                it = g0
-                                break
+        products: list[dict[str, Any]] = []
+        _iter_ld_product_dicts(data, products)
+        for it in products:
             name = it.get("name")
-            if isinstance(name, str) and name:
-                out.setdefault("name", unescape(name))
-            img = it.get("image")
-            if isinstance(img, str) and img:
+            if isinstance(name, str) and name.strip():
+                out.setdefault("name", unescape(name.strip()))
+            img = _ld_pick_first_image(it.get("image"))
+            if img:
+                fallback_img = fallback_img or img
                 out.setdefault("image", img)
-            elif isinstance(img, list) and img and isinstance(img[0], str):
-                out.setdefault("image", img[0])
             offers = it.get("offers")
             if isinstance(offers, dict):
                 p = offers.get("price") or offers.get("lowPrice")
                 if p is not None:
                     try:
-                        out["price"] = float(str(p).replace(",", ""))
+                        out.setdefault(
+                            "price",
+                            float(str(p).replace(",", "").replace("\u00a0", "")),
+                        )
                     except Exception:
                         pass
             elif isinstance(offers, list) and offers:
@@ -262,13 +372,14 @@ def _extract_from_json_ld(html: str) -> dict[str, Any]:
                     p = o0.get("price") or o0.get("lowPrice")
                     if p is not None:
                         try:
-                            out["price"] = float(str(p).replace(",", ""))
+                            out.setdefault(
+                                "price",
+                                float(str(p).replace(",", "").replace("\u00a0", "")),
+                            )
                         except Exception:
                             pass
-            if out.get("name") and out.get("price") is not None:
-                break
-        if out.get("name"):
-            break
+    if not out.get("image") and fallback_img:
+        out["image"] = fallback_img
     return out
 
 
@@ -281,13 +392,26 @@ def _extract_meta_fallback(html: str) -> dict[str, Any]:
     )
     if m:
         out["name"] = unescape(m.group(1))
-    m = re.search(
+    for pat in (
         r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-        html,
-        re.I,
-    )
-    if m:
-        out["image"] = m.group(1).strip()
+        r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+        r'<meta\s+property=["\']og:image:secure_url["\']\s+content=["\']([^"\']+)["\']',
+        r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image:secure_url["\']',
+        r'<meta\s+name=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
+        r'<meta\s+name=["\']twitter:image:src["\']\s+content=["\']([^"\']+)["\']',
+    ):
+        m = re.search(pat, html, re.I)
+        if m:
+            out["image"] = m.group(1).strip()
+            break
+    if not out.get("image"):
+        m = re.search(
+            r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']',
+            html,
+            re.I,
+        )
+        if m:
+            out["image"] = m.group(1).strip()
     for pat in (
         r'"price"\s*:\s*([\d.]+)',
         r'itemprop=["\']price["\']\s+content=["\']([\d.]+)',
@@ -303,6 +427,23 @@ def _extract_meta_fallback(html: str) -> dict[str, Any]:
     return out
 
 
+def _absolutize_image_url(page_url: str, img: str | None) -> str | None:
+    """يحوّل روابط الصور النسبية أو // إلى رابط مطلق يعمل في <img src>."""
+    if not img:
+        return None
+    u = str(img).strip()
+    if not u or u.lower() in ("none", "null", "undefined"):
+        return None
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith(("http://", "https://")):
+        return u
+    try:
+        return urljoin(page_url, u)
+    except Exception:
+        return u
+
+
 def _scrape_url(session: Any, page_url: str) -> dict[str, Any] | None:
     _jitter_sleep()
     r = _http_get_armored(session, page_url, timeout=22.0)
@@ -310,14 +451,19 @@ def _scrape_url(session: Any, page_url: str) -> dict[str, Any] | None:
         return None
     html = r.text
     data = _extract_from_json_ld(html)
+    fb = _extract_meta_fallback(html)
     if not data.get("name"):
-        data.update(_extract_meta_fallback(html))
+        data.update({k: v for k, v in fb.items() if v is not None})
     if not data.get("name"):
         return None
-    if data.get("price") is None:
-        fb = _extract_meta_fallback(html)
-        if fb.get("price") is not None:
-            data["price"] = fb["price"]
+    if data.get("price") is None and fb.get("price") is not None:
+        data["price"] = fb["price"]
+    if not data.get("image") and fb.get("image"):
+        data["image"] = fb["image"]
+    if data.get("image"):
+        abs_u = _absolutize_image_url(page_url, data.get("image"))
+        if abs_u:
+            data["image"] = abs_u
     data["url"] = page_url
     return data
 
@@ -442,9 +588,12 @@ def _pipeline_analysis_worker(
                 pass
         use_ai = True if is_final else use_ai_partial
         try:
+            from utils.db_manager import merged_comp_dfs_for_analysis
+
+            _comp_dfs = merged_comp_dfs_for_analysis(comp_key, cdf)
             df = run_full_analysis(
                 our_df,
-                {comp_key: cdf},
+                _comp_dfs,
                 progress_callback=None,
                 use_ai=use_ai,
             )
@@ -527,9 +676,9 @@ def run_scraper_sync(
             elif not products and len(all_page_urls) < 80:
                 # لا توجد روابط تبدو كمنتجات — سلوك قديم: املأ حتى 80 رابطاً
                 all_page_urls.append(u)
-            if len(all_page_urls) >= _MAX_URLS:
+            if _max_sitemap_urls_reached(len(all_page_urls)):
                 break
-        if len(all_page_urls) >= _MAX_URLS:
+        if _max_sitemap_urls_reached(len(all_page_urls)):
             break
 
     total_urls = len(all_page_urls)
@@ -567,7 +716,7 @@ def run_scraper_sync(
 
     _scrape_tick = [0, 0.0]
 
-    def _consume_row(u: str, row: dict[str, Any] | None, i_pos: int) -> None:
+    def _consume_row(u: str, row: dict[str, Any] | None, i_pos: int):
         nonlocal last_name
         if row:
             name = str(row.get("name", "")).strip()
@@ -614,10 +763,13 @@ def run_scraper_sync(
             )
         if len(rows) % _CHECKPOINT_EVERY == 0 and rows:
             _save_checkpoint(seeds_fp, processed_urls, rows)
+        if _max_product_rows_reached(len(rows)):
+            return "stop_products"
         return None
 
     pending = [u for u in all_page_urls if u not in processed_urls]
     pref: dict[str, dict[str, Any] | None] = {}
+    urls_processed_this_run = [0]
 
     if _FETCH_WORKERS > 1 and pending:
         with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
@@ -634,10 +786,12 @@ def run_scraper_sync(
                 if progress_cb:
                     progress_cb(i + 1, total_urls, last_name)
                 continue
+            if _max_fetch_urls_reached(urls_processed_this_run[0]):
+                break
             row = pref.get(u)
             processed_urls.add(u)
-            _consume_row(u, row, i)
-            if len(rows) >= _MAX_URLS:
+            urls_processed_this_run[0] += 1
+            if _consume_row(u, row, i) == "stop_products":
                 break
     else:
         for i, u in enumerate(all_page_urls):
@@ -645,10 +799,12 @@ def run_scraper_sync(
                 if progress_cb:
                     progress_cb(i + 1, total_urls, last_name)
                 continue
+            if _max_fetch_urls_reached(urls_processed_this_run[0]):
+                break
             row = _scrape_url(session, u)
             processed_urls.add(u)
-            _consume_row(u, row, i)
-            if len(rows) >= _MAX_URLS:
+            urls_processed_this_run[0] += 1
+            if _consume_row(u, row, i) == "stop_products":
                 break
 
     if pipeline_q is not None and pipeline_thread is not None:

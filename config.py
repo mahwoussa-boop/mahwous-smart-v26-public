@@ -211,7 +211,9 @@ AUTOMATION_RULES_DEFAULT = [
 # جدولة البحث الدوري (بالدقائق)
 AUTO_SEARCH_INTERVAL_MINUTES = 60 * 6   # كل 6 ساعات
 AUTO_PUSH_TO_MAKE = False               # إرسال تلقائي لـ Make.com (يتطلب تفعيل يدوي)
-AUTO_DECISION_CONFIDENCE = 92           # حد الثقة للقرار التلقائي
+AUTO_DECISION_CONFIDENCE = 92           # حد الثقة للقرار التلقائي (تسعير/رفع-خفض)
+# تحقق AI لقسم المراجعة — واقعي مع مخرجات verify_match (غالباً 65–90)
+REVIEW_VERIFY_MIN_CONFIDENCE = 72
 
 # ══════════════════════════════════════════════
 #  أقسام التطبيق (v26.0 — مع لوحة الأتمتة)
@@ -233,4 +235,8 @@ SECTIONS = [
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-DB_PATH          = "perfume_pricing.db"
+# مسار SQLite الوحيد — يُعرّف في db_manager ويُستورد هنا لتوحيد الأتمتة مع باقي التطبيق
+from utils.db_manager import DB_PATH  # noqa: E402
+
+# قائمة المنافسين الافتراضية للكشط — يُحمَّل من الملف؛ يمكن تعديل JSON دون المساس بالكود
+PRESET_COMPETITORS_PATH = _os.path.join("data", "preset_competitors.json")
