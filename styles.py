@@ -143,16 +143,49 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
 </div><div style="text-align:center;background:#1A1A2E;padding:4px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:.9rem">الفرق: {diff:+.0f} ر.س</span></div>'''
 
 
-def comp_strip(all_comps):
-    """شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم واسم المنتج لديهم مرتبين من الأقل"""
-    if not all_comps or not isinstance(all_comps, list) or len(all_comps) == 0:
+def comp_strip(all_comps, our_price=None, rank_by_threat=False, show_threat_badge=False):
+    """شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم واسم المنتج لديهم.
+
+    - افتراضياً: ترتيب من **الأقل سعراً** (سلوك قديم).
+    - إذا ``rank_by_threat=True`` و``our_price`` > 0: ترتيب بـ **Threat Score** (WTI) عند توفر ``utils.threat_score``.
+    - يقبل ``list[dict]`` أو ``pandas.DataFrame`` (صفوف كمنافسين).
+    """
+    if all_comps is None:
         return ""
-    # ترتيب من الأقل سعراً
-    sorted_comps = sorted(all_comps, key=lambda c: float(c.get("price", 0) or 0))
+    try:
+        import pandas as pd
+
+        _has_pd = True
+    except ImportError:
+        pd = None
+        _has_pd = False
+    if _has_pd and isinstance(all_comps, pd.DataFrame):
+        if all_comps.empty:
+            return ""
+        work = all_comps.to_dict("records")
+    elif isinstance(all_comps, list):
+        if len(all_comps) == 0:
+            return ""
+        work = [dict(c) if isinstance(c, dict) else c for c in all_comps]
+    else:
+        return ""
+    if rank_by_threat and our_price is not None and float(our_price) > 0:
+        try:
+            from utils.threat_score import rank_competitors_for_ui
+
+            sorted_comps = rank_competitors_for_ui(work, float(our_price))
+        except Exception:
+            sorted_comps = sorted(
+                work, key=lambda c: float(c.get("price", c.get("comp_price", 0)) or 0)
+            )
+    else:
+        sorted_comps = sorted(
+            work, key=lambda c: float(c.get("price", c.get("comp_price", 0)) or 0)
+        )
     rows = []
     for i, cm in enumerate(sorted_comps):
         c_store = str(cm.get("competitor", "")).strip()
-        c_price = float(cm.get("price", 0) or 0)
+        c_price = float(cm.get("price", cm.get("comp_price", 0)) or 0)
         c_pname = str(cm.get("name", "")).strip()
         c_score = float(cm.get("score", 0) or 0)
         c_img = str(cm.get("image_url", "") or cm.get("image", "") or "").strip()
@@ -164,6 +197,16 @@ def comp_strip(all_comps):
         # اسم المنتج لدى المنافس (مختصر)
         short_pname = c_pname[:50] + ".." if len(c_pname) > 50 else c_pname
         score_html = f'<span style="color:#888;font-size:.62rem">{c_score:.0f}%</span>' if c_score > 0 else ""
+        threat_html = ""
+        if show_threat_badge and cm.get("threat_score") is not None:
+            try:
+                ts = float(cm["threat_score"])
+                threat_html = (
+                    f'<span style="color:#ff8a80;font-size:.58rem;margin-inline-start:4px" '
+                    f'title="Threat Score">⚡{ts:.1f}</span>'
+                )
+            except (TypeError, ValueError):
+                threat_html = ""
         img_html = (
             f'<img src="{_html_escape(c_img, quote=True)}" '
             f'style="width:50px;height:50px;border-radius:10px;object-fit:cover;'
@@ -181,7 +224,7 @@ def comp_strip(all_comps):
             f'<span style="font-weight:900;font-size:.8rem">{crown}</span>'
             f'<span style="font-weight:700;color:{name_color};font-size:.75rem;white-space:nowrap">{c_store}</span>'
             f'<span style="color:#aaa;font-size:.7rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px" title="{c_pname}">{short_pname}</span>'
-            f'{score_html}'
+            f'{score_html}{threat_html}'
             f'</div>'
             f'<span style="font-weight:900;color:{"#ff9800" if is_leader else "#9e9eff"};font-size:.85rem;white-space:nowrap">{c_price:,.0f} ر.س</span>'
             f'</div>'

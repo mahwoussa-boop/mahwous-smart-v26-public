@@ -17,11 +17,14 @@ import copy
 from html import escape as _html_escape
 from textwrap import dedent as _dedent
 import json
+import logging
 import os
 import pickle
 import streamlit as st
 import pandas as pd
 import threading
+
+_logger = logging.getLogger(__name__)
 import time
 import uuid
 from datetime import datetime
@@ -81,6 +84,13 @@ from utils.db_manager import (init_db, log_event, log_decision,
                                merged_comp_dfs_for_analysis, load_all_comp_catalog_as_comp_dfs,
                                save_processed, get_processed, undo_processed,
                                get_processed_keys, migrate_db_v26)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_filter_options(df: pd.DataFrame):
+    """خيارات الفلاتر — تُخزَّن مؤقتاً لتخفيف إعادة الحساب عند كل تفاعل."""
+    return get_filter_options(df)
+
 
 # ── إعداد الصفحة ──────────────────────────
 st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON,
@@ -462,13 +472,17 @@ if st.session_state.results is None and not st.session_state.job_running and not
                 if _cdf_all:
                     st.session_state.comp_dfs = _cdf_all
             except Exception:
-                pass
+                _logger.exception(
+                    "restore comp_dfs from load_all_comp_catalog_as_comp_dfs failed"
+                )
 
 
 # ── دوال مساعدة ───────────────────────────
 def db_log(page, action, details=""):
-    try: log_event(page, action, details)
-    except: pass
+    try:
+        log_event(page, action, details)
+    except Exception:
+        _logger.exception("db_log failed page=%s action=%s", page, action)
 
 def ts_badge(ts_str=""):
     """شارة تاريخ مصغرة جميلة"""
@@ -1322,7 +1336,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         return
 
     # ── فلاتر ─────────────────────────────────
-    opts = get_filter_options(df)
+    opts = _cached_filter_options(df)
     with st.expander("🔍 فلاتر متقدمة", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
         search   = c1.text_input("🔎 بحث",    key=f"{prefix}_s")
@@ -1429,10 +1443,25 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
     st.caption(f"عرض {len(filtered)} من {len(df)} منتج — {datetime.now().strftime('%H:%M:%S')}")
 
     # ── Pagination ─────────────────────────────
-    PAGE_SIZE = 25
+    PAGE_SIZE = 50
     total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
+    _pg_key = f"{prefix}_pg"
+    if _pg_key in st.session_state and int(st.session_state[_pg_key]) > total_pages:
+        st.session_state[_pg_key] = total_pages
     if total_pages > 1:
-        page_num = st.number_input("الصفحة", 1, total_pages, 1, key=f"{prefix}_pg")
+        c_prev, c_num, c_next = st.columns([1, 3, 1])
+        with c_prev:
+            _cur = int(st.session_state.get(_pg_key, 1))
+            if st.button("◀ السابق", key=f"{prefix}_pg_prev", disabled=_cur <= 1):
+                st.session_state[_pg_key] = max(1, _cur - 1)
+                st.rerun()
+        with c_next:
+            _cur = int(st.session_state.get(_pg_key, 1))
+            if st.button("التالي ▶", key=f"{prefix}_pg_next", disabled=_cur >= total_pages):
+                st.session_state[_pg_key] = min(total_pages, _cur + 1)
+                st.rerun()
+        with c_num:
+            page_num = st.number_input("الصفحة", 1, total_pages, key=_pg_key)
     else:
         page_num = 1
     start = (page_num - 1) * PAGE_SIZE
@@ -1540,7 +1569,10 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         # شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم
         all_comps = row.get("جميع_المنافسين", row.get("جميع المنافسين", []))
         if isinstance(all_comps, list) and len(all_comps) > 0:
-            st.markdown(comp_strip(all_comps), unsafe_allow_html=True)
+            st.markdown(
+                comp_strip(all_comps, our_price=our_price, rank_by_threat=True),
+                unsafe_allow_html=True,
+            )
 
         # ── أزرار لكل منتج ─────────────────────
         b1, b2, b3, b4, b5, b6, b7, b8, b9, b10 = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
@@ -2593,7 +2625,7 @@ elif page == "🔍 منتجات مفقودة":
                         st.markdown(f'<div class="ai-box">{resp}</div>', unsafe_allow_html=True)
 
             # ── فلاتر ─────────────────────────────────────────────────────
-            opts = get_filter_options(df)
+            opts = _cached_filter_options(df)
             with st.expander("🔍 فلاتر", expanded=False):
                 c1,c2,c3,c4,c5 = st.columns(5)
                 search   = c1.text_input("🔎 بحث", key="miss_s")
@@ -3773,12 +3805,15 @@ elif page == "⚙️ الإعدادات":
             elif "⚠️" in or_res: st.warning(or_res)
             else: st.error(or_res)
 
-            # ── نتائج Cohere ──────────────────────────────────────────────
+            # ── نتائج Cohere (احتياطي — التطبيق يعمل بدونها) ───────────────
             co_res = diag.get("cohere","")
             st.markdown("**Cohere:**")
-            if "✅" in co_res: st.success(co_res)
-            elif "⚠️" in co_res: st.warning(co_res)
-            else: st.error(co_res)
+            if "✅" in co_res:
+                st.success(co_res)
+            elif "⚠️" in co_res:
+                st.warning(co_res)
+            else:
+                st.error(co_res)
 
             # ── تحليل وتوصية ─────────────────────────────────────────────
             or_ok = "✅" in or_res

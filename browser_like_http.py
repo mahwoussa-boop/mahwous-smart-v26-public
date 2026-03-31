@@ -5,6 +5,7 @@
 
 متغيرات البيئة:
   SCRAPER_IMPERSONATE   — تعريف curl_cffi (افتراضي: chrome131)
+  SCRAPER_ASYNC_IMPERSONATE — curl_cffi للكشط async (افتراضي: chrome120)
   SCRAPER_DISABLE_CURL_CFFI — 1 لتعطيل curl_cffi والاكتفاء بـ requests
   SCRAPER_USE_PLAYWRIGHT — 1 لتفعيل مسار Playwright في اكتشاف الخريطة عند الفشل
   SCRAPER_PW_SETTLE_MS — انتظار بعد تحميل الصفحة الرئيسية (افتراضي 2500)
@@ -14,13 +15,14 @@ from __future__ import annotations
 import os
 import random
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
 
 _IMPERSONATE = (os.environ.get("SCRAPER_IMPERSONATE") or "chrome131").strip() or "chrome131"
+_ASYNC_IMPERSONATE = (os.environ.get("SCRAPER_ASYNC_IMPERSONATE") or "chrome120").strip() or "chrome120"
 _DISABLE_CURL = os.environ.get("SCRAPER_DISABLE_CURL_CFFI", "").lower() in ("1", "true", "yes")
 _PW_SETTLE_MS = int(os.environ.get("SCRAPER_PW_SETTLE_MS", "2500"))
 
@@ -28,6 +30,9 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
 
@@ -47,15 +52,16 @@ def create_requests_session() -> requests.Session:
     s.headers.update(
         {
             "User-Agent": random.choice(_USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
+            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
+            "DNT": "1",
         }
     )
     return s
@@ -107,26 +113,30 @@ def fetch_url_bytes(
     *,
     timeout: float = 22.0,
     max_body_bytes: int | None = None,
-    max_attempts: int = 2,
+    max_attempts: int = 4,
 ) -> tuple[int, bytes, bool]:
     """
-    GET كامل ثم اقتطاع المحتوى (موثوق مع curl_cffi و requests).
-    يعيد (الرمز، الجسم أو البادئة، هل واجهنا 429/403).
+    GET كامل ثم اقتطاع المحتوى مع Exponential Backoff (موثوق مع curl_cffi و requests).
+    يعيد (الرمز، الجسم أو البادئة، هل واجهنا 429/403/503).
     """
     saw_block = False
     last_code = 0
     for attempt in range(max_attempts):
         try:
-            time.sleep(0.2 + random.random() * 0.35)
+            time.sleep(random.uniform(0.3, 0.8))
             r = session.get(url, timeout=timeout, allow_redirects=True)
             last_code = getattr(r, "status_code", 0) or 0
-            if last_code in (429, 403):
+
+            if last_code in (429, 403, 503):
                 saw_block = True
                 if attempt + 1 < max_attempts:
-                    time.sleep(1.0 + random.random())
+                    backoff = (2**attempt) * 2.0 + random.uniform(0.5, 2.0)
+                    time.sleep(backoff)
                 continue
+
             if last_code != 200:
                 return last_code, b"", saw_block
+
             raw = r.content or b""
             if max_body_bytes is not None and len(raw) > max_body_bytes:
                 raw = raw[:max_body_bytes]
@@ -134,7 +144,8 @@ def fetch_url_bytes(
         except Exception:
             saw_block = True
             if attempt + 1 < max_attempts:
-                time.sleep(1.0 + random.random())
+                backoff = (2**attempt) * 2.0 + random.uniform(0.5, 2.0)
+                time.sleep(backoff)
             continue
     return last_code, b"", saw_block
 
@@ -207,11 +218,11 @@ def playwright_sub_fetch(
     *,
     page: Any | None = None,
     timeout_ms: float = 90000,
-    max_attempts: int = 2,
+    max_attempts: int = 4,
 ) -> tuple[int, bytes, bool]:
     """
-    طلبات من جلسة Playwright. إن فشل request.get (XHR)، يُجرّب page.goto
-    كما يفعل المتصفح عند فتح رابط مباشر (مفيد مع بعض سياسات Cloudflare).
+    طلبات من جلسة Playwright مع Exponential Backoff عند الحظر.
+    إن فشل request.get (XHR)، يُجرّب page.goto كما يفعل المتصفح عند فتح رابط مباشر.
     """
     saw_block = False
     last_code = 0
@@ -224,7 +235,7 @@ def playwright_sub_fetch(
 
     for attempt in range(max_attempts):
         try:
-            time.sleep(0.2 + random.random() * 0.3)
+            time.sleep(random.uniform(0.3, 0.8))
             resp = req.get(url, timeout=timeout_ms)
             last_code = resp.status
             if last_code == 200:
@@ -240,16 +251,169 @@ def playwright_sub_fetch(
                             return 200, _clip(b2), saw_block
                 except Exception:
                     pass
-            if last_code in (429, 403):
+            if last_code in (429, 403, 503):
                 saw_block = True
                 if attempt + 1 < max_attempts:
-                    time.sleep(1.2 + random.random())
+                    backoff = (2**attempt) * 2.5 + random.uniform(1.0, 3.0)
+                    time.sleep(backoff)
                 continue
             if last_code != 200:
                 return last_code, b"", saw_block
         except Exception:
             saw_block = True
             if attempt + 1 < max_attempts:
-                time.sleep(1.0 + random.random())
+                backoff = (2**attempt) * 2.0 + random.uniform(1.0, 2.0)
+                time.sleep(backoff)
             continue
     return last_code, b"", saw_block
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Phase 2 — كشط async: curl_cffi.AsyncSession + httpx.AsyncClient (احتياطي)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def curl_cffi_async_available() -> bool:
+    """هل يتوفر AsyncSession من curl_cffi (مع احترام SCRAPER_DISABLE_CURL_CFFI)."""
+    if _DISABLE_CURL:
+        return False
+    try:
+        from curl_cffi.requests import AsyncSession  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+async def _maybe_await_close(obj: Any) -> None:
+    if obj is None:
+        return
+    try:
+        c = getattr(obj, "close", None)
+        if callable(c):
+            out = c()
+            import asyncio
+
+            if asyncio.iscoroutine(out):
+                await out
+    except Exception:
+        pass
+
+
+class AsyncScraperHTTP:
+    """
+    جلسة HTTP للكشط غير المتزامن:
+    - أساسي: ``curl_cffi.requests.AsyncSession(impersonate=…)`` لتجاوز WAF/Cloudflare.
+    - احتياطي: ``httpx.AsyncClient`` عند فشل curl أو غيابه.
+    يُغلق كلاهما في ``__aexit__`` لتفادي تسرّب المقابس.
+    """
+
+    def __init__(self) -> None:
+        self._curl: Any = None
+        self._httpx: Any = None
+        self._curl_entered = False
+
+    async def __aenter__(self) -> "AsyncScraperHTTP":
+        import httpx
+
+        timeout = httpx.Timeout(30.0, connect=20.0)
+        headers = {
+            "User-Agent": random.choice(_USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "DNT": "1",
+        }
+        self._httpx = httpx.AsyncClient(
+            headers=headers,
+            timeout=timeout,
+            follow_redirects=True,
+            http2=False,
+        )
+        await self._httpx.__aenter__()
+
+        if curl_cffi_async_available():
+            try:
+                from curl_cffi.requests import AsyncSession
+
+                imp = _ASYNC_IMPERSONATE
+                session: Any = None
+                for cand in (imp, "chrome120", "chrome124", "chrome131", "safari17_0"):
+                    try:
+                        session = AsyncSession(impersonate=cand)
+                        break
+                    except Exception:
+                        continue
+                if session is not None:
+                    aenter = getattr(session, "__aenter__", None)
+                    if callable(aenter):
+                        await aenter()
+                        self._curl_entered = True
+                    self._curl = session
+            except Exception:
+                self._curl = None
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._curl is not None:
+            try:
+                if self._curl_entered:
+                    aexit = getattr(self._curl, "__aexit__", None)
+                    if callable(aexit):
+                        await aexit(exc_type, exc, tb)
+                    else:
+                        await _maybe_await_close(self._curl)
+                else:
+                    await _maybe_await_close(self._curl)
+            except Exception:
+                pass
+            self._curl = None
+
+        if self._httpx is not None:
+            try:
+                await self._httpx.__aexit__(exc_type, exc, tb)
+            except Exception:
+                pass
+            self._httpx = None
+
+    async def get_text_once(self, url: str, timeout: float = 25.0) -> tuple[int, str | None]:
+        """طلب GET واحد: curl أولاً ثم httpx. يعيد (status_code, نص أو None)."""
+        t = float(timeout)
+        if self._curl is not None:
+            try:
+                r = await self._curl.get(url, timeout=t, allow_redirects=True)
+                code = int(getattr(r, "status_code", 0) or 0)
+                body = getattr(r, "text", None)
+                if body is None and getattr(r, "content", None) is not None:
+                    raw = r.content
+                    if isinstance(raw, (bytes, bytearray)):
+                        body = raw.decode("utf-8", errors="replace")
+                    else:
+                        body = str(raw)
+                return code, (body if body else None)
+            except Exception:
+                pass
+        try:
+            r = await self._httpx.get(url, timeout=t)
+            code = int(r.status_code)
+            body = r.text or ""
+            return code, (body if body else None)
+        except Exception:
+            return 0, None
+
+
+@asynccontextmanager
+async def async_scraper_http_stack():
+    """سياق ``async with async_scraper_http_stack() as fetcher:`` — إغلاق مضمون."""
+    f = AsyncScraperHTTP()
+    await f.__aenter__()
+    try:
+        yield f
+    finally:
+        await f.__aexit__(None, None, None)

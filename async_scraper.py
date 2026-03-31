@@ -1,6 +1,7 @@
 """
-كشط غير متزامن (واجهة async + تنفيذ I/O عبر مؤشر ترابط).
-مدرّع: تدوير User-Agent، Jitter، Exponential Backoff، نقاط حفظ (Checkpoint).
+كشط غير متزامن — Phase 2: I/O بـ asyncio فقط (لا ThreadPoolExecutor).
+HTTP: جلسة واحدة ``AsyncScraperHTTP`` تُغلق في ``__aexit__`` (لا تسرّب مقابس).
+حدود: asyncio.Semaphore لمنع فتح اتصالات لا نهائية على Railway.
 """
 from __future__ import annotations
 
@@ -9,7 +10,6 @@ import copy
 import csv
 from collections import deque
 import hashlib
-import json
 import logging
 import os
 import queue
@@ -18,17 +18,24 @@ import re
 import threading
 import time as _time
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 from html import unescape
 from typing import Any
+
 from urllib.parse import urljoin, urlparse
 
-import requests
-
-from browser_like_http import create_scraper_session
+from browser_like_http import AsyncScraperHTTP
+from utils.jsonfast import dump as json_dump, load as json_load, loads as json_loads
 
 logger = logging.getLogger(__name__)
+
+# uvloop على Linux/macOS فقط — لا يُفعّل تلقائياً مع Streamlit؛ للمهام asyncio المستقبلية
+try:
+    import sys as _sys
+
+    if _sys.platform != "win32":
+        import uvloop  # noqa: F401 — اختياري، يُستورد للتحقق من التثبيت
+except ImportError:
+    pass
 
 
 def _is_ld_product_group_node(node: dict) -> bool:
@@ -98,8 +105,7 @@ _MAX_SITEMAP_BYTES = _env_int("SCRAPER_MAX_SITEMAP_BYTES", 32 * 1024 * 1024)
 _SITEMAP_EXPAND_TIMEOUT_SEC = _env_int("SCRAPER_SITEMAP_EXPAND_TIMEOUT_SEC", 600)
 _CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
-_FETCH_WORKERS = max(1, min(16, int(os.environ.get("SCRAPER_FETCH_WORKERS", "3"))))
-_MAX_ADAPTIVE_WORKERS = max(1, min(5, int(os.environ.get("SCRAPER_MAX_ADAPTIVE_WORKERS", "5"))))
+_MAX_CONCURRENT_FETCH = max(1, min(64, _env_int("SCRAPER_MAX_CONCURRENT_FETCH", 20)))
 _HEURISTIC_MODE = (os.environ.get("SCRAPER_HEURISTIC_MODE", "loose") or "loose").strip().lower()
 _PIPELINE_EVERY = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100"))
 _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip().lower() in (
@@ -109,7 +115,6 @@ _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip()
 )
 
 _PIPELINE_STOP = object()
-_HTTP_STATUS_LOCK = threading.Lock()
 _RECENT_HTTP_STATUS = deque(maxlen=10)
 _NON_PRODUCT_URL_TOKENS = (
     "/privacy", "/policy", "/policies", "/terms", "/shipping", "/returns",
@@ -166,7 +171,7 @@ def read_scraper_bg_state() -> dict[str, Any]:
         return dict(default)
     try:
         with open(SCRAPER_BG_STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            data = json_load(f)
         out = dict(default)
         if isinstance(data, dict):
             out.update(data)
@@ -184,7 +189,7 @@ def merge_scraper_bg_state(**kwargs) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp = SCRAPER_BG_STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cur, f, ensure_ascii=False, indent=2)
+        json_dump(cur, f, ensure_ascii=False, indent=2)
     os.replace(tmp, SCRAPER_BG_STATE_PATH)
 
 
@@ -192,88 +197,57 @@ def _random_ua() -> str:
     return random.choice(_USER_AGENTS)
 
 
-def _jitter_sleep() -> None:
-    _time.sleep(random.uniform(0.5, 1.5))
+async def _async_jitter_sleep() -> None:
+    await asyncio.sleep(random.uniform(0.5, 1.5))
 
 
-def _session() -> Any:
-    """جلسة كشط: curl_cffi (بصمة Chrome) عند التثبيت، وإلا requests."""
-    sess = create_scraper_session()
-    # جلسة requests فقط — curl_cffi يثبّت UA مع impersonate
-    if isinstance(sess, requests.Session):
-        sess.headers.update(
-            {
-                "User-Agent": _random_ua(),
-                "Accept": "text/html,application/xml,text/xml,application/json;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, deflate",
-                "DNT": "1",
-                "Connection": "keep-alive",
-            }
-        )
-    return sess
+async def _async_backoff_sleep(attempt: int) -> None:
+    """Exponential backoff + jitter لـ 403/429/5xx."""
+    base = min(5.0 * (2.0 ** attempt), 60.0)
+    jitter = random.uniform(0.5, 2.5)
+    await asyncio.sleep(base + jitter)
 
 
-def _close_scraper_session(session: Any) -> None:
-    """يغلق جلسة requests/curl_cffi ويحرر المقابس — ضروري للكشط عالي الحجم."""
-    if session is None:
-        return
-    try:
-        close = getattr(session, "close", None)
-        if callable(close):
-            close()
-    except Exception:
-        pass
-
-
-@contextmanager
-def _scraper_session_cm():
-    """سياق جلسة كشط واحدة مع إغلاق مضمون في finally."""
-    sess = _session()
-    try:
-        yield sess
-    finally:
-        _close_scraper_session(sess)
-
-
-def _http_get_armored(session: Any, url: str, timeout: float = 25.0):
-    """GET مع تدوير UA (requests فقط) و backoff أسي عند 403/429/5xx. curl_cffi يُترك ببصمة TLS ثابتة."""
-    backoff = 5.0
-    last_exc: Exception | None = None
+async def _async_http_get_armored(
+    fetcher: AsyncScraperHTTP,
+    url: str,
+    timeout: float = 25.0,
+    max_attempts: int = 6,
+) -> tuple[int, str] | None:
+    """
+    GET مع backoff أسي + jitter عند 403/429/5xx أو أخطاء الشبكة.
+    يعيد (200, text) أو None. يُسجّل آخر رموز HTTP في _RECENT_HTTP_STATUS.
+    """
     last_status = 0
-    for attempt in range(6):
-        if isinstance(session, requests.Session):
-            session.headers["User-Agent"] = _random_ua()
+    for attempt in range(max_attempts):
+        await _async_jitter_sleep()
         try:
-            r = session.get(url, timeout=timeout, allow_redirects=True)
-            last_status = int(r.status_code or 0)
-            if r.status_code in (429, 403, 503, 502, 500, 504):
-                _time.sleep(backoff)
-                backoff = min(backoff * 2.0, 60.0)
+            code, text = await fetcher.get_text_once(url, timeout=timeout)
+            last_status = int(code or 0)
+            _RECENT_HTTP_STATUS.append(last_status)
+            if last_status in (429, 403, 503, 502, 500, 504):
+                await _async_backoff_sleep(attempt)
                 continue
-            with _HTTP_STATUS_LOCK:
-                _RECENT_HTTP_STATUS.append(last_status)
-            return r
-        except Exception as e:
-            last_exc = e
+            if last_status == 200 and text:
+                return 200, text
+            if last_status == 200 and not text:
+                await _async_backoff_sleep(attempt)
+                continue
+            # غير 200: أعد المحاولة للأخطاء العابرة
+            if last_status > 0:
+                await _async_backoff_sleep(attempt)
+                continue
+            await _async_backoff_sleep(attempt)
+        except Exception:
             logger.warning(
-                "HTTP GET attempt failed (step=http_get_armored) url=%s attempt=%s/6",
-                url,
+                "async HTTP GET failed url=%s attempt=%s/%s",
+                url[:200],
                 attempt + 1,
+                max_attempts,
                 exc_info=True,
             )
-            _time.sleep(backoff)
-            backoff = min(backoff * 2.0, 60.0)
-    with _HTTP_STATUS_LOCK:
-        _RECENT_HTTP_STATUS.append(last_status if last_status else 0)
-    if last_exc:
-        logger.warning(
-            "HTTP GET exhausted retries url=%s last_status=%s",
-            url,
-            last_status,
-            exc_info=last_exc,
-        )
-        return None
+            _RECENT_HTTP_STATUS.append(0)
+            await _async_backoff_sleep(attempt)
     return None
 
 
@@ -304,15 +278,19 @@ def _parse_sitemap_xml(content: bytes) -> tuple[list[str], bool]:
     return urls, is_index
 
 
-def _expand_sitemap_to_page_urls(session: Any, start_url: str, progress_cb=None) -> list[str]:
+async def _expand_sitemap_to_page_urls_async(
+    fetcher: AsyncScraperHTTP,
+    start_url: str,
+    progress_cb=None,
+) -> list[str]:
     page_urls: list[str] = []
     seen_sm: set[str] = set()
-    queue = [start_url]
+    q: list[str] = [start_url]
     t0 = _time.time()
-    while queue and len(page_urls) < _SITEMAP_LOC_CAP:
+    while q and len(page_urls) < _SITEMAP_LOC_CAP:
         if _SITEMAP_EXPAND_TIMEOUT_SEC > 0 and (_time.time() - t0) > _SITEMAP_EXPAND_TIMEOUT_SEC:
             break
-        sm_url = queue.pop(0)
+        sm_url = q.pop(0)
         if sm_url in seen_sm:
             continue
         if len(seen_sm) >= _MAX_SITEMAP_INDEX_ENTRIES:
@@ -320,24 +298,28 @@ def _expand_sitemap_to_page_urls(session: Any, start_url: str, progress_cb=None)
         seen_sm.add(sm_url)
         if progress_cb:
             try:
-                progress_cb(len(seen_sm), len(queue), len(page_urls))
+                progress_cb(len(seen_sm), len(q), len(page_urls))
             except Exception:
                 logger.exception(
                     "sitemap progress_cb failed sm_url=%s seen_sm=%s",
                     sm_url,
                     len(seen_sm),
                 )
-        _jitter_sleep()
-        r = _http_get_armored(session, sm_url, timeout=30.0)
-        if r is None or r.status_code != 200 or not r.content:
+        await _async_jitter_sleep()
+        got = await _async_http_get_armored(fetcher, sm_url, timeout=30.0)
+        if got is None:
             continue
-        if len(r.content) > _MAX_SITEMAP_BYTES:
+        _code, body = got
+        if _code != 200 or not body:
             continue
-        locs, is_index = _parse_sitemap_xml(r.content)
+        raw = body.encode("utf-8", errors="replace")
+        if len(raw) > _MAX_SITEMAP_BYTES:
+            continue
+        locs, is_index = _parse_sitemap_xml(raw)
         if is_index:
             for loc in locs:
                 if loc.startswith("http") and loc not in seen_sm:
-                    queue.append(loc)
+                    q.append(loc)
         else:
             for loc in locs:
                 if loc.startswith("http"):
@@ -434,7 +416,7 @@ def _extract_from_json_ld(html: str, page_url: str | None = None) -> dict[str, A
     ):
         raw = m.group(1).strip()
         try:
-            data = json.loads(raw)
+            data = json_loads(raw)
         except Exception:
             logger.warning(
                 "JSON-LD script parse failed (step=json_ld_loads skip block) page_url=%s raw_len=%s",
@@ -562,12 +544,16 @@ def _absolutize_image_url(page_url: str, img: str | None) -> str | None:
         return u
 
 
-def _scrape_url(session: Any, page_url: str) -> dict[str, Any] | None:
-    _jitter_sleep()
-    r = _http_get_armored(session, page_url, timeout=22.0)
-    if r is None or r.status_code != 200 or not r.text:
+async def _scrape_url_async(
+    fetcher: AsyncScraperHTTP,
+    page_url: str,
+) -> dict[str, Any] | None:
+    got = await _async_http_get_armored(fetcher, page_url, timeout=22.0)
+    if got is None:
         return None
-    html = r.text
+    _code, html = got
+    if _code != 200 or not html:
+        return None
     data = _extract_from_json_ld(html, page_url=page_url)
     fb = _extract_meta_fallback(html, page_url=page_url)
     if not data.get("name"):
@@ -592,7 +578,7 @@ def _load_sitemap_seeds() -> list[str]:
         return []
     try:
         with open(LIST_PATH, encoding="utf-8") as f:
-            raw = json.load(f)
+            raw = json_load(f)
     except Exception:
         logger.exception("load sitemap seeds failed path=%s", LIST_PATH)
         return []
@@ -627,7 +613,7 @@ def _load_checkpoint(seeds_fp: str) -> tuple[set[str], list[dict[str, Any]]]:
         return set(), []
     try:
         with open(CHECKPOINT_JSON, encoding="utf-8") as f:
-            d = json.load(f)
+            d = json_load(f)
     except Exception:
         logger.exception("load checkpoint failed path=%s", CHECKPOINT_JSON)
         return set(), []
@@ -655,7 +641,7 @@ def _save_checkpoint(seeds_fp: str, processed: set[str], rows: list[dict[str, An
     os.makedirs(DATA_DIR, exist_ok=True)
     try:
         with open(CHECKPOINT_JSON, "w", encoding="utf-8") as f:
-            json.dump(
+            json_dump(
                 {
                     "seeds_fp": seeds_fp,
                     "processed_urls": list(processed),
@@ -760,44 +746,11 @@ def _pipeline_maybe_enqueue(
     pipeline_q.put((copy.deepcopy(rows), False))
 
 
-def _fetch_url_row(u: str) -> tuple[str, dict[str, Any] | None]:
-    """خيط منفصل لكل URL — جلسة مؤقتة تُغلق حتماً بعد الطلب."""
-    _jitter_sleep()
-    sess = _session()
-    try:
-        return u, _scrape_url(sess, u)
-    except Exception:
-        logger.exception("_fetch_url_row scrape failed url=%s", u)
-        return u, None
-    finally:
-        _close_scraper_session(sess)
-
-
-def _recent_block_ratio() -> float:
-    with _HTTP_STATUS_LOCK:
-        xs = list(_RECENT_HTTP_STATUS)
-    if not xs:
-        return 0.0
-    blocked = sum(1 for s in xs if s in (403, 429))
-    return float(blocked) / float(len(xs))
-
-
-def run_scraper_sync(
+async def _run_scraper_async(
     progress_cb=None,
     pipeline: dict[str, Any] | None = None,
 ) -> int:
-    """تشغيل الكشط — يعيد عدد الصفوف المكتوبة.
-
-    pipeline (اختياري): {"our_df": DataFrame, "comp_key": "Scraped_Competitor",
-    "every": لقطات كل N صف، "use_ai_partial": bool،
-    "incremental_every": حفظ CSV + استدعاء on_incremental_flush كل N صف (مجموع مكسوب حتى الآن)،
-    "on_incremental_flush": دالة(rows) لتحديث كتالوج المنافس،
-    "on_analysis_snapshot": دالة(rows_snap, analysis_df, is_final) للوحة مباشرة،
-    "on_scrape_rows_tick": دالة(n_rows) أثناء الكشط لتحديث اللقطة دون انتظار المحرك،
-    "on_pipeline_before_analysis": دالة(rows_snap, is_final) قبل run_full_analysis}
-    يملأ pipeline["out"] بمفاتيح analysis_df / error عند التحليل المترافق.
-    SCRAPER_INCREMENTAL_EVERY في البيئة يحدد الدفعة إن وُجدت.
-    """
+    """منطق الكشط بالكامل — asyncio + Semaphore + جلسة HTTP واحدة مغلقة بـ async with."""
     seeds = _load_sitemap_seeds()
     if not seeds:
         return 0
@@ -819,7 +772,7 @@ def run_scraper_sync(
         "skip_zero_price": 0,
     }
 
-    with _scraper_session_cm() as session:
+    async with AsyncScraperHTTP() as fetcher:
         all_page_urls: list[str] = []
         seen_u: set[str] = set()
         for si, seed in enumerate(seeds):
@@ -836,8 +789,8 @@ def run_scraper_sync(
                         si,
                         seed[:200] if seed else "",
                     )
-            expanded = _expand_sitemap_to_page_urls(
-                session,
+            expanded = await _expand_sitemap_to_page_urls_async(
+                fetcher,
                 seed,
                 progress_cb=lambda seen_sm, queued, found: (
                     progress_cb(
@@ -872,7 +825,6 @@ def run_scraper_sync(
                 if include_all_urls or _product_url_heuristic(u):
                     all_page_urls.append(u)
                 elif not products and len(all_page_urls) < 80:
-                    # لا توجد روابط تبدو كمنتجات — سلوك قديم: املأ حتى 80 رابطاً
                     all_page_urls.append(u)
                 if _max_sitemap_urls_reached(len(all_page_urls)):
                     break
@@ -987,72 +939,47 @@ def run_scraper_sync(
 
         pending = [u for u in all_page_urls if u not in processed_urls]
         urls_processed_this_run = [0]
+        sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCH)
 
-        if _FETCH_WORKERS > 1 and pending:
-            dyn_workers = max(1, min(_FETCH_WORKERS, _MAX_ADAPTIVE_WORKERS))
-            high_success_since: float | None = None
-            p = 0
+        async def _bounded_fetch_one(page_url: str) -> tuple[str, dict[str, Any] | None]:
+            async with sem:
+                try:
+                    row = await _scrape_url_async(fetcher, page_url)
+                    return page_url, row
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("async scrape failed url=%s", page_url[:200])
+                    return page_url, None
+
+        if pending:
+            tasks = [asyncio.create_task(_bounded_fetch_one(u)) for u in pending]
             stop_early = False
-            while p < len(pending):
-                chunk = pending[p : p + max(dyn_workers * 4, dyn_workers)]
-                p += len(chunk)
-                with ThreadPoolExecutor(max_workers=dyn_workers) as ex:
-                    fut_map = {ex.submit(_fetch_url_row, u): u for u in chunk}
-                    for fut in as_completed(fut_map):
-                        try:
-                            u, row = fut.result()
-                        except Exception:
-                            u = fut_map[fut]
-                            row = None
-                            logger.exception(
-                                "ThreadPoolExecutor future failed url=%s", u
-                            )
-                        if u in processed_urls:
-                            continue
-                        if _max_fetch_urls_reached(urls_processed_this_run[0]):
-                            stop_early = True
-                            break
-                        processed_urls.add(u)
-                        urls_processed_this_run[0] += 1
-                        i_pos = max(0, urls_processed_this_run[0] - 1)
-                        if _consume_row(u, row, i_pos) == "stop_products":
-                            stop_early = True
-                            break
-                if stop_early:
-                    break
-                br = _recent_block_ratio()
-                now = _time.time()
-                with _HTTP_STATUS_LOCK:
-                    xs = list(_RECENT_HTTP_STATUS)
-                ok_ratio = 0.0
-                if xs:
-                    ok_ratio = sum(1 for s in xs if s == 200) / float(len(xs))
-                if len(xs) >= 10 and br > 0.20:
-                    if dyn_workers > 1:
-                        dyn_workers -= 1
-                    high_success_since = None
-                else:
-                    if len(xs) >= 10 and ok_ratio >= 0.95:
-                        if high_success_since is None:
-                            high_success_since = now
-                        elif now - high_success_since >= 60.0 and dyn_workers < _MAX_ADAPTIVE_WORKERS:
-                            dyn_workers += 1
-                            high_success_since = now
-                    else:
-                        high_success_since = None
-        else:
-            for i, u in enumerate(all_page_urls):
-                if u in processed_urls:
-                    if progress_cb:
-                        progress_cb(i + 1, total_urls, last_name)
-                    continue
-                if _max_fetch_urls_reached(urls_processed_this_run[0]):
-                    break
-                row = _scrape_url(session, u)
-                processed_urls.add(u)
-                urls_processed_this_run[0] += 1
-                if _consume_row(u, row, i) == "stop_products":
-                    break
+            try:
+                for fut in asyncio.as_completed(tasks):
+                    try:
+                        u, row = await fut
+                    except asyncio.CancelledError:
+                        break
+                    except Exception:
+                        logger.exception("as_completed task failed")
+                        continue
+                    if u in processed_urls:
+                        continue
+                    if _max_fetch_urls_reached(urls_processed_this_run[0]):
+                        stop_early = True
+                        break
+                    processed_urls.add(u)
+                    urls_processed_this_run[0] += 1
+                    i_pos = max(0, urls_processed_this_run[0] - 1)
+                    if _consume_row(u, row, i_pos) == "stop_products":
+                        stop_early = True
+                        break
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     if pipeline_q is not None and pipeline_thread is not None:
         if rows:
@@ -1085,11 +1012,22 @@ def run_scraper_sync(
     return len(rows)
 
 
-async def run_scraper_engine(progress_cb=None, pipeline: dict[str, Any] | None = None) -> int:
-    """للتوافق مع استدعاءات async — يمرّر progress_cb إلى الكشط المتزامن."""
-    import functools
+def run_scraper_sync(
+    progress_cb=None,
+    pipeline: dict[str, Any] | None = None,
+) -> int:
+    """تشغيل الكشط — يعيد عدد الصفوف المكتوبة. ينفّذ محرك asyncio بالكامل (لا خيط جلب)."""
+    try:
+        return asyncio.run(_run_scraper_async(progress_cb, pipeline))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(_run_scraper_async(progress_cb, pipeline))
+        finally:
+            loop.close()
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, functools.partial(run_scraper_sync, progress_cb, pipeline)
-    )
+
+async def run_scraper_engine(progress_cb=None, pipeline: dict[str, Any] | None = None) -> int:
+    """استدعاء async مباشر — نفس منطق run_scraper_sync دون ThreadPoolExecutor."""
+    return await _run_scraper_async(progress_cb, pipeline)
