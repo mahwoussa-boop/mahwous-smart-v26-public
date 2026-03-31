@@ -702,7 +702,7 @@ def run_scraper_sync(
         if progress_cb:
             try:
                 progress_cb(
-                    max(1, si),
+                    si + 1,
                     max(1, len(seeds)),
                     f"🔍 فهرسة sitemap للمتجر {si + 1}/{len(seeds)}...",
                 )
@@ -713,7 +713,7 @@ def run_scraper_sync(
             seed,
             progress_cb=lambda seen_sm, queued, found: (
                 progress_cb(
-                    max(1, si),
+                    si + 1,
                     max(1, len(seeds)),
                     f"🔍 sitemap {si + 1}/{len(seeds)} | خرائط:{seen_sm} | queued:{queued} | روابط:{found}",
                 )
@@ -843,13 +843,13 @@ def run_scraper_sync(
         return None
 
     pending = [u for u in all_page_urls if u not in processed_urls]
-    pref: dict[str, dict[str, Any] | None] = {}
     urls_processed_this_run = [0]
 
     if _FETCH_WORKERS > 1 and pending:
         dyn_workers = max(1, min(_FETCH_WORKERS, _MAX_ADAPTIVE_WORKERS))
         high_success_since: float | None = None
         p = 0
+        stop_early = False
         while p < len(pending):
             chunk = pending[p : p + max(dyn_workers * 4, dyn_workers)]
             p += len(chunk)
@@ -861,7 +861,19 @@ def run_scraper_sync(
                     except Exception:
                         u = fut_map[fut]
                         row = None
-                    pref[u] = row
+                    if u in processed_urls:
+                        continue
+                    if _max_fetch_urls_reached(urls_processed_this_run[0]):
+                        stop_early = True
+                        break
+                    processed_urls.add(u)
+                    urls_processed_this_run[0] += 1
+                    i_pos = max(0, urls_processed_this_run[0] - 1)
+                    if _consume_row(u, row, i_pos) == "stop_products":
+                        stop_early = True
+                        break
+            if stop_early:
+                break
             br = _recent_block_ratio()
             now = _time.time()
             with _HTTP_STATUS_LOCK:
@@ -882,18 +894,6 @@ def run_scraper_sync(
                         high_success_since = now
                 else:
                     high_success_since = None
-        for i, u in enumerate(all_page_urls):
-            if u in processed_urls:
-                if progress_cb:
-                    progress_cb(i + 1, total_urls, last_name)
-                continue
-            if _max_fetch_urls_reached(urls_processed_this_run[0]):
-                break
-            row = pref.get(u)
-            processed_urls.add(u)
-            urls_processed_this_run[0] += 1
-            if _consume_row(u, row, i) == "stop_products":
-                break
     else:
         for i, u in enumerate(all_page_urls):
             if u in processed_urls:
