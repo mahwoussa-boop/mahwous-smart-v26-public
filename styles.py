@@ -153,6 +153,7 @@ def comp_strip(all_comps):
         c_price = float(cm.get("price", 0) or 0)
         c_pname = str(cm.get("name", "")).strip()
         c_score = float(cm.get("score", 0) or 0)
+        c_img = str(cm.get("image_url", "") or cm.get("image", "") or "").strip()
         is_leader = (i == 0)
         crown = "👑" if is_leader else ""
         bg = "rgba(255,152,0,.10)" if is_leader else "rgba(108,99,255,.05)"
@@ -161,11 +162,20 @@ def comp_strip(all_comps):
         # اسم المنتج لدى المنافس (مختصر)
         short_pname = c_pname[:50] + ".." if len(c_pname) > 50 else c_pname
         score_html = f'<span style="color:#888;font-size:.62rem">{c_score:.0f}%</span>' if c_score > 0 else ""
+        img_html = (
+            f'<img src="{_html_escape(c_img, quote=True)}" '
+            f'style="width:38px;height:38px;border-radius:8px;object-fit:cover;'
+            f'border:1px solid {border};background:#0e1628;flex:0 0 38px" '
+            f'onerror="this.style.display=\'none\'" />'
+            if c_img and c_img.lower() not in ("nan", "none")
+            else ""
+        )
         rows.append(
             f'<div style="display:flex;justify-content:space-between;align-items:center;'
             f'padding:5px 10px;background:{bg};border:1px solid {border};border-radius:8px;'
             f'margin:2px 0;gap:8px;flex-wrap:wrap">'
             f'<div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">'
+            f'{img_html}'
             f'<span style="font-weight:900;font-size:.8rem">{crown}</span>'
             f'<span style="font-weight:700;color:{name_color};font-size:.75rem;white-space:nowrap">{c_store}</span>'
             f'<span style="color:#aaa;font-size:.7rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px" title="{c_pname}">{short_pname}</span>'
@@ -181,6 +191,12 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
               note="", variant_html="", tester_badge="", border_color="#007bff44",
               confidence_level="green", confidence_score=0, product_id=""):
     """بطاقة المنتج المفقود المحسنة — أنيقة وواضحة مع عرض الكود"""
+    safe_name = _html_escape(str(name or ""))
+    safe_brand = _html_escape(str(brand or "—"))
+    safe_size = _html_escape(str(size or "—"))
+    safe_ptype = _html_escape(str(ptype or "—"))
+    safe_comp = _html_escape(str(comp or "—"))
+    safe_note = _html_escape(str(note or ""))
     # شارة الثقة
     trust_map = {
         "green":  ("trust-green",  "مؤكد"),
@@ -190,23 +206,24 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
     t_cls, t_lbl = trust_map.get(confidence_level, ("trust-green", "مؤكد"))
     trust_html = f'<span class="trust-badge {t_cls}">{t_lbl}</span>' if confidence_level != "green" else ""
 
-    note_html = f'<div style="font-size:.72rem;color:#ff9800;margin-top:4px">{note}</div>' if note and "⚠️" in note else ""
+    note_html = f'<div style="font-size:.72rem;color:#ff9800;margin-top:4px">{safe_note}</div>' if safe_note and "⚠️" in safe_note else ""
 
     # عرض الكود/المعرف إذا موجود
     pid_html = ""
     if product_id and str(product_id).strip() and str(product_id) not in ("", "nan", "None", "0"):
-        pid_html = f'<span style="font-size:.7rem;padding:2px 8px;border-radius:8px;background:#1a237e44;color:#90caf9;margin-right:6px;font-family:monospace;letter-spacing:1px">📌 {product_id}</span>'
+        safe_pid = _html_escape(str(product_id))
+        pid_html = f'<span style="font-size:.7rem;padding:2px 8px;border-radius:8px;background:#1a237e44;color:#90caf9;margin-right:6px;font-family:monospace;letter-spacing:1px">📌 {safe_pid}</span>'
 
     return f"""
     <div class="miss-card" style="border:1px solid {border_color}">
       <div class="miss-header">
         <div class="miss-info">
           <div class="miss-name">
-            {trust_html}{tester_badge}{pid_html}{name}
+            {trust_html}{tester_badge}{pid_html}{safe_name}
           </div>
           <div class="miss-meta">
-            🏷️ {brand or "—"} &nbsp;|&nbsp; 📏 {size or "—"} &nbsp;|&nbsp;
-            🧴 {ptype or "—"} &nbsp;|&nbsp; 🏪 {comp}
+            🏷️ {safe_brand} &nbsp;|&nbsp; 📏 {safe_size} &nbsp;|&nbsp;
+            🧴 {safe_ptype} &nbsp;|&nbsp; 🏪 {safe_comp}
           </div>
           {variant_html}
           {note_html}

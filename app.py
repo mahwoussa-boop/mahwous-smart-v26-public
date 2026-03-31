@@ -14,6 +14,7 @@ app.py - نظام التسعير الذكي مهووس v26.0
 ✅ لوحة تحكم الأتمتة متصلة بالتنقل (v26.0)
 """
 import copy
+from html import escape as _html_escape
 import json
 import os
 import pickle
@@ -901,7 +902,8 @@ def _run_scrape_chain_background():
     scrape_bg = bool(ctx.get("scrape_bg", False))
     our_df = ctx["our_df"]
     user_label = str(ctx.get("user_comp_label") or "").strip()
-    pipeline_inline = bool(ctx.get("pipeline_inline", True)) and (not scrape_bg)
+    # اسمح بالتحديث اللحظي حتى عند تشغيل الكشط في الخلفية.
+    pipeline_inline = bool(ctx.get("pipeline_inline", True))
     pl_every = int(ctx.get("pl_every") or 100)
     use_ai_partial = bool(ctx.get("use_ai_partial"))
     our_file_name = str(ctx.get("our_file_name") or "mahwous_catalog.csv")
@@ -931,7 +933,7 @@ def _run_scrape_chain_background():
         return
 
     total_stores = len(scrape_queue)
-    pipeline_inline_effective = bool(pipeline_inline) and total_stores <= 1
+    pipeline_inline_effective = bool(pipeline_inline)
 
     _merge_scrape_live_snapshot(
         analysis_reset=True,
@@ -987,6 +989,7 @@ def _run_scrape_chain_background():
             pl_dict = {
                 "incremental_every": max(1, inc_every),
                 "on_incremental_flush": flush_cb,
+                "on_scrape_rows_tick": _make_scrape_rows_tick_fn(),
             }
 
         def scrape_cb(current, total, last_name, _si=store_idx, _ts=total_stores):
@@ -1970,6 +1973,31 @@ elif page == "📂 رفع الملفات":
 
     st.header("🕸️ كشط الويب والتحليل")
     db_log("upload", "view")
+    our_path = os.path.join("data", "mahwous_catalog.csv")
+
+    # اظهر رافع الكتالوج دائماً حتى تتمكن الاختبارات/المستخدم من رفع الملف دون الدخول في مسار البدء.
+    st.markdown("### 📦 كتالوج منتجاتنا")
+    if os.path.isfile(our_path):
+        st.caption("✅ الملف الحالي: `data/mahwous_catalog.csv` (يمكنك استبداله برفع جديد)")
+    else:
+        st.warning("⚠️ لم يُعثر على كتالوج المنتجات — ارفعه أولاً قبل بدء الكشط.")
+    uploaded_catalog_main = st.file_uploader(
+        "📂 ارفع ملف كتالوج منتجاتك (mahwous_catalog.csv)",
+        type=["csv"],
+        key="catalog_uploader_main",
+    )
+    if uploaded_catalog_main:
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open(our_path, "wb") as f:
+                f.write(uploaded_catalog_main.read())
+            _tmp_df = pd.read_csv(our_path)
+            if "no" not in _tmp_df.columns:
+                st.error("❌ الملف رُفع لكن عمود المعرف الإلزامي `no` غير موجود.")
+            else:
+                st.success(f"✅ تم حفظ الكتالوج بنجاح — عدد الصفوف: {len(_tmp_df):,}")
+        except Exception as e:
+            st.error(f"❌ تعذر حفظ/قراءة الكتالوج: {e}")
 
     if "scraper_urls" not in st.session_state:
         st.session_state.scraper_urls = ["https://worldgivenchy.com/ar/"]
@@ -2026,8 +2054,8 @@ elif page == "📂 رفع الملفات":
         ),
     )
     st.caption(
-        "**عدة متاجر:** يُكشط كل متجر **بالتسلسل** ويُسجَّل في الكتالوج تحت مفتاحه، ثم يعمل **تحليل واحد** "
-        "يشمل جميع المنافسين. عند **أكثر من متجر** يُعطَّل التحليل المترافق أثناء الجلب (لأسباب دقة وزمن)."
+        "**عدة متاجر:** يُكشط كل متجر **بالتسلسل** ويُسجَّل في الكتالوج تحت مفتاحه، مع **Preview مترافق لكل متجر** "
+        "أثناء الجلب، ثم يعمل **تحليل نهائي موحّد** يشمل جميع المنافسين في النهاية."
     )
     for i in range(len(st.session_state.scraper_urls)):
         st.caption(f"متجر {i+1}")
@@ -2147,10 +2175,21 @@ elif page == "📂 رفع الملفات":
                     st.warning(
                         f"⚠️ تُجاهل {_fail_n} سطراً دون خريطة صالحة — يُكشط **{len(resolved_triples)}** متجراً في الطابور."
                     )
-                our_path = os.path.join("data", "mahwous_catalog.csv")
                 our_df_pre = None
                 if not os.path.isfile(our_path):
-                    st.error("❌ لم يُعثر على ملف الكتالوج المحلي data/mahwous_catalog.csv")
+                    st.warning("⚠️ لم يُعثر على كتالوج المنتجات — يرجى رفع ملف `mahwous_catalog.csv`")
+                    uploaded_catalog = st.file_uploader(
+                        "📂 ارفع ملف كتالوج منتجاتك (mahwous_catalog.csv)",
+                        type=["csv"],
+                        key="catalog_uploader",
+                    )
+                    if uploaded_catalog:
+                        os.makedirs("data", exist_ok=True)
+                        with open(our_path, "wb") as f:
+                            f.write(uploaded_catalog.read())
+                        st.success("✅ تم حفظ الكتالوج — اضغط 'بدء الكشط والتحليل' الآن")
+                        st.rerun()
+                    st.stop()
                 else:
                     try:
                         our_df_pre = pd.read_csv(our_path)
@@ -2406,7 +2445,15 @@ elif page == "🔍 منتجات مفقودة":
                 ).sort_values("_conf_sort").drop(columns=["_conf_sort"])
 
             # ── تصدير + مدقق سلة صارم ────────────────────────────────────
-            _export_ok, _export_issues = validate_export_product_dataframe(filtered)
+            _export_df = filtered.copy()
+            _dropped_zero = 0
+            if "سعر_المنافس" in _export_df.columns:
+                _before_n = len(_export_df)
+                _export_df = _export_df[pd.to_numeric(_export_df["سعر_المنافس"], errors="coerce").fillna(0) > 0]
+                _dropped_zero = max(0, _before_n - len(_export_df))
+            _export_ok, _export_issues = validate_export_product_dataframe(_export_df)
+            if _dropped_zero > 0:
+                st.info(f"ℹ️ تم استبعاد {_dropped_zero} صف بسعر منافس غير صالح (<= 0) من التصدير فقط.")
             if not _export_ok:
                 st.error("❌ التصدير معطل مؤقتاً: البيانات لا تطابق معايير سلة الصارمة:")
                 for _iss in _export_issues[:25]:
@@ -2415,14 +2462,14 @@ elif page == "🔍 منتجات مفقودة":
             cc1,cc2,cc3 = st.columns(3)
             with cc1:
                 if _export_ok:
-                    excel_m = export_to_excel(filtered, "مفقودة")
+                    excel_m = export_to_excel(_export_df, "مفقودة")
                     st.download_button("📥 Excel", data=excel_m, file_name="missing.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="miss_dl")
                 else:
                     st.caption("📥 Excel — يتطلب إصلاح الأخطاء أعلاه")
             with cc2:
                 if _export_ok:
-                    _csv_m = filtered.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                    _csv_m = _export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                     st.download_button("📄 CSV", data=_csv_m, file_name="missing.csv", mime="text/csv", key="miss_csv")
                 else:
                     st.caption("📄 CSV — يتطلب إصلاح الأخطاء أعلاه")
@@ -2432,7 +2479,7 @@ elif page == "🔍 منتجات مفقودة":
                 _conf_sel = st.selectbox("مستوى الثقة", list(_conf_opts.keys()), key="miss_conf_sel")
                 _conf_val = _conf_opts[_conf_sel]
                 if st.button("📤 إرسال بدفعات ذكية لـ Make", key="miss_make_all"):
-                    _to_send = filtered[filtered["نوع_متاح"].str.strip() == ""] if "نوع_متاح" in filtered.columns else filtered
+                    _to_send = _export_df[_export_df["نوع_متاح"].str.strip() == ""] if "نوع_متاح" in _export_df.columns else _export_df
                     is_valid, issues = validate_export_product_dataframe(_to_send)
                     if not is_valid:
                         st.error("❌ تم إيقاف الإرسال! البيانات لا تطابق معايير سلة الصارمة:")
@@ -2530,13 +2577,15 @@ elif page == "🔍 منتجات مفقودة":
                 # ── بادج النوع المتاح ──────────────────────────────────
                 _variant_html = ""
                 if _has_variant:
+                    _variant_label_safe = _html_escape(str(variant_label or ""))
+                    _variant_product_safe = _html_escape(str(variant_product or ""))
                     _variant_html = f"""
                     <div style="margin-top:6px;padding:5px 10px;border-radius:6px;
                                 background:{_badge_bg}22;border:1px solid {_badge_bg}88;
                                 font-size:.78rem;color:{_badge_bg};font-weight:700">
-                        {variant_label}
+                        {_variant_label_safe}
                         <span style="font-weight:400;color:#aaa;margin-right:6px">
-                            ({variant_score:.0f}%) → {variant_product[:50]}
+                            ({variant_score:.0f}%) → {_variant_product_safe[:50]}
                         </span>
                     </div>"""
 
@@ -3121,7 +3170,7 @@ elif page == "🤖 الذكاء الصناعي":
         # إدخال
         _mc1, _mc2 = st.columns([5, 1])
         with _mc1:
-            _user_in = st.text_input("", key="gem_in",
+            _user_in = st.text_input("اكتب رسالتك", key="gem_in",
                 placeholder="اسأل Gemini — عن المنتجات، الأسعار، التوصيات...",
                 label_visibility="collapsed")
         with _mc2:
