@@ -71,6 +71,9 @@ def _parse_gemini_keys():
 
     # ─── المحاولة 2: GEMINI_API_KEY (مفتاح واحد) ───
     single = _s("GEMINI_API_KEY", "")
+    # Railway/UI أحياناً يحفظان Gemini_API_Key (حالة أحرف مختلفة؛ Linux حساس)
+    if not single:
+        single = (_os.environ.get("Gemini_API_Key", "") or _os.environ.get("GEMINI_KEY", "")).strip()
     if single and single not in keys:
         keys.append(single)
 
