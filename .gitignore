@@ -5,3 +5,4 @@ __pycache__/
 .streamlit/secrets.toml
 .streamlit/secrets.toml
 API_SETUP.md
+data/scraper_stop.flag
