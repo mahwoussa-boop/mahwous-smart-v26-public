@@ -8,11 +8,12 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
 الخطة:
   1. عند رفع الملف → تطبيع كل منتجات المنافس مرة واحدة (cache)
   2. لكل منتجنا → cdist vectorized دفعة واحدة (بدل loop)
-  3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62-96%
-  4. score ≥97% → تلقائي فوري  |  score <62% → مفقود
+  3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62–96% (ومفاتيح متاحة)
+  4. score ≥97% → تلقائي فوري  |  score <62% → لا مرشح | بدون API: عتبات 75/88
 """
 import re, io, json, hashlib, logging, sqlite3, time
 from datetime import datetime
+from typing import Optional
 import pandas as pd
 from rapidfuzz import fuzz, process as rf_process
 from rapidfuzz.distance import Indel
@@ -46,18 +47,22 @@ def _clean_ai_json(text: str) -> str:
 
 
 try:
-    from engines.mahwous_core import apply_strict_pipeline_filters
+    from engines.mahwous_core import apply_strict_pipeline_filters, tag_missing_volume_status
 except ImportError:
-    from mahwous_core import apply_strict_pipeline_filters
+    from mahwous_core import apply_strict_pipeline_filters, tag_missing_volume_status
 
 try:
-    from config import AUTO_DECISION_CONFIDENCE
+    from config import AUTO_DECISION_CONFIDENCE, SMART_MISSING_FUZZ_THRESHOLD
 except Exception:
     logger.error(
-        "config AUTO_DECISION_CONFIDENCE import failed; using default 92",
+        "config AUTO_DECISION_CONFIDENCE / SMART_MISSING_FUZZ_THRESHOLD import failed; using defaults",
         exc_info=True,
     )
     AUTO_DECISION_CONFIDENCE = 92
+    SMART_MISSING_FUZZ_THRESHOLD = 88
+
+# أقل عتبة لمطابقة ذات معنى (منطقة Gemini 62–96%؛ أقل من ذلك → لا مرشح / مفقود بدون API)
+MATCH_MIN_SCORE = 62
 
 # ─── استيراد الإعدادات ───────────────────────
 try:
@@ -376,6 +381,92 @@ def _cset(k, v):
             except Exception: pass
 
 _init_db()
+
+
+def _gemini_keys_available() -> bool:
+    """True إذا وُجد مفتاح Gemini صالح لاستدعاء API."""
+    for k in GEMINI_API_KEYS or []:
+        if k and str(k).strip():
+            return True
+    return False
+
+
+def _no_api_strong_signals(
+    product: str,
+    brand: str,
+    size: float,
+    our_pline: str,
+    best0: dict,
+) -> bool:
+    """
+    عتبة 88% حتى <97%: موافقة تلقائية بدون API فقط عند ماركة + حجم + خط إنتاج متوافقين.
+    (لا يمس normalize_name / extract_product_line — يستدعيها فقط.)
+    """
+    sc = float(best0.get("score") or 0)
+    if not (88 <= sc < 97):
+        return False
+    cname = str(best0.get("name") or "")
+    c_br = best0.get("brand") or extract_brand(cname)
+    c_sz = float(best0.get("size") or 0)
+    our_sz = float(size or 0)
+    if brand and c_br and normalize(brand) != normalize(c_br):
+        return False
+    if our_sz > 0 and c_sz > 0:
+        d = abs(our_sz - c_sz)
+        if d > 30:
+            return False
+        if d > 5:
+            return False
+    c_pl = extract_product_line(cname, c_br) if c_br else extract_product_line(cname, extract_brand(cname))
+    if our_pline and c_pl:
+        if fuzz.token_sort_ratio(our_pline, c_pl) < 88:
+            return False
+    elif our_pline and not c_pl:
+        return False
+    return True
+
+
+def _no_api_resolve_row(
+    product: str,
+    our_price: float,
+    our_id: str,
+    brand: str,
+    size: float,
+    ptype: str,
+    gender: str,
+    our_pline: str,
+    best0: dict,
+    all_cands: list,
+    our_img: str,
+):
+    """
+    وضع بدون API: 62–74 → لا صف (مفقود من ناحية المطابقة) | 75–87 → review_no_api |
+    88–96.99 قوي → auto_no_api عند الإشارات القوية وإلا مراجعة.
+    """
+    sc = float(best0.get("score") or 0)
+    if sc < MATCH_MIN_SCORE:
+        return None
+    if MATCH_MIN_SCORE <= sc < 75:
+        return None
+    if 75 <= sc < 88:
+        return _row(
+            product, our_price, our_id, brand, size, ptype, gender,
+            best0, override="⚠️ تحت المراجعة", src="review_no_api",
+            all_cands=all_cands, our_img=our_img,
+        )
+    if 88 <= sc < 97:
+        if _no_api_strong_signals(product, brand, size, our_pline, best0):
+            return _row(
+                product, our_price, our_id, brand, size, ptype, gender,
+                best0, src="auto_no_api", all_cands=all_cands, our_img=our_img,
+            )
+        return _row(
+            product, our_price, our_id, brand, size, ptype, gender,
+            best0, override="⚠️ تحت المراجعة", src="review_no_api",
+            all_cands=all_cands, our_img=our_img,
+        )
+    return None
+
 
 # ─── دوال أساسية ────────────────────────────
 def read_file(f):
@@ -1011,7 +1102,7 @@ class CompIndex:
             base += pline_penalty
 
             score = round(max(0, min(100, base)), 1)
-            if score < 60: continue   # ← 60% الحد الأدنى للمراجعة
+            if score < MATCH_MIN_SCORE: continue   # ← حد أدنى لمطابقة ذات معنى
 
             seen.add(name)
             cands.append({
@@ -1232,17 +1323,17 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
     # الحدود المستخدمة:
     #   score ≥ 85%           → مطابقة مؤكدة → توزيع سعري
     #   60% ≤ score < 85%     → تحت المراجعة (مطابقة محتملة)
-    #   score < 60%           → يُخفى تماماً (return None من run_full_analysis)
+    #   score < MATCH_MIN_SCORE → يُخفى تماماً (return None من run_full_analysis)
     PRICE_DIFF_THRESHOLD = 10  # فرق السعر المقبول بالريال
-    NO_MATCH_THRESHOLD   = 60  # أقل من هذا → غير متطابق → يُخفى
+    NO_MATCH_THRESHOLD   = MATCH_MIN_SCORE  # أقل من هذا → غير متطابق → يُخفى
     REVIEW_MAX           = 85  # أقل من هذا → مراجعة
     if override:
         dec = override
     elif score < NO_MATCH_THRESHOLD:
         # نسبة منخفضة جداً → لا يظهر في أي واجهة
         return None  # ← الفلتر الحاسم: يُحذف من النتائج كلياً
-    elif src in ("gemini", "auto", "vision") or score >= REVIEW_MAX:
-        # مطابقة مؤكدة (≥85%) أو تأكيد بصري → توزيع حسب السعر
+    elif src in ("gemini", "auto", "vision", "auto_no_api") or score >= REVIEW_MAX:
+        # مطابقة مؤكدة (≥85%) أو تأكيد بصري / بدون API قوي → توزيع حسب السعر
         if our_price > 0 and cp > 0:
             if diff > PRICE_DIFF_THRESHOLD:     dec = "🔴 سعر أعلى"
             elif diff < -PRICE_DIFF_THRESHOLD:   dec = "🟢 سعر أقل"
@@ -1255,6 +1346,8 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
 
     ai_lbl = {"gemini": f"🤖✅({score:.0f}%)",
               "auto": f"🎯({score:.0f}%)",
+              "auto_no_api": f"🎯📴({score:.0f}%)",
+              "review_no_api": f"⚠️📴({score:.0f}%)",
               "vision": f"👁️✅({score:.0f}%)",
               "vision_reject": f"👁️❌({score:.0f}%)",
               "gemini_no_match": "🤖❌"}.get(src, f"{score:.0f}%")
@@ -1277,9 +1370,9 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
 def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     """
     1. بناء CompIndex لكل منافس (تطبيع مسبق)
-    2. لكل منتجنا → search vectorized
-    3. score≥97 → تلقائي | ≥AUTO_DECISION_CONFIDENCE (92) → تلقائي بدون API
-       | 60–91 مع صورتان → محكمة Gemini Vision | وإلا → دفعة Gemini نصية
+    2. لكل منتجنا → search vectorized (مع ذاكرة تخزين مؤقتة لقائمة المرشحين)
+    3. score≥97 → تلقائي | عند غياب مفاتيح Gemini أو use_ai=False → وضع بدون API (عتبات 75/88)
+    4. مع مفاتيح: ≥AUTO_DECISION_CONFIDENCE (92) → تلقائي | MATCH_MIN_SCORE–91 → رؤية/Gemini
     """
     results = []
     our_col       = _fcol(our_df, ["المنتج","اسم المنتج","Product","Name","name"])
@@ -1313,7 +1406,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     BATCH   = 8  # خفض من 12 إلى 8 لتقليل ضغط Gemini ومنع rate limit
 
     def _flush():
-        """يُعالج الـ pending batch ويضيف النتائج مباشرة — محمي من الأخطاء"""
+        """يُعالج الـ pending batch — عند رفض AI أو ci=-1 يُطبَّق وضع بدون API (_no_api_resolve_row)."""
         if not pending:
             return
         try:
@@ -1324,30 +1417,29 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                 len(pending),
                 exc_info=True,
             )
-            # فشل AI → fallback: استخدم أفضل مرشح fuzzy
-            idxs = []
-            for it in pending:
-                cands = it.get("candidates", [])
-                if cands and cands[0].get("score", 0) >= 88:
-                    idxs.append(0)
-                else:
-                    idxs.append(-1)
+            idxs = [-1] * len(pending)
         for j, it in enumerate(pending):
             try:
-                ci = idxs[j] if j < len(idxs) else 0
+                ci = idxs[j] if j < len(idxs) else -1
+                cands = it.get("candidates") or []
+                best0 = cands[0] if cands else None
+                if ci < 0 and best0:
+                    rr = _no_api_resolve_row(
+                        it["product"], it["our_price"], it["our_id"],
+                        it["brand"], it["size"], it["ptype"], it["gender"],
+                        it.get("our_pline", ""), best0, it.get("all_cands", []),
+                        it.get("our_img", ""),
+                    )
+                    if rr is not None:
+                        results.append(rr)
+                    continue
                 if ci < 0:
-                    # AI غير متأكد → أعطِ أفضل مرشح كمراجعة
-                    best_fallback = it["candidates"][0] if it["candidates"] else None
-                    rr = _row(it["product"], it["our_price"], it["our_id"],
-                              it["brand"], it["size"], it["ptype"], it["gender"],
-                              best_fallback, "⚠️ تحت المراجعة", "ai_uncertain",
-                              all_cands=it["all_cands"], our_img=it.get("our_img", ""))
-                else:
-                    best = it["candidates"][ci]
-                    rr = _row(it["product"], it["our_price"], it["our_id"],
-                              it["brand"], it["size"], it["ptype"], it["gender"],
-                              best, src="gemini", all_cands=it["all_cands"],
-                              our_img=it.get("our_img", ""))
+                    continue
+                best = it["candidates"][ci]
+                rr = _row(it["product"], it["our_price"], it["our_id"],
+                          it["brand"], it["size"], it["ptype"], it["gender"],
+                          best, src="gemini", all_cands=it["all_cands"],
+                          our_img=it.get("our_img", ""))
                 if rr is not None:
                     results.append(rr)
             except Exception:
@@ -1405,14 +1497,29 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         size    = extract_size(product)
         ptype   = extract_type(product)
         gender  = extract_gender(product)
+        if size > 0 and size < 10:
+            # عينات أقل من 10ml: لا تُطابق وتُستبعد من مسار المفقودات
+            if progress_callback:
+                progress_callback((i + 1) / total, results)
+            continue
         our_n   = normalize(product)
         our_pl  = extract_product_line(product, brand)
 
-        # ── جمع المرشحين من كل الفهارس ──
-        all_cands = []
-        for idx_obj in indices.values():
-            all_cands.extend(idx_obj.search(our_n, brand, size, ptype, gender,
-                                            our_pline=our_pl, top_n=6, our_raw=product))
+        # ── جمع المرشحين من كل الفهارس (مع ذاكرة SQLite للجولات المتكررة) ──
+        _sig = "|".join(f"{nm}:{len(obj.df)}" for nm, obj in sorted(indices.items()))
+        _ck = hashlib.md5(f"{product}|{_sig}".encode()).hexdigest()
+        _cached = _cget(f"compmatch:{_ck}")
+        if _cached and isinstance(_cached, list) and _cached:
+            all_cands = list(_cached)
+        else:
+            all_cands = []
+            for idx_obj in indices.values():
+                all_cands.extend(idx_obj.search(our_n, brand, size, ptype, gender,
+                                                our_pline=our_pl, top_n=6, our_raw=product))
+            try:
+                _cset(f"compmatch:{_ck}", all_cands[:40])
+            except Exception:
+                logger.warning("compmatch cache write failed", exc_info=True)
 
         if not all_cands:
             # ← الإصلاح الجوهري: لا يوجد أي منافس لهذا المنتج إطلاقاً
@@ -1425,16 +1532,24 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         top5  = all_cands[:5]
         best0 = top5[0]
 
-        if best0["score"] < 60:
+        if best0["score"] < MATCH_MIN_SCORE:
             # score منخفض جداً → لا يوجد منافس حقيقي → تخطي تماماً
             if progress_callback:
                 progress_callback((i + 1) / total, results)
             continue
 
-        if best0["score"] >= 97 or not use_ai:
+        if best0["score"] >= 97:
             row_result = _row(product, our_price, our_id, brand, size, ptype, gender,
                               best0, src="auto", all_cands=all_cands, our_img=our_img)
             if row_result is not None:   # ← فلتر None
+                results.append(row_result)
+        elif (not _gemini_keys_available()) or (not use_ai):
+            # بدون مفاتيح Gemini أو تعطيل AI: عتبات متدرّجة (auto_no_api / review_no_api / تخطي)
+            row_result = _no_api_resolve_row(
+                product, our_price, our_id, brand, size, ptype, gender,
+                our_pl, best0, all_cands, our_img,
+            )
+            if row_result is not None:
                 results.append(row_result)
         elif best0["score"] >= AUTO_DECISION_CONFIDENCE:
             # ≥92%: أتمتة كاملة بدون استدعاء API (معيار AUTO_DECISION_CONFIDENCE)
@@ -1442,8 +1557,8 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                               best0, src="auto", all_cands=all_cands, our_img=our_img)
             if row_result is not None:
                 results.append(row_result)
-        elif best0["score"] >= 60:
-            # 60–91%: محكمة بصرية إن وُجدت صورتان، وإلا دفعة Gemini النصية
+        elif best0["score"] >= MATCH_MIN_SCORE:
+            # MATCH_MIN_SCORE–91%: محكمة بصرية إن وُجدت صورتان، وإلا دفعة Gemini النصية
             cimg = best0.get("image") or ""
             _ou = str(our_img or "").strip()
             _ci = str(cimg or "").strip()
@@ -1485,6 +1600,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                         pending.append(dict(
                             product=product, our_price=our_price, our_id=our_id,
                             brand=brand, size=size, ptype=ptype, gender=gender,
+                            our_pline=our_pl,
                             candidates=top5, all_cands=all_cands,
                             our=product, price=our_price, our_img=our_img,
                         ))
@@ -1500,6 +1616,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                     pending.append(dict(
                         product=product, our_price=our_price, our_id=our_id,
                         brand=brand, size=size, ptype=ptype, gender=gender,
+                        our_pline=our_pl,
                         candidates=top5, all_cands=all_cands,
                         our=product, price=our_price, our_img=our_img,
                     ))
@@ -1509,6 +1626,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                 pending.append(dict(
                     product=product, our_price=our_price, our_id=our_id,
                     brand=brand, size=size, ptype=ptype, gender=gender,
+                    our_pline=our_pl,
                     candidates=top5, all_cands=all_cands,
                     our=product, price=our_price, our_img=our_img,
                 ))
@@ -1703,7 +1821,16 @@ def find_missing_products(our_df, comp_dfs):
 
         for _, row in cdf.iterrows():
             cp = str(row.get(ccol, "")).strip()
-            if not cp or is_sample(cp): continue
+            if not cp or is_sample(cp):
+                continue
+            _c_sz = extract_size(cp)
+            if _c_sz > 0 and _c_sz < 10:
+                continue
+            _c_cls = classify_product(cp)
+            if _c_cls in ("hair_mist", "body_mist", "set"):
+                continue
+            if is_set(cp):
+                continue
 
             cn    = normalize(cp)
             c_agg = normalize_name(cp)        # ← normalize_name
@@ -1714,6 +1841,18 @@ def find_missing_products(our_df, comp_dfs):
             if not bare_ck or len(bare_ck) < 3: continue
             if bare_ck in seen_bare: continue
 
+            # ── الحاجز 1: token_set ≥ 88% مع كتالوجنا — قبل أي حساب ثقيل
+            _tok88 = False
+            for p in our_items:
+                if (
+                    fuzz.token_set_ratio(bare_ck, p["bare"]) >= 88
+                    and _capacity_bundle_guardrail_ok(cp, p["raw"])
+                ):
+                    _tok88 = True
+                    break
+            if _tok88:
+                continue
+
             c_brand   = extract_brand(cp)
             c_pline   = extract_product_line(cp, c_brand)
             c_size    = extract_size(cp)
@@ -1721,24 +1860,11 @@ def find_missing_products(our_df, comp_dfs):
             c_gender  = extract_gender(cp)
             c_is_t    = is_tester(cp)
 
-            # ── Cross-check الأول: بالـ normalize_aggressive ─────────
             found, score, reason, variant = _is_same_product(
                 cp, cn, c_brand, c_pline, c_size, c_type, c_gender, c_is_t, c_agg)
 
             if found:
                 continue  # موجود لدينا → تخطي
-
-            # ── Cross-check الثاني: token_set_ratio المباشر على bare ─
-            # يحمي من الحالات الهامشية التي يفوتها _is_same_product
-            if not found:
-                for p in our_items:
-                    direct = fuzz.token_set_ratio(bare_ck, p["bare"])
-                    if direct >= 82 and _capacity_bundle_guardrail_ok(cp, p["raw"]):
-                        found = True
-                        break
-
-            if found:
-                continue
 
             seen_bare.add(bare_ck)
 
@@ -1764,6 +1890,14 @@ def find_missing_products(our_df, comp_dfs):
                 except Exception:
                     c_img = ""
 
+            _brand_known = bool(
+                c_brand.strip() and bool(_fuzzy_correct_brand(c_brand, threshold=80))
+            )
+            _path_note = ""
+            if not _brand_known:
+                _conf_level = "yellow"
+                _path_note = "ماركة غير مؤكدة في القائمة المرجعية — يُفضّل المراجعة"
+
             entry = {
                 "منتج_المنافس":  cp,
                 "معرف_المنافس":  _pid(row, icol),
@@ -1776,9 +1910,11 @@ def find_missing_products(our_df, comp_dfs):
                 "الجنس":         c_gender,
                 "هو_تستر":       c_is_t,
                 "تاريخ_الرصد":   datetime.now().strftime("%Y-%m-%d"),
-                "ملاحظة":        reason if reason and "⚠️" in reason else "",
+                "ملاحظة":        (reason if reason and "⚠️" in reason else "")
+                + ((" | " + _path_note) if _path_note else ""),
                 "درجة_التشابه":  round(score, 1),
                 "مستوى_الثقة":  _conf_level,
+                "مسار_المفقودات": "تحت المراجعة" if not _brand_known else "مفقود",
             }
 
             # إضافة معلومات النوع المتاح (تستر/أساسي)
@@ -1793,7 +1929,17 @@ def find_missing_products(our_df, comp_dfs):
 
             missing.append(entry)
 
-    return pd.DataFrame(missing) if missing else pd.DataFrame()
+    out = pd.DataFrame(missing) if missing else pd.DataFrame()
+    if not out.empty:
+        try:
+            from engines.reference_data import enrich_missing_reference_columns
+            out = enrich_missing_reference_columns(out)
+        except Exception:
+            logger.warning(
+                "enrich_missing_reference_columns failed (reference_data)",
+                exc_info=True,
+            )
+    return out
 
 def export_excel(df, sheet_name="النتائج"):
     from openpyxl.styles import PatternFill, Font, Alignment
@@ -1833,16 +1979,30 @@ def export_section_excel(df, sname):
 
 
 def smart_missing_barrier(
-    missing_df: pd.DataFrame, our_df: pd.DataFrame, threshold: int = 88
+    missing_df: pd.DataFrame,
+    our_df: pd.DataFrame,
+    threshold: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     محرك الحاجز الذكي: الفلتر النهائي قبل دخول المنتجات لقسم المفقودات.
-    يقلل التكرار عبر مطابقة الـ SKU والـ Fuzzy (token_set_ratio).
+    يقلل التكرار عبر مطابقة الـ SKU والـ Fuzzy (token_set_ratio) — افتراضياً من الإعدادات (88٪).
     """
+    if threshold is None:
+        threshold = SMART_MISSING_FUZZ_THRESHOLD
     if missing_df.empty or our_df.empty:
         return missing_df
 
-    filtered_df, _ = apply_strict_pipeline_filters(missing_df, name_col="منتج_المنافس")
+    _desc = None
+    for c in ("وصف_المنافس", "الوصف", "description", "Description"):
+        if c in missing_df.columns:
+            _desc = c
+            break
+    filtered_df, _ = apply_strict_pipeline_filters(
+        missing_df, name_col="منتج_المنافس", desc_col=_desc
+    )
+    filtered_df = tag_missing_volume_status(
+        filtered_df, name_col="منتج_المنافس", desc_col=_desc
+    )
 
     if filtered_df.empty:
         return filtered_df
