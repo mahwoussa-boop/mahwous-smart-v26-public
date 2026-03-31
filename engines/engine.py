@@ -862,6 +862,9 @@ class CompIndex:
             limit=min(30, len(valid_aggs))
         )
 
+        _our_for_class = our_raw if our_raw else our_norm
+        our_class = classify_product(_our_for_class)
+
         cands = []
         seen  = set()
         for _, fast_score, vi in fast:
@@ -876,16 +879,24 @@ class CompIndex:
             c_gd = self.genders[idx]
             c_pl = self.plines[idx]
 
+            c_class = classify_product(name)
+            # إيقاف إجباري: التستر لا يُقارن مع المنتج الأساسي (قبل أي حساب للنقاط)
+            if (our_class == 'tester') != (c_class == 'tester'):
+                continue
+
             # ═══ فلاتر سريعة ═══
-            if our_br and c_br and normalize(our_br) != normalize(c_br): continue
-            if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 30: continue
+            if our_br and c_br and normalize(our_br) != normalize(c_br):
+                continue
+            if our_pline and not c_pl:
+                continue
+            if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 2.5:
+                continue
             if our_tp and c_tp and our_tp != c_tp:
-                if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 3: continue
-            if our_gd and c_gd and our_gd != c_gd: continue
+                continue
+            if our_gd and c_gd and our_gd != c_gd:
+                continue
 
             # ═══ فلتر تصنيف المنتج (retail/tester/set/hair_mist) ═══
-            our_class = classify_product(our_norm)
-            c_class = classify_product(name)
             if our_class != c_class:
                 # العينات تُستثنى تماماً
                 if our_class == 'rejected' or c_class == 'rejected':
@@ -893,9 +904,6 @@ class CompIndex:
                 # المجموعات ومعطرات الشعر/الجسم لا تقارن مع العطور
                 if our_class in ('hair_mist','body_mist','set','other') or \
                    c_class in ('hair_mist','body_mist','set','other'):
-                    continue
-                # التستر يقارن فقط مع التستر، العطر الأساسي فقط مع الأساسي
-                if (our_class == 'tester') != (c_class == 'tester'):
                     continue
 
             # ═══ سعة العبوة + طقم/مجموعة (قبل النقاط العالية للـ fuzzy) ═══
