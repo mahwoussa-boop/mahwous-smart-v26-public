@@ -901,7 +901,8 @@ def _run_scrape_chain_background():
     scrape_bg = bool(ctx.get("scrape_bg", False))
     our_df = ctx["our_df"]
     user_label = str(ctx.get("user_comp_label") or "").strip()
-    pipeline_inline = bool(ctx.get("pipeline_inline", True)) and (not scrape_bg)
+    # اسمح بالتحديث اللحظي حتى عند تشغيل الكشط في الخلفية.
+    pipeline_inline = bool(ctx.get("pipeline_inline", True))
     pl_every = int(ctx.get("pl_every") or 100)
     use_ai_partial = bool(ctx.get("use_ai_partial"))
     our_file_name = str(ctx.get("our_file_name") or "mahwous_catalog.csv")
@@ -987,6 +988,7 @@ def _run_scrape_chain_background():
             pl_dict = {
                 "incremental_every": max(1, inc_every),
                 "on_incremental_flush": flush_cb,
+                "on_scrape_rows_tick": _make_scrape_rows_tick_fn(),
             }
 
         def scrape_cb(current, total, last_name, _si=store_idx, _ts=total_stores):
