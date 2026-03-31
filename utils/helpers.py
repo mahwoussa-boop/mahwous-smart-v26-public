@@ -5,7 +5,9 @@ utils/helpers.py - دوال مساعدة v17.2
 import csv
 import html
 import io
+import json
 import os
+import re
 import pandas as pd
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -317,6 +319,254 @@ def default_salla_missing_html_description(row: Dict[str, Any]) -> str:
         parts.append(f"<li>الحجم: {size_e}</li>")
     parts.append("</ul><p>منتج أصلي من متجرنا — جودة عالية وتوصيل سريع.</p>")
     return "".join(parts)
+
+
+def _strip_trailing_seo_json_from_mahwous_text(text: str) -> str:
+    """يزيل كتلة JSON الختامية من رد خبير مهووس (MISSING_PAGE_SYSTEM)."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if "\n\n{" in s:
+        head, tail = s.rsplit("\n\n{", 1)
+        tail = "{" + tail
+        try:
+            json.loads(tail)
+            return head.strip()
+        except Exception:
+            pass
+    m = re.search(r"\n\s*(\{[\s\S]*\})\s*$", s)
+    if m:
+        try:
+            json.loads(m.group(1))
+            return s[: m.start()].strip()
+        except Exception:
+            pass
+    return s
+
+
+def rough_markdown_to_html_for_salla(md: str) -> str:
+    """تحويل تقريبي من Markdown (عناوين، قوائم، **غامق**) إلى HTML آمن."""
+    md = _strip_trailing_seo_json_from_mahwous_text(md)
+    if not md:
+        return ""
+    lines = md.replace("\r\n", "\n").split("\n")
+    out: List[str] = []
+    in_ul = False
+
+    def close_ul() -> None:
+        nonlocal in_ul
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+
+    def inline_bold(s: str) -> str:
+        parts = re.split(r"(\*\*.+?\*\*)", s)
+        buf: List[str] = []
+        for p in parts:
+            if p.startswith("**") and p.endswith("**") and len(p) > 4:
+                inner = html.escape(p[2:-2].strip())
+                buf.append(f"<strong>{inner}</strong>")
+            else:
+                buf.append(html.escape(p))
+        return "".join(buf)
+
+    for line in lines:
+        raw = line.rstrip()
+        if not raw.strip():
+            close_ul()
+            continue
+        if raw.startswith("### "):
+            close_ul()
+            out.append(f"<h3>{inline_bold(raw[4:].strip())}</h3>")
+        elif raw.startswith("## "):
+            close_ul()
+            out.append(f"<h2>{inline_bold(raw[3:].strip())}</h2>")
+        elif raw.startswith("# "):
+            close_ul()
+            out.append(f"<h2>{inline_bold(raw[2:].strip())}</h2>")
+        elif raw.strip().startswith(("- ", "* ")):
+            if not in_ul:
+                out.append("<ul>")
+                in_ul = True
+            item = raw.strip()[2:].strip()
+            out.append(f"<li>{inline_bold(item)}</li>")
+        else:
+            close_ul()
+            out.append(f"<p>{inline_bold(raw.strip())}</p>")
+    close_ul()
+    return "".join(out)
+
+
+def _normalize_note_list(val: Any) -> List[str]:
+    if val is None:
+        return []
+    if isinstance(val, str):
+        s = val.strip()
+        return [s] if s else []
+    if isinstance(val, list):
+        out: List[str] = []
+        for x in val[:24]:
+            if isinstance(x, str) and x.strip():
+                out.append(x.strip())
+        return out
+    return []
+
+
+def _fragrance_web_data_to_ai_context(frag: Dict[str, Any]) -> str:
+    """نص عربي يُحقَن في برومبت الوصف ليلزم النموذج بمكونات مستخرجة من الويب."""
+    if not frag.get("success"):
+        return ""
+    top = _normalize_note_list(frag.get("top_notes"))
+    mid = _normalize_note_list(frag.get("middle_notes"))
+    base = _normalize_note_list(frag.get("base_notes"))
+    fam = str(frag.get("fragrance_family") or "").strip()
+    des = str(frag.get("description_ar") or "").strip()
+    yr = str(frag.get("year") or "").strip()
+    des_snip = des[:900] if des else ""
+    lines = [
+        "【بيانات مرجعية مستخرجة من مواقع عطور (مثل Fragrantica Arabia) — التزم بها في قسم الهرم العطري ولا تخترع مكونات متعارضة معها. إن غابت قائمة فاذكر أن التفاصيل غير مكتملة】",
+        f"- النفحات العليا: { '، '.join(top) if top else 'غير متوفرة في المصدر' }",
+        f"- النفحات الوسطى: { '، '.join(mid) if mid else 'غير متوفرة في المصدر' }",
+        f"- النفحات الأساسية: { '، '.join(base) if base else 'غير متوفرة في المصدر' }",
+    ]
+    if fam:
+        lines.append(f"- العائلة العطرية: {fam}")
+    if yr:
+        lines.append(f"- سنة الإصدار (إن وُجدت): {yr}")
+    if des_snip:
+        lines.append(f"- وصف مرجعي مختصر: {des_snip}")
+    u = str(frag.get("fragrantica_url") or "").strip()
+    if u:
+        lines.append(f"- رابط المصدر: {u}")
+    return "\n".join(lines)
+
+
+def _fragrance_web_data_to_html_appendix(frag: Dict[str, Any]) -> str:
+    """قسم HTML يُلحق بالوصف: هرم عطري صريح + ملخص مرجعي + رابط المصدر."""
+    if not frag.get("success"):
+        return ""
+    top = _normalize_note_list(frag.get("top_notes"))
+    mid = _normalize_note_list(frag.get("middle_notes"))
+    base = _normalize_note_list(frag.get("base_notes"))
+    if not (top or mid or base):
+        return ""
+    chunks: List[str] = [
+        '<h3>الهرم العطري (مصادر مرجعية من الويب)</h3>',
+        "<ul>",
+    ]
+    if top:
+        chunks.append(
+            f"<li><strong>النفحات العليا:</strong> {html.escape('، '.join(top))}</li>"
+        )
+    if mid:
+        chunks.append(
+            f"<li><strong>النفحات الوسطى:</strong> {html.escape('، '.join(mid))}</li>"
+        )
+    if base:
+        chunks.append(
+            f"<li><strong>النفحات الأساسية:</strong> {html.escape('، '.join(base))}</li>"
+        )
+    chunks.append("</ul>")
+    des = str(frag.get("description_ar") or "").strip()
+    if des:
+        chunks.append(
+            f"<p><strong>ملخص مرجعي:</strong> {html.escape(des[:1200])}</p>"
+        )
+    url = str(frag.get("fragrantica_url") or "").strip()
+    if url:
+        chunks.append(f'<p><small>مصدر المكونات: {html.escape(url)}</small></p>')
+    return "".join(chunks)
+
+
+def ai_salla_description_for_missing_row(row: Dict[str, Any]) -> str:
+    """
+    يستدعي خبير مهووس (MISSING_PAGE_SYSTEM + generate_missing_product_description)
+    ويُرجع HTML مناسباً لعمود «الوصف» في استيراد سلة.
+
+    عند تفعيل الجلب من الويب (افتراضي): يستدعي fetch_fragrantica_info لاستخراج مكونات حقيقية
+    من مواقع مرجعية، يدمجها في سياق الـ AI، ويُلحق قسماً HTML بالمكونات الصريحة.
+    """
+    try:
+        from engines.ai_engine import fetch_fragrantica_info, generate_missing_product_description
+
+        name = str(row.get("منتج_المنافس", "") or row.get("name", "") or "").strip()
+        if not name:
+            return default_salla_missing_html_description(row)
+        brand = str(row.get("الماركة", "") or "").strip()
+        sz = str(row.get("الحجم", "") or "").strip()
+        ctype = str(row.get("النوع", "") or "").strip()
+        size_conc = " ".join(x for x in (sz, ctype) if x).strip()
+        comp = str(row.get("المنافس", "") or "").strip()
+        price = safe_float(row.get("سعر_المنافس", 0), 0.0)
+        extra = str(row.get("ملاحظة", "") or "").strip()
+
+        fetch_web = (os.environ.get("SALLA_EXPORT_FETCH_WEB_NOTES") or "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        frag: Dict[str, Any] = {}
+        if fetch_web:
+            q = f"{brand} {name}".strip() if brand else name
+            try:
+                frag = fetch_fragrantica_info(q) or {}
+            except Exception:
+                frag = {}
+
+        ctx_bits: List[str] = []
+        if extra:
+            ctx_bits.append(extra)
+        web_ctx = _fragrance_web_data_to_ai_context(frag)
+        if web_ctx:
+            ctx_bits.append(web_ctx)
+        extra_merged = "\n\n".join(ctx_bits)
+
+        res = generate_missing_product_description(
+            name,
+            brand=brand,
+            size_concentration=size_conc,
+            competitor_price=price,
+            competitor_name=comp,
+            extra_context=extra_merged,
+        )
+        txt = ""
+        if isinstance(res, dict):
+            txt = str(res.get("response") or res.get("text") or "")
+        if not txt.strip():
+            base_fallback = default_salla_missing_html_description(row)
+            appendix = _fragrance_web_data_to_html_appendix(frag)
+            return base_fallback + appendix if appendix else base_fallback
+        html_out = rough_markdown_to_html_for_salla(txt)
+        if not html_out.strip():
+            base_fallback = default_salla_missing_html_description(row)
+            appendix = _fragrance_web_data_to_html_appendix(frag)
+            return base_fallback + appendix if appendix else base_fallback
+        appendix = _fragrance_web_data_to_html_appendix(frag)
+        if appendix:
+            html_out = html_out + appendix
+        return html_out
+    except Exception:
+        return default_salla_missing_html_description(row)
+
+
+def make_salla_desc_fn(
+    use_ai: bool,
+    max_ai_rows: int,
+) -> Callable[[Dict[str, Any]], str]:
+    """
+    يُبنى دالة وصف لـ export_missing_products_to_salla_csv*:
+    أول max_ai_rows صفوفاً بالذكاء الاصطناعي (إن فعّلت)، ثم القالب الثابت.
+    """
+    cap = max(0, int(max_ai_rows))
+    n = [0]
+
+    def _fn(row: Dict[str, Any]) -> str:
+        if use_ai and cap > 0 and n[0] < cap:
+            n[0] += 1
+            return ai_salla_description_for_missing_row(row)
+        return default_salla_missing_html_description(row)
+
+    return _fn
 
 
 def _missing_row_to_salla_cells(
