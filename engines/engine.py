@@ -1696,6 +1696,10 @@ def find_missing_products(our_df, comp_dfs):
             "SKU","sku","Sku","رمز المنتج","رمز_المنتج",
             "الكود","كود","Code","code","الرقم","رقم","Barcode","barcode","الباركود"
         ])
+        img_col = _fcol(cdf, [
+            "رابط_الصورة", "صورة_المنافس", "image_url", "صورة", "image", "Image",
+            "رابط الصورة", "صورة المنتج",
+        ])
 
         for _, row in cdf.iterrows():
             cp = str(row.get(ccol, "")).strip()
@@ -1753,9 +1757,17 @@ def find_missing_products(our_df, comp_dfs):
             else:
                 _conf_level = "green"
 
+            c_img = ""
+            if img_col:
+                try:
+                    c_img = str(row.get(img_col, "") or "").strip()
+                except Exception:
+                    c_img = ""
+
             entry = {
                 "منتج_المنافس":  cp,
                 "معرف_المنافس":  _pid(row, icol),
+                "صورة_المنافس":  c_img,
                 "سعر_المنافس":   _price(row),
                 "المنافس":       cname,
                 "الماركة":       c_brand,
