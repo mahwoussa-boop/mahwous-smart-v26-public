@@ -2150,7 +2150,19 @@ elif page == "📂 رفع الملفات":
                 our_path = os.path.join("data", "mahwous_catalog.csv")
                 our_df_pre = None
                 if not os.path.isfile(our_path):
-                    st.error("❌ لم يُعثر على ملف الكتالوج المحلي data/mahwous_catalog.csv")
+                    st.warning("⚠️ لم يُعثر على كتالوج المنتجات — يرجى رفع ملف `mahwous_catalog.csv`")
+                    uploaded_catalog = st.file_uploader(
+                        "📂 ارفع ملف كتالوج منتجاتك (mahwous_catalog.csv)",
+                        type=["csv"],
+                        key="catalog_uploader",
+                    )
+                    if uploaded_catalog:
+                        os.makedirs("data", exist_ok=True)
+                        with open(our_path, "wb") as f:
+                            f.write(uploaded_catalog.read())
+                        st.success("✅ تم حفظ الكتالوج — اضغط 'بدء الكشط والتحليل' الآن")
+                        st.rerun()
+                    st.stop()
                 else:
                     try:
                         our_df_pre = pd.read_csv(our_path)
