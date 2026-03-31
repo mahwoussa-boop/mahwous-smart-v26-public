@@ -924,8 +924,8 @@ def run_scraper_sync(
                 if name:
                     if name in seen_names:
                         stats["dup_name"] += 1
-                    else:
-                        seen_names.add(name)
+                        return None
+                    seen_names.add(name)
                     price = row.get("price")
                     if price is None:
                         price = 0.0

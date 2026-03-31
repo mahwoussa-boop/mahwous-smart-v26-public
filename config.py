@@ -10,7 +10,7 @@ APP_TITLE   = "نظام التسعير الذكي - مهووس"
 APP_NAME    = APP_TITLE
 APP_VERSION = "v26.0"
 APP_ICON    = "🧪"
-GEMINI_MODEL = "gemini-2.0-flash-001"   # النموذج المستقر (gemini-2.0-flash قديم على Railway)
+GEMINI_MODEL = "gemini-2.0-flash"   # النموذج المستقر الموصى به
 
 # ══════════════════════════════════════════════
 #  قراءة Secrets بطريقة آمنة 100%
@@ -81,24 +81,6 @@ def _parse_gemini_keys():
         if k and k not in keys:
             keys.append(k)
 
-    # ─── المحاولة 4: أسماء Railway المختلفة (بمسافات أو حروف مختلطة) ───
-    # Railway يسمح بأسماء مثل "Gemini API Key" أو "Gemini_API_Key"
-    for railway_name in [
-        "Gemini API Key", "Gemini_API_Key", "gemini_api_key",
-        "GEMINI API KEY", "Gemini-API-Key", "gemini-api-key",
-        "GeminiApiKey", "geminiApiKey", "GEMINI_KEY", "gemini_key",
-        "Gemini API Keys", "GEMINI API KEYS", "Gemini_API_Keys",
-    ]:
-        k = _os.environ.get(railway_name, "")
-        if k and k not in keys:
-            keys.append(k)
-
-    # ─── المحاولة 5: البحث الشامل في متغيرات البيئة عن أي مفتاح Gemini ───
-    for env_name, env_val in _os.environ.items():
-        if "gemini" in env_name.lower() and env_val and env_val not in keys:
-            if len(env_val) > 20 and env_val.startswith("AIza"):
-                keys.append(env_val)
-
     # تنظيف نهائي: إزالة المفاتيح الفارغة أو القصيرة
     keys = [k.strip() for k in keys if k and len(k) > 20]
     return keys
@@ -116,14 +98,8 @@ EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 # ══════════════════════════════════════════════
 #  Make Webhooks
 # ══════════════════════════════════════════════
-WEBHOOK_UPDATE_PRICES = (
-    _s("WEBHOOK_UPDATE_PRICES") or
-    "https://hook.eu2.make.com/8jia6gc7s1cpkeg6catlrvwck768sbfk"
-)
-WEBHOOK_NEW_PRODUCTS = (
-    _s("WEBHOOK_NEW_PRODUCTS") or
-    "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
-)
+WEBHOOK_UPDATE_PRICES = _s("WEBHOOK_UPDATE_PRICES") or ""
+WEBHOOK_NEW_PRODUCTS = _s("WEBHOOK_NEW_PRODUCTS") or ""
 
 # ══════════════════════════════════════════════
 #  ألوان
@@ -253,8 +229,8 @@ SECTIONS = [
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-# مسار SQLite الوحيد — يُعرّف في db_manager ويُستورد هنا لتوحيد الأتمتة مع باقي التطبيق
-from utils.db_manager import DB_PATH  # noqa: E402
+# مسار SQLite — معرّف مباشرة لتجنب circular import مع db_manager
+DB_PATH = _os.path.join("/tmp", "pricing_v18.db")
 
 # قائمة المنافسين الافتراضية للكشط — يُحمَّل من الملف؛ يمكن تعديل JSON دون المساس بالكود
 PRESET_COMPETITORS_PATH = _os.path.join("data", "preset_competitors.json")
