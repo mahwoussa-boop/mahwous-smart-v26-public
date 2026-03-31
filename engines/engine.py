@@ -1124,7 +1124,7 @@ _GURL    = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-f
 _OR_URL  = "https://openrouter.ai/api/v1/chat/completions"
 _OR_FREE = [
     "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
+    "google/gemma-3-27b-it:free",
     "deepseek/deepseek-chat-v3-0324:free",
     "mistralai/mistral-7b-instruct:free",
 ]

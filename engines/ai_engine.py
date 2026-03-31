@@ -25,6 +25,15 @@ _GV = _os.environ.get("GEMINI_VISION_MODEL", _GM)
 _GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
 _GVU = f"https://generativelanguage.googleapis.com/v1beta/models/{_GV}:generateContent"
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
+
+# نماذج OpenRouter المجربة — يُحدَّث عند إزالة معرّفات من المنصة (خطأ 400)
+OPENROUTER_FALLBACK_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek/deepseek-chat-v3-0324:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "google/gemma-3-27b-it:free",
+]
 _CO  = "https://api.cohere.ai/v1/generate"
 
 # ── سجل الأخطاء الأخيرة (يُعرض في صفحة التشخيص) ─────────────────────────
@@ -67,7 +76,10 @@ def diagnose_ai_providers() -> dict:
             elif r.status_code == 403:
                 gemini_results.append({"key": i+1, "status": "❌ 403 — مفتاح غير مصرح أو IP محظور"})
             elif r.status_code == 429:
-                gemini_results.append({"key": i+1, "status": "⚠️ 429 — تجاوز الحد (Rate Limit)"})
+                gemini_results.append({
+                    "key": i+1,
+                    "status": "⚠️ 429 — تجاوز الحد (انتظر أو جرّب مفتاحاً آخر / ارفع الحصة في Google AI)",
+                })
             elif r.status_code == 404:
                 gemini_results.append({"key": i+1, "status": f"❌ 404 — النموذج {_GM} غير متاح"})
             else:
@@ -82,35 +94,55 @@ def diagnose_ai_providers() -> dict:
             gemini_results.append({"key": i+1, "status": f"❌ خطأ: {str(e)[:80]}"})
     results["gemini"] = gemini_results
 
-    # ── OpenRouter ────────────────────────────────────────────────────────
+    # ── OpenRouter — تجربة نماذج صالحة (المعرّفات القديمة مثل google/gemini-2.0-flash تُرفض بـ 400)
     if OPENROUTER_API_KEY:
-        try:
-            r = requests.post(_OR, json={
-                "model": "google/gemini-2.0-flash",  # ← مستقر
-                "messages": [{"role":"user","content":"test"}],
-                "max_tokens": 5
-            }, headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "HTTP-Referer": "https://mahwous.com"
-            }, timeout=15)
-            if r.status_code == 200:
-                results["openrouter"] = "✅ يعمل"
-            elif r.status_code == 401:
-                results["openrouter"] = "❌ 401 — مفتاح OpenRouter غير صحيح"
-            elif r.status_code == 402:
-                results["openrouter"] = "❌ 402 — رصيد OpenRouter منتهٍ"
-            elif r.status_code == 429:
-                results["openrouter"] = "⚠️ 429 — تجاوز الحد"
-            else:
-                try: msg = r.json().get("error",{}).get("message","")
-                except: msg = r.text[:100]
-                results["openrouter"] = f"❌ {r.status_code} — {msg[:80]}"
-        except requests.exceptions.ConnectionError:
-            results["openrouter"] = "❌ لا اتصال بـ openrouter.ai — قد يكون محظوراً"
-        except requests.exceptions.Timeout:
-            results["openrouter"] = "❌ Timeout"
-        except Exception as e:
-            results["openrouter"] = f"❌ {str(e)[:80]}"
+        or_ok = False
+        last_or = ""
+        for _model in OPENROUTER_FALLBACK_MODELS:
+            try:
+                r = requests.post(
+                    _OR,
+                    json={
+                        "model": _model,
+                        "messages": [{"role": "user", "content": "test"}],
+                        "max_tokens": 5,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "HTTP-Referer": "https://mahwous.com",
+                    },
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    results["openrouter"] = f"✅ يعمل (نموذج: {_model})"
+                    or_ok = True
+                    break
+                if r.status_code == 401:
+                    results["openrouter"] = "❌ 401 — مفتاح OpenRouter غير صحيح"
+                    or_ok = True
+                    break
+                if r.status_code == 402:
+                    results["openrouter"] = "❌ 402 — رصيد OpenRouter منتهٍ"
+                    or_ok = True
+                    break
+                if r.status_code == 429:
+                    last_or = f"⚠️ 429 — تجاوز الحد ({_model})"
+                    continue
+                try:
+                    msg = r.json().get("error", {}).get("message", "")
+                except Exception:
+                    msg = r.text[:100]
+                last_or = f"❌ {r.status_code} — {msg[:100]} ({_model})"
+            except requests.exceptions.ConnectionError:
+                results["openrouter"] = "❌ لا اتصال بـ openrouter.ai — قد يكون محظوراً"
+                or_ok = True
+                break
+            except requests.exceptions.Timeout:
+                last_or = f"❌ Timeout ({_model})"
+            except Exception as e:
+                last_or = f"❌ {str(e)[:80]} ({_model})"
+        if not or_ok:
+            results["openrouter"] = last_or or "❌ فشلت كل نماذج OpenRouter"
     else:
         results["openrouter"] = "⚠️ مفتاح غير موجود"
 
@@ -127,7 +159,7 @@ def diagnose_ai_providers() -> dict:
             if r.status_code == 200:
                 results["cohere"] = "✅ يعمل (command-a-03-2025)"
             elif r.status_code == 401:
-                results["cohere"] = "❌ 401 — مفتاح Cohere غير صحيح"
+                results["cohere"] = "❌ 401 — مفتاح Cohere غير صحيح (اختياري: احذف المفتاح من Secrets إن لم تستخدم Cohere)"
             elif r.status_code == 402:
                 results["cohere"] = "❌ 402 — رصيد Cohere منتهٍ"
             else:
@@ -390,22 +422,12 @@ def _call_openrouter(prompt, system=""):
     if not OPENROUTER_API_KEY:
         return None
 
-    # نماذج مجانية صحيحة (محدَّثة مارس 2026)
-    # نماذج مستقرة فقط — بدون النماذج التجريبية (exp)
-    FREE_MODELS = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "deepseek/deepseek-chat-v3-0324:free",
-        "mistralai/mistral-7b-instruct:free",
-        "qwen/qwen-2.5-72b-instruct:free",
-        "google/gemma-3-27b-it:free",
-    ]
-
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
 
-    for model in FREE_MODELS:
+    for model in OPENROUTER_FALLBACK_MODELS:
         try:
             r = requests.post(_OR, json={
                 "model": model,
