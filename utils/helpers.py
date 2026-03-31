@@ -326,13 +326,14 @@ def _missing_row_to_salla_cells(
 ) -> List[str]:
     name = str(row.get("منتج_المنافس", "") or row.get("name", "") or "").strip()
     brand = str(row.get("الماركة", "") or "").strip()
+    cat = str(row.get("تصنيف_مرجعي", "") or "").strip() or default_category
     img = str(row.get("صورة_المنافس", "") or row.get("image_url", "") or "").strip()
     alt = f"{name} الأصلية" if name else ""
     desc_html = desc_fn(row)
     out: List[str] = [""] * _SALLA_COL_COUNT
     out[0] = "منتج"
     out[1] = name
-    out[2] = default_category
+    out[2] = cat
     out[3] = img
     out[4] = alt
     out[5] = "منتج جاهز"
