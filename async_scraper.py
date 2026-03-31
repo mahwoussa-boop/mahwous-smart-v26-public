@@ -90,7 +90,8 @@ _SITEMAP_LOC_CAP = _env_int("SCRAPER_SITEMAP_LOC_CAP", 200000)
 _MAX_SITEMAP_INDEX_ENTRIES = _env_int("SCRAPER_SITEMAP_INDEX_CAP", 200000)
 # حجم استجابة XML واحدة قبل التخطي (متاجر ضخمة قد تولّد ملفات > 8 ميجا)
 _MAX_SITEMAP_BYTES = _env_int("SCRAPER_MAX_SITEMAP_BYTES", 32 * 1024 * 1024)
-_SITEMAP_EXPAND_TIMEOUT_SEC = _env_int("SCRAPER_SITEMAP_EXPAND_TIMEOUT_SEC", 120)
+# متاجر كبيرة (آلاف الملفات داخل sitemap index) تحتاج مهلة أعلى افتراضياً.
+_SITEMAP_EXPAND_TIMEOUT_SEC = _env_int("SCRAPER_SITEMAP_EXPAND_TIMEOUT_SEC", 600)
 _CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
 _FETCH_WORKERS = max(1, min(16, int(os.environ.get("SCRAPER_FETCH_WORKERS", "3"))))
@@ -106,6 +107,18 @@ _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip()
 _PIPELINE_STOP = object()
 _HTTP_STATUS_LOCK = threading.Lock()
 _RECENT_HTTP_STATUS = deque(maxlen=10)
+_NON_PRODUCT_URL_TOKENS = (
+    "/privacy", "/policy", "/policies", "/terms", "/shipping", "/returns",
+    "/refund", "/contact", "/about", "/faq", "/blog", "/track", "/cart",
+    "/checkout", "/account", "/login", "/register", "/wishlist",
+)
+_NON_PRODUCT_NAME_TOKENS = (
+    "سياسة", "الخصوصية", "الشحن", "التوصيل", "الشروط", "الاحكام",
+    "طرق الدفع", "الاستبدال", "الاسترجاع", "اتصل بنا", "من نحن",
+    "المدونة", "تتبع الطلب", "الأسئلة الشائعة",
+    "privacy", "policy", "terms", "shipping", "returns", "refund",
+    "contact us", "about us", "blog", "faq",
+)
 
 
 def _max_sitemap_urls_reached(n: int) -> bool:
@@ -296,6 +309,8 @@ def _product_url_heuristic(url: str) -> bool:
     if re.search(r"/p\d+$", pl, re.I):
         return True
     u = url.lower()
+    if any(tok in u for tok in _NON_PRODUCT_URL_TOKENS):
+        return False
     if any(x in u for x in ("/product/", "/products/", "/item/", "/perfume")):
         return True
     if "عطر" in u and "/c" not in u:
@@ -303,6 +318,13 @@ def _product_url_heuristic(url: str) -> bool:
     if re.search(r"/[^/]+-\d{3,}", u):
         return True
     return False
+
+
+def _looks_non_product_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n:
+        return True
+    return any(tok in n for tok in _NON_PRODUCT_NAME_TOKENS)
 
 
 def _ld_pick_first_image(val: Any) -> str | None:
@@ -693,6 +715,8 @@ def run_scraper_sync(
         "extract_ok": 0,
         "extract_fail": 0,
         "dup_name": 0,
+        "skip_non_product": 0,
+        "skip_zero_price": 0,
     }
 
     session = _session()
@@ -728,17 +752,20 @@ def run_scraper_sync(
         accept_ratio = (len(products) / len(expanded)) if expanded else 1.0
         prod_set = set(products)
         rest = [x for x in expanded if x not in prod_set]
+        include_all_urls = False
         if _HEURISTIC_MODE == "off":
             merged = expanded
+            include_all_urls = True
         elif _HEURISTIC_MODE == "loose" and accept_ratio < 0.50:
             merged = expanded
+            include_all_urls = True
         else:
             merged = products + rest
         for u in merged:
             if u in seen_u:
                 continue
             seen_u.add(u)
-            if _product_url_heuristic(u):
+            if include_all_urls or _product_url_heuristic(u):
                 all_page_urls.append(u)
             elif not products and len(all_page_urls) < 80:
                 # لا توجد روابط تبدو كمنتجات — سلوك قديم: املأ حتى 80 رابطاً
@@ -798,11 +825,21 @@ def run_scraper_sync(
                 price = row.get("price")
                 if price is None:
                     price = 0.0
+                try:
+                    price_f = float(price)
+                except (TypeError, ValueError):
+                    price_f = 0.0
+                if _looks_non_product_name(name):
+                    stats["skip_non_product"] += 1
+                    return None
+                if price_f <= 0:
+                    stats["skip_zero_price"] += 1
+                    return None
                 img = str(row.get("image", "") or "")
                 rows.append(
                     {
                         "اسم المنتج": name,
-                        "السعر": price,
+                        "السعر": price_f,
                         "رقم المنتج": "",
                         "رابط_الصورة": img,
                     }
@@ -918,7 +955,8 @@ def run_scraper_sync(
         print(
             f"[SCRAPER] sitemap_total={stats['sitemap_total']} accepted={stats['heuristic_accepted']} "
             f"rejected={stats['heuristic_rejected']} extract_ok={stats['extract_ok']} "
-            f"extract_fail={stats['extract_fail']} dup_name={stats['dup_name']}",
+            f"extract_fail={stats['extract_fail']} dup_name={stats['dup_name']} "
+            f"skip_non_product={stats['skip_non_product']} skip_zero_price={stats['skip_zero_price']}",
             flush=True,
         )
         return 0
@@ -927,7 +965,8 @@ def run_scraper_sync(
     print(
         f"[SCRAPER] sitemap_total={stats['sitemap_total']} accepted={stats['heuristic_accepted']} "
         f"rejected={stats['heuristic_rejected']} extract_ok={stats['extract_ok']} "
-        f"extract_fail={stats['extract_fail']} dup_name={stats['dup_name']}",
+        f"extract_fail={stats['extract_fail']} dup_name={stats['dup_name']} "
+        f"skip_non_product={stats['skip_non_product']} skip_zero_price={stats['skip_zero_price']}",
         flush=True,
     )
 

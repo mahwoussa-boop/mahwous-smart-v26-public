@@ -181,6 +181,12 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
               note="", variant_html="", tester_badge="", border_color="#007bff44",
               confidence_level="green", confidence_score=0, product_id=""):
     """بطاقة المنتج المفقود المحسنة — أنيقة وواضحة مع عرض الكود"""
+    safe_name = _html_escape(str(name or ""))
+    safe_brand = _html_escape(str(brand or "—"))
+    safe_size = _html_escape(str(size or "—"))
+    safe_ptype = _html_escape(str(ptype or "—"))
+    safe_comp = _html_escape(str(comp or "—"))
+    safe_note = _html_escape(str(note or ""))
     # شارة الثقة
     trust_map = {
         "green":  ("trust-green",  "مؤكد"),
@@ -190,23 +196,24 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
     t_cls, t_lbl = trust_map.get(confidence_level, ("trust-green", "مؤكد"))
     trust_html = f'<span class="trust-badge {t_cls}">{t_lbl}</span>' if confidence_level != "green" else ""
 
-    note_html = f'<div style="font-size:.72rem;color:#ff9800;margin-top:4px">{note}</div>' if note and "⚠️" in note else ""
+    note_html = f'<div style="font-size:.72rem;color:#ff9800;margin-top:4px">{safe_note}</div>' if safe_note and "⚠️" in safe_note else ""
 
     # عرض الكود/المعرف إذا موجود
     pid_html = ""
     if product_id and str(product_id).strip() and str(product_id) not in ("", "nan", "None", "0"):
-        pid_html = f'<span style="font-size:.7rem;padding:2px 8px;border-radius:8px;background:#1a237e44;color:#90caf9;margin-right:6px;font-family:monospace;letter-spacing:1px">📌 {product_id}</span>'
+        safe_pid = _html_escape(str(product_id))
+        pid_html = f'<span style="font-size:.7rem;padding:2px 8px;border-radius:8px;background:#1a237e44;color:#90caf9;margin-right:6px;font-family:monospace;letter-spacing:1px">📌 {safe_pid}</span>'
 
     return f"""
     <div class="miss-card" style="border:1px solid {border_color}">
       <div class="miss-header">
         <div class="miss-info">
           <div class="miss-name">
-            {trust_html}{tester_badge}{pid_html}{name}
+            {trust_html}{tester_badge}{pid_html}{safe_name}
           </div>
           <div class="miss-meta">
-            🏷️ {brand or "—"} &nbsp;|&nbsp; 📏 {size or "—"} &nbsp;|&nbsp;
-            🧴 {ptype or "—"} &nbsp;|&nbsp; 🏪 {comp}
+            🏷️ {safe_brand} &nbsp;|&nbsp; 📏 {safe_size} &nbsp;|&nbsp;
+            🧴 {safe_ptype} &nbsp;|&nbsp; 🏪 {safe_comp}
           </div>
           {variant_html}
           {note_html}
