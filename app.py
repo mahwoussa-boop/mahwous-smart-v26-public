@@ -3135,6 +3135,8 @@ elif page == "⚠️ تحت المراجعة":
                 size       = str(row.get("الحجم",""))
                 comp_name_s= str(row.get("المنافس",""))
                 diff       = our_price - comp_price
+                our_img_rv = str(row.get("صورة_منتجنا", "") or "").strip()
+                comp_img_rv = str(row.get("صورة_المنافس", "") or "").strip()
 
                 _rv_key = f"review_{our_name}_{idx}"
                 if _rv_key in st.session_state.hidden_products:
@@ -3145,33 +3147,58 @@ elif page == "⚠️ تحت المراجعة":
                 _diff_color  = "#f44336" if diff > 10 else "#4caf50" if diff < -10 else "#888"
                 _diff_label  = f"+{diff:.0f}" if diff > 0 else f"{diff:.0f}"
 
-                # ── بطاقة المقارنة ─────────────────────────────────────
+                def _rv_img_tag(url: str, border_hex: str) -> str:
+                    u = (url or "").strip()
+                    if not u or u.lower() in ("nan", "none"):
+                        return (
+                            '<div style="min-height:76px;display:flex;align-items:center;justify-content:center;'
+                            'color:#555;font-size:.62rem;border-radius:8px;background:#0a1424;border:1px dashed #333">لا صورة</div>'
+                        )
+                    eu = _html_escape(u, quote=True)
+                    return (
+                        f'<div style="text-align:center;margin-bottom:6px">'
+                        f'<img src="{eu}" alt="" style="width:76px;height:76px;max-width:100%;object-fit:cover;'
+                        f'border-radius:10px;border:1px solid {border_hex};background:#0e1628" '
+                        f'loading="lazy" referrerpolicy="no-referrer" '
+                        f"onerror=\"this.style.display='none'\" />"
+                        f"</div>"
+                    )
+
+                _on = _html_escape(our_name[:120])
+                _cn = _html_escape(comp_name[:120])
+                _bs = _html_escape(brand)
+                _sz = _html_escape(size)
+                _cs = _html_escape(comp_name_s)
+
+                # ── بطاقة المقارنة (مع صور) ─────────────────────────────────────
                 st.markdown(f"""
                 <div style="border:1px solid #ff980055;border-radius:10px;padding:12px;
                             margin:6px 0;background:linear-gradient(135deg,#0a1628,#0e1a30);">
                   <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
-                    <span style="font-size:.75rem;color:#888">🏷️ {brand} | 📏 {size}</span>
+                    <span style="font-size:.75rem;color:#888">🏷️ {_bs} | 📏 {_sz}</span>
                     <span style="font-size:.75rem;padding:2px 8px;border-radius:10px;
                                  background:{_score_color}22;color:{_score_color};font-weight:700">
                       نسبة المطابقة: {score:.0f}%
                     </span>
                   </div>
-                  <div style="display:grid;grid-template-columns:1fr 60px 1fr;gap:8px;align-items:center">
+                  <div style="display:grid;grid-template-columns:1fr 60px 1fr;gap:10px;align-items:start">
                     <!-- منتجنا -->
                     <div style="background:#0d2040;border-radius:8px;padding:10px;border:1px solid #4fc3f733">
+                      {_rv_img_tag(our_img_rv, "#4fc3f766")}
                       <div style="font-size:.65rem;color:#4fc3f7;margin-bottom:4px">📦 منتجنا</div>
-                      <div style="font-weight:700;color:#fff;font-size:.88rem">{our_name[:60]}</div>
+                      <div style="font-weight:700;color:#fff;font-size:.88rem">{_on}</div>
                       <div style="font-size:1.1rem;font-weight:900;color:#4caf50;margin-top:6px">{our_price:,.0f} ر.س</div>
                     </div>
                     <!-- الفرق -->
-                    <div style="text-align:center">
+                    <div style="text-align:center;padding-top:28px">
                       <div style="font-size:1.2rem;color:{_diff_color};font-weight:900">{_diff_label}</div>
                       <div style="font-size:.6rem;color:#555">ر.س</div>
                     </div>
                     <!-- منتج المنافس -->
                     <div style="background:#1a0d20;border-radius:8px;padding:10px;border:1px solid #ff572233">
-                      <div style="font-size:.65rem;color:#ff5722;margin-bottom:4px">🏪 {comp_name_s}</div>
-                      <div style="font-weight:700;color:#fff;font-size:.88rem">{comp_name[:60]}</div>
+                      {_rv_img_tag(comp_img_rv, "#ff572266")}
+                      <div style="font-size:.65rem;color:#ff5722;margin-bottom:4px">🏪 {_cs}</div>
+                      <div style="font-weight:700;color:#fff;font-size:.88rem">{_cn}</div>
                       <div style="font-size:1.1rem;font-weight:900;color:#ff9800;margin-top:6px">{comp_price:,.0f} ر.س</div>
                     </div>
                   </div>

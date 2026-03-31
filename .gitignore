@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.db
+data/scrape_events.ndjson
 .streamlit/secrets.toml
 .streamlit/secrets.toml
 API_SETUP.md

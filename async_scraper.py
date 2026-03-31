@@ -681,6 +681,9 @@ def _pipeline_analysis_worker(
 
     from engines.engine import run_full_analysis
 
+    # أحداث الكشط المُصدّرة من engines.scrape_event تُسجّل عند الاستخراج؛ لا تزال هذه الدالة
+    # تعمل على صفوف CSV كما في السابق (استبدال الوسيط لاحقاً دون تغيير التوقيع هنا).
+
     while True:
         item = q.get()
         if item is _PIPELINE_STOP:
@@ -864,6 +867,33 @@ async def _run_scraper_async(
         elif inc_ev == 0 and (inc_cb or (pipeline and pipeline.get("our_df") is not None)):
             inc_ev = pipe_every if pipe_every > 0 else _CHECKPOINT_EVERY
 
+        _cid = (
+            str((pipeline or {}).get("comp_key") or "").strip()
+            or os.environ.get("SCRAPE_COMPETITOR_ID", "").strip()
+            or "Scraped_Competitor"
+        )
+
+        def _emit_scrape_event(page_url: str, name: str, price_f: float, img: str) -> None:
+            """عقد حدث داخلي — راجع engines/scrape_event.py (لاحقاً: Redis Streams)."""
+            try:
+                from engines.scrape_event import build_scrape_event, maybe_append_ndjson_event
+
+                ev = build_scrape_event(
+                    competitor_id=_cid,
+                    source_url=page_url,
+                    name=name,
+                    price_sar=price_f,
+                    image_url=img,
+                )
+                if pipeline and callable(pipeline.get("on_scrape_event")):
+                    try:
+                        pipeline["on_scrape_event"](ev)
+                    except Exception:
+                        logger.exception("on_scrape_event callback failed")
+                maybe_append_ndjson_event(ev)
+            except Exception:
+                logger.exception("emit scrape event failed")
+
         _scrape_tick = [0, 0.0]
 
         def _consume_row(u: str, row: dict[str, Any] | None, i_pos: int):
@@ -900,6 +930,7 @@ async def _run_scraper_async(
                             "رابط_الصورة": img,
                         }
                     )
+                    _emit_scrape_event(u, name, price_f, img)
                 else:
                     stats["extract_fail"] += 1
             else:
