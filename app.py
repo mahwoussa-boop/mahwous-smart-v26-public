@@ -102,10 +102,40 @@ _defaults = {
     "our_df": None, "comp_dfs": None,  # حفظ الملفات للمنتجات المفقودة
     "hidden_products": set(),  # منتجات أُرسلت لـ Make أو أُزيلت
     "scrape_preset_selection": [],  # أسماء منافسين من preset_competitors.json
+    "brands_df": None,   # من data/brands.csv — إثراء المفقودات
+    "categories_df": None,  # من data/categories.csv
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+def _enrich_missing_df(missing_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    يطبّق إثراء الماركات (brand_page_url / brand_description) والتصنيف التلقائي
+    بعد جدول المفقودات — دون تعديل mahwous_core أو المحرك.
+    """
+    if missing_df is None or missing_df.empty:
+        return missing_df
+    try:
+        from engines.pipeline_enrichment import (
+            apply_missing_pipeline_enrichment,
+            load_brands_categories_from_disk,
+        )
+
+        bdf = st.session_state.get("brands_df")
+        cdf = st.session_state.get("categories_df")
+        if not isinstance(bdf, pd.DataFrame) or bdf.empty:
+            bdf, cdf = load_brands_categories_from_disk()
+            st.session_state["brands_df"] = bdf
+            st.session_state["categories_df"] = cdf
+        elif not isinstance(cdf, pd.DataFrame) or cdf.empty:
+            _, cdf = load_brands_categories_from_disk()
+            st.session_state["categories_df"] = cdf
+        return apply_missing_pipeline_enrichment(missing_df, bdf, cdf)
+    except Exception:
+        return missing_df
+
 
 # تحميل المنتجات المخفية من قاعدة البيانات عند كل تشغيل
 _db_hidden = get_hidden_product_keys()
@@ -671,6 +701,7 @@ def _persist_analysis_after_match(
     try:
         raw_missing_df = find_missing_products(our_df, comp_dfs)
         missing_df = smart_missing_barrier(raw_missing_df, our_df)
+        missing_df = _enrich_missing_df(missing_df)
     except Exception as e:
         import traceback
 
@@ -943,6 +974,7 @@ def _make_on_analysis_snapshot(
             comp_dfs = merged_comp_dfs_for_analysis(ck, cdf)
             raw_m = find_missing_products(our_df, comp_dfs)
             missing_df = smart_missing_barrier(raw_m, our_df)
+            missing_df = _enrich_missing_df(missing_df)
             missing_n = len(missing_df)
         except Exception:
             missing_df = pd.DataFrame()
@@ -2552,7 +2584,7 @@ elif page == "🔍 منتجات مفقودة":
                             "3. سعر مقترح (أقل من المنافس بـ5-10 ر.س)\n"
                             "4. منتجات لا تستحق الإضافة — ولماذا؟"
                         )
-                        r_ai = call_ai(_prompt, "missing")
+                        r_ai = call_ai(_prompt, "missing_analysis")
                         resp = r_ai["response"] if r_ai["success"] else "❌ فشل AI"
                         # تنظيف JSON من المخرجات
                         import re as _re

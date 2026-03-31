@@ -140,6 +140,7 @@ PRICE_DIFF_THRESHOLD = PRICE_TOLERANCE
 REJECT_KEYWORDS = [
     "sample","عينة","عينه","decant","تقسيم","تقسيمة",
     "split","miniature","0.5ml","1ml","2ml","3ml",
+    "vial","سمبل",
 ]
 TESTER_KEYWORDS = ["tester","تستر","تيستر"]
 SET_KEYWORDS    = ["set","gift set","طقم","مجموعة","coffret"]
@@ -220,6 +221,8 @@ AUTOMATION_RULES_DEFAULT = [
 AUTO_SEARCH_INTERVAL_MINUTES = 60 * 6   # كل 6 ساعات
 AUTO_PUSH_TO_MAKE = False               # إرسال تلقائي لـ Make.com (يتطلب تفعيل يدوي)
 AUTO_DECISION_CONFIDENCE = 92           # حد الثقة للقرار التلقائي (تسعير/رفع-خفض)
+# حاجز المفقودات: تطابق نصي مع كتالوجنا (token_set_ratio) — يُستبعد عند ≥88%
+SMART_MISSING_FUZZ_THRESHOLD = 88
 # تحقق AI لقسم المراجعة — واقعي مع مخرجات verify_match (غالباً 65–90)
 REVIEW_VERIFY_MIN_CONFIDENCE = 72
 
