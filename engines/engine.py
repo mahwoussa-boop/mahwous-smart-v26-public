@@ -69,7 +69,7 @@ try:
     from config import (REJECT_KEYWORDS, KNOWN_BRANDS, WORD_REPLACEMENTS,
                         MATCH_THRESHOLD, HIGH_CONFIDENCE, REVIEW_THRESHOLD,
                         PRICE_TOLERANCE, TESTER_KEYWORDS, SET_KEYWORDS,
-                        GEMINI_API_KEYS, OPENROUTER_API_KEY)
+                        GEMINI_API_KEYS, get_openrouter_api_key)
 except Exception:
     logger.error(
         "config import failed; using bundled defaults for REJECT_KEYWORDS/KNOWN_BRANDS/etc.",
@@ -120,7 +120,8 @@ except Exception:
     WORD_REPLACEMENTS = {}
     MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
     PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
-    OPENROUTER_API_KEY = ""
+    def get_openrouter_api_key():
+        return ""
 
 # ─── قراءة مفاتيح Gemini من Railway Environment Variables ───
 import os as _os
@@ -1127,9 +1128,10 @@ _GURL    = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-f
 _OR_URL  = "https://openrouter.ai/api/v1/chat/completions"
 _OR_FREE = [
     "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-3-27b-it:free",
     "deepseek/deepseek-chat-v3-0324:free",
     "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "google/gemma-3-27b-it:free",
 ]
 
 def _ai_batch(batch):
@@ -1247,7 +1249,7 @@ def _ai_batch(batch):
             continue
 
     # ── 2. OpenRouter fallback ────────────────────────────────────────────
-    or_key = OPENROUTER_API_KEY
+    or_key = get_openrouter_api_key()
     if or_key:
         for model in _OR_FREE:
             try:

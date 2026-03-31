@@ -13,7 +13,7 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 import base64
 import os as _os
 import requests, json, re, time, traceback
-from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
+from config import get_gemini_api_keys, get_openrouter_api_key, get_cohere_api_key
 
 try:
     from engines.engine import _clean_ai_json
@@ -57,7 +57,7 @@ def diagnose_ai_providers() -> dict:
 
     # ── Gemini ────────────────────────────────────────────────────────────
     gemini_results = []
-    for i, key in enumerate(GEMINI_API_KEYS or []):
+    for i, key in enumerate(get_gemini_api_keys() or []):
         if not key:
             gemini_results.append({"key": i+1, "status": "❌ مفتاح فارغ"})
             continue
@@ -95,7 +95,8 @@ def diagnose_ai_providers() -> dict:
     results["gemini"] = gemini_results
 
     # ── OpenRouter — تجربة نماذج صالحة (المعرّفات القديمة مثل google/gemini-2.0-flash تُرفض بـ 400)
-    if OPENROUTER_API_KEY:
+    _or_key = get_openrouter_api_key()
+    if _or_key:
         or_ok = False
         last_or = ""
         for _model in OPENROUTER_FALLBACK_MODELS:
@@ -108,7 +109,7 @@ def diagnose_ai_providers() -> dict:
                         "max_tokens": 5,
                     },
                     headers={
-                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Authorization": f"Bearer {_or_key}",
                         "HTTP-Referer": "https://mahwous.com",
                     },
                     timeout=15,
@@ -147,13 +148,14 @@ def diagnose_ai_providers() -> dict:
         results["openrouter"] = "⚠️ مفتاح غير موجود"
 
     # ── Cohere ────────────────────────────────────────────────────────────
-    if COHERE_API_KEY:
+    _ch_key = get_cohere_api_key()
+    if _ch_key:
         try:
             r = requests.post("https://api.cohere.com/v2/chat", json={
                 "model": "command-a-03-2025",
                 "messages": [{"role": "user", "content": "test"}],
             }, headers={
-                "Authorization": f"Bearer {COHERE_API_KEY}",
+                "Authorization": f"Bearer {_ch_key}",
                 "Content-Type": "application/json",
             }, timeout=15)
             if r.status_code == 200:
@@ -218,7 +220,7 @@ def vision_match_court(
     يعيد: same_product (bool), reason (str), ok (نجح الطلب).
     """
     out: dict = {"same_product": False, "reason": "", "ok": False}
-    keys = GEMINI_API_KEYS or []
+    keys = get_gemini_api_keys() or []
     if not keys:
         out["reason"] = "لا يوجد مفتاح Gemini"
         return out
@@ -382,11 +384,12 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     if grounding:
         payload["tools"] = [{"google_search": {}}]
 
-    if not GEMINI_API_KEYS:
+    keys = get_gemini_api_keys()
+    if not keys:
         _log_err("Gemini", "لا توجد مفاتيح API")
         return None
 
-    for i, key in enumerate(GEMINI_API_KEYS):
+    for i, key in enumerate(keys):
         if not key:
             continue
         try:
@@ -423,7 +426,8 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     return None
 
 def _call_openrouter(prompt, system=""):
-    if not OPENROUTER_API_KEY:
+    or_key = get_openrouter_api_key()
+    if not or_key:
         return None
 
     msgs = []
@@ -439,7 +443,7 @@ def _call_openrouter(prompt, system=""):
                 "temperature": 0.3,
                 "max_tokens": 8192
             }, headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {or_key}",
                 "HTTP-Referer": "https://mahwous.com",
                 "X-Title": "Mahwous"
             }, timeout=45)
@@ -483,7 +487,8 @@ def _call_cohere(prompt, system=""):
     Cohere — Fallback صامت فقط.
     أي خطأ (401/402/429/...) يُسجَّل ويُعاد None بدون إيقاف سير العمل.
     """
-    if not COHERE_API_KEY:
+    ch_key = get_cohere_api_key()
+    if not ch_key:
         return None
     try:
         messages = []
@@ -494,7 +499,7 @@ def _call_cohere(prompt, system=""):
         r = requests.post(
             "https://api.cohere.com/v2/chat",
             json={"model": "command-r-plus", "messages": messages, "temperature": 0.3},
-            headers={"Authorization": f"Bearer {COHERE_API_KEY}",
+            headers={"Authorization": f"Bearer {ch_key}",
                      "Content-Type": "application/json"},
             timeout=30
         )
@@ -579,7 +584,7 @@ def gemini_chat(message, history=None, system_extra=""):
                "generationConfig":{"temperature":0.4,"maxOutputTokens":4096,"topP":0.9}}
     if needs_web:
         payload["tools"] = [{"google_search":{}}]
-    for key in GEMINI_API_KEYS:
+    for key in get_gemini_api_keys():
         if not key: continue
         try:
             r = requests.post(f"{_GU}?key={key}", json=payload, timeout=40)
