@@ -718,9 +718,10 @@ def extract_brand(text):
 def extract_type(text):
     if not isinstance(text, str): return ""
     n = normalize(text)
-    if "edp" in n or "extrait" in n: return "EDP"
+    # EDT قبل EDP حتى لا يُلتقط «eau de parfum» كـ edt فقط عبر «toilette»
     if "edt" in n: return "EDT"
     if "edc" in n: return "EDC"
+    if "edp" in n or "extrait" in n or "parfum" in n: return "EDP"
     return ""
 
 def extract_gender(text):
@@ -986,7 +987,10 @@ class CompIndex:
                 continue
             if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 2.5:
                 continue
-            if our_tp and c_tp and our_tp != c_tp:
+            # عزل تركيز العطر: EDP/EDT/EDC يجب أن يتطابق عندما يُستنتج من الاسم
+            _conc_our = our_tp or (extract_type(our_raw) if our_raw else "")
+            _conc_comp = c_tp or extract_type(name)
+            if _conc_our and _conc_comp and _conc_our != _conc_comp:
                 continue
             if our_gd and c_gd and our_gd != c_gd:
                 continue
