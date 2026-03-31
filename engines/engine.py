@@ -694,7 +694,7 @@ class CompIndex:
         self.plines     = [extract_product_line(n, self.brands[i]) for i, n in enumerate(self.raw_names)]
         self.prices     = [_price(row) for _, row in df.iterrows()]
         self.ids        = [_pid(row, id_col) for _, row in df.iterrows()]
-        _img_cands = ["رابط_الصورة", "image_url", "صورة", "image"]
+        _img_cands = ["رابط_الصورة", "صورة_المنافس", "image_url", "صورة", "image"]
         img_col = next((c for c in _img_cands if c in df.columns), None)
         if img_col is None:
             for c in df.columns:
