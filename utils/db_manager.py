@@ -184,34 +184,42 @@ def upsert_price_history(product_name, competitor, price,
     إذا كان أمس → يضيف سجلاً جديداً لتتبع التغيير.
     يرجع True إذا تغير السعر عن آخر تسجيل.
     """
-    conn = get_db()
-    today = _date()
+    conn = None
+    try:
+        conn = get_db()
+        today = _date()
 
-    # آخر سعر مسجل لهذا المنتج/المنافس
-    last = conn.execute(
-        """SELECT price, date FROM price_history
-           WHERE product_name=? AND competitor=?
-           ORDER BY id DESC LIMIT 1""",
-        (product_name, competitor)
-    ).fetchone()
+        last = conn.execute(
+            """SELECT price, date FROM price_history
+               WHERE product_name=? AND competitor=?
+               ORDER BY id DESC LIMIT 1""",
+            (product_name, competitor)
+        ).fetchone()
 
-    price_changed = False
-    if last:
-        last_price = last["price"]
-        last_date  = last["date"]
-        price_changed = abs(float(price) - float(last_price)) > 0.01
+        price_changed = False
+        if last:
+            last_price = last["price"]
+            last_date  = last["date"]
+            price_changed = abs(float(price) - float(last_price)) > 0.01
 
-        if last_date == today:
-            # نفس اليوم → حدّث فقط
-            conn.execute(
-                """UPDATE price_history SET price=?,our_price=?,diff=?,
-                   match_score=?,decision=?,product_id=?
-                   WHERE product_name=? AND competitor=? AND date=?""",
-                (price, our_price, diff, match_score, decision,
-                 product_id, product_name, competitor, today)
-            )
+            if last_date == today:
+                conn.execute(
+                    """UPDATE price_history SET price=?,our_price=?,diff=?,
+                       match_score=?,decision=?,product_id=?
+                       WHERE product_name=? AND competitor=? AND date=?""",
+                    (price, our_price, diff, match_score, decision,
+                     product_id, product_name, competitor, today)
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO price_history
+                       (date,product_name,competitor,price,our_price,diff,
+                        match_score,decision,product_id)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (today, product_name, competitor, price, our_price,
+                     diff, match_score, decision, product_id)
+                )
         else:
-            # يوم جديد → أضف سجل
             conn.execute(
                 """INSERT INTO price_history
                    (date,product_name,competitor,price,our_price,diff,
@@ -220,19 +228,16 @@ def upsert_price_history(product_name, competitor, price,
                 (today, product_name, competitor, price, our_price,
                  diff, match_score, decision, product_id)
             )
-    else:
-        # أول مرة
-        conn.execute(
-            """INSERT INTO price_history
-               (date,product_name,competitor,price,our_price,diff,
-                match_score,decision,product_id)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (today, product_name, competitor, price, our_price,
-             diff, match_score, decision, product_id)
-        )
 
-    conn.commit(); conn.close()
-    return price_changed
+        conn.commit()
+        return price_changed
+    except Exception as e:
+        _log_db_err("upsert_price_history", e)
+        return False
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
 
 
 def get_price_history(product_name, competitor="", limit=30):
@@ -545,6 +550,7 @@ def upsert_comp_catalog(comp_dfs: dict):
     for cname, cdf in comp_dfs.items():
         cols = list(cdf.columns)
         name_col = price_col = img_col = id_col = None
+        # بحث بالاسم أولاً (أدق من تخمين المحتوى)
         for c in cols:
             cs = str(c)
             if id_col is None and any(
@@ -555,14 +561,27 @@ def upsert_comp_catalog(comp_dfs: dict):
                 k in cs for k in ("رابط_الصورة", "صورة", "image", "Image")
             ):
                 img_col = c
-            sample = str(cdf[c].dropna().iloc[0]) if not cdf[c].dropna().empty else ""
-            try:
-                float(sample.replace(",", ""))
-                if price_col is None:
-                    price_col = c
-            except Exception:
-                if name_col is None and len(sample) > 5:
-                    name_col = c
+            if price_col is None and any(
+                k in cs.lower() for k in ("سعر", "price", "السعر")
+            ):
+                price_col = c
+            if name_col is None and any(
+                k in cs for k in ("اسم المنتج", "المنتج", "Product", "Name", "name", "اسم")
+            ):
+                name_col = c
+        # fallback بالمحتوى — لكن تخطي أعمدة معروفة
+        if name_col is None or price_col is None:
+            for c in cols:
+                if c in (id_col, img_col, name_col, price_col):
+                    continue
+                sample = str(cdf[c].dropna().iloc[0]) if not cdf[c].dropna().empty else ""
+                try:
+                    float(sample.replace(",", ""))
+                    if price_col is None:
+                        price_col = c
+                except Exception:
+                    if name_col is None and len(sample) > 5:
+                        name_col = c
 
         if name_col is None:
             name_col = cols[0]
