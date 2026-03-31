@@ -112,10 +112,10 @@ except Exception:
         "جيمي تشو","لاليك","بوليس","فيكتور رولف",
         "كلوي","بالنسياغا","ميو ميو",
     ]
-WORD_REPLACEMENTS = {}
-MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
-PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
-OPENROUTER_API_KEY = ""
+    WORD_REPLACEMENTS = {}
+    MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
+    PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
+    OPENROUTER_API_KEY = ""
 
 # ─── قراءة مفاتيح Gemini من Railway Environment Variables ───
 import os as _os
@@ -221,9 +221,9 @@ _SYN = {
     "كلوب دي نوي":"club de nuit","كلوب دنوي":"club de nuit",
     "مايلستون":"milestone",
     "سكاندل":"scandal","سكاندال":"scandal",
-    " مل":" ml","ملي ":"ml ","ملي":"ml","مل":"ml",
-    "ليتر":"l","لتر":"l"," لتر":" l"," ليتر":" l",
-    "جم":"g","جرام":"g"," غرام":" g",
+    " مل ":" ml ","ملي ":"ml "," ملي":" ml","مل ":"ml ",
+    "ليتر":"l","لتر ":"l "," لتر":" l"," ليتر":" l",
+    " جم ":"g","جرام":"g"," غرام":" g",
     # ── توحيد الحروف العربية ──
     "أ":"ا","إ":"ا","آ":"ا","ة":"ه","ى":"ي","ؤ":"و","ئ":"ي","ـ":"",
     # ── تهجئات بديلة لكلمات العطور (الأهم للمطابقة) ──
@@ -263,8 +263,9 @@ _SYN = {
     "جولد":"gold","قولد":"gold",
     "سيلفر":"silver","سيلفير":"silver",
     "نايت":"night","نايث":"night",
-    "داي":"day","دي":"day",
-    "او":"",  # إزالة حروف الربط الزائدة
+    "داي":"day",
+    # "دي":"day",   # محذوف: يدمّر "ديور"/"ديفيدوف" وغيرها (str.replace بدون حدود)
+    # "او":"",      # محذوف: يحذف حرفين من أي كلمة تحتويهما
     # ── v26.0: مرادفات إضافية لزيادة الدقة ──
     # أحجام بديلة
     "٥٠":"50","٧٥":"75","١٠٠":"100","١٢٥":"125","١٥٠":"150","٢٠٠":"200",
@@ -336,10 +337,11 @@ def _init_db():
         logger.error("match cache DB init failed path=%s", _DB, exc_info=True)
 
 def _cget(k):
+    cn = None
     try:
         cn = sqlite3.connect(_DB, check_same_thread=False)
         r = cn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
-        cn.close(); return json.loads(r[0]) if r else None
+        return json.loads(r[0]) if r else None
     except Exception:
         logger.error(
             "match cache read failed key_prefix=%s",
@@ -347,19 +349,28 @@ def _cget(k):
             exc_info=True,
         )
         return None
+    finally:
+        if cn:
+            try: cn.close()
+            except Exception: pass
 
 def _cset(k, v):
+    cn = None
     try:
         cn = sqlite3.connect(_DB, check_same_thread=False)
         cn.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",
                    (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat()))
-        cn.commit(); cn.close()
+        cn.commit()
     except Exception:
         logger.error(
             "match cache write failed key_prefix=%s",
             (k[:32] + "…") if len(k) > 32 else k,
             exc_info=True,
         )
+    finally:
+        if cn:
+            try: cn.close()
+            except Exception: pass
 
 _init_db()
 
@@ -457,7 +468,8 @@ def _smart_rename_columns(df):
                         exc_info=True,
                     )
             if numeric_count >= len(sample) * 0.7:
-                new_cols[col] = 'السعر'
+                if 'السعر' not in new_cols.values():
+                    new_cols[col] = 'السعر'
             else:
                 # يحتوي على نصوص → اسم المنتج
                 if 'المنتج' not in new_cols.values() and 'اسم المنتج' not in new_cols.values():
@@ -479,8 +491,9 @@ _NOISE_RE = re.compile(
     r'eau\s*de|pour\s*homme|pour\s*femme|for\s*men|for\s*women|unisex|'
     r'edp|edt|edc)\b'
     r'|\b\d+(?:\.\d+)?\s*(?:ml|مل|ملي|oz)\b'   # أحجام: 100ml, 50مل
-    r'|\b(100|200|50|75|150|125|250|300|30|80)\b',  # أرقام أحجام منفردة
-    re.UNICODE | re.IGNORECASE
+    # حُذف: r'|\b(100|200|50|75|150|125|250|300|30|80)\b'
+    # السبب: يحذف أرقاماً مهمة من أسماء المنتجات مثل "212 VIP" و "No. 5"
+    , re.UNICODE | re.IGNORECASE
 )
 
 def normalize(text):
@@ -618,10 +631,9 @@ def extract_type(text):
 
 def extract_gender(text):
     if not isinstance(text, str): return ""
-    tl = text.lower()
-    # تم التحديث ليشمل mans وصيغ الرجال المطلوبة
-    m = any(k in tl for k in ["pour homme","for men"," men "," man ","رجالي","للرجال"," مان "," هوم ","homme"," uomo", "mans", "for mans", " mans "])
-    w = any(k in tl for k in ["pour femme","for women","women"," woman ","نسائي","للنساء","النسائي","lady","femme"," donna"])
+    tl = " " + text.lower() + " "
+    m = any(k in tl for k in [" pour homme "," for men "," men "," man "," رجالي "," للرجال "," مان "," هوم "," homme "," uomo "," mans "])
+    w = any(k in tl for k in [" pour femme "," for women "," women "," woman "," نسائي "," للنساء "," النسائي "," lady "," femme "," donna "])
     if m and not w: return "رجالي"
     if w and not m: return "نسائي"
     return ""
@@ -739,7 +751,7 @@ def classify_product(name):
     return 'retail'
 
 def _price(row):
-    for c in ["السعر","Price","price","سعر","PRICE"]:
+    for c in ["السعر","Price","price","سعر","PRICE","سعر المنتج","سعر_المنتج"]:
         if c in row.index:
             try: return float(str(row[c]).replace(",",""))
             except Exception:
@@ -749,18 +761,7 @@ def _price(row):
                     row.get(c),
                     exc_info=True,
                 )
-    # احتياطي: ابحث عن أي عمود رقمي يشبه السعر
-    for c in row.index:
-        try:
-            v = float(str(row[c]).replace(",",""))
-            if 1 <= v <= 99999:  # نطاق سعر معقول
-                return v
-        except Exception:
-            logger.warning(
-                "_price: heuristic column parse failed col=%r",
-                c,
-                exc_info=True,
-            )
+    # لا fallback عشوائي — قد يلتقط SKU أو رقم المنتج كسعر
     return 0.0
 
 def _pid(row, col):
@@ -801,7 +802,7 @@ def _fcol(df, cands):
         for col in cols:
             if c in col or _norm_ar(c) in _norm_ar(col):
                 return col
-    return cols[0] if cols else ""
+    return ""
 
 # ═══════════════════════════════════════════════════════
 #  الكلاس الجديد: Pre-normalized Competitor Index
@@ -1081,7 +1082,7 @@ def _ai_batch(batch):
                 raw = []
             out = []
             for j, it in enumerate(batch):
-                n = raw[j] if j < len(raw) else 1
+                n = raw[j] if j < len(raw) else 0
                 try:
                     n = int(float(str(n)))
                 except Exception:
@@ -1091,7 +1092,7 @@ def _ai_batch(batch):
                         raw[j] if j < len(raw) else None,
                         exc_info=True,
                     )
-                    n = 1
+                    n = 0
                 if 1 <= n <= len(it["candidates"]):
                     out.append(n - 1)
                 elif n == 0:
@@ -1589,8 +1590,8 @@ def find_missing_products(our_df, comp_dfs):
             if len(w) >= 3 and w in _word_idx:
                 for p in _word_idx[w]:
                     seen[id(p)] = p
-        # fallback: إذا لم يجد شيئاً → ابحث في كامل القائمة
-        return list(seen.values()) if seen else our_items
+        # لا fallback لكل المنتجات — يسبب O(N²) كارثي مع آلاف المنتجات
+        return list(seen.values())
 
     def _is_same_product(cp_raw, cn, c_brand, c_pline, c_size, c_type, c_gender, c_is_tester, c_agg=""):
         """

@@ -344,26 +344,25 @@ def _ensure_automation_table(db=None):
     """إنشاء جدول الأتمتة إذا لم يكن موجوداً"""
     path = db or DB_PATH
     try:
-        conn = sqlite3.connect(path, check_same_thread=False)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS automation_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT DEFAULT (datetime('now','localtime')),
-                product_name TEXT,
-                product_id TEXT,
-                rule_name TEXT,
-                action TEXT,
-                old_price REAL,
-                new_price REAL,
-                comp_price REAL,
-                competitor TEXT,
-                match_score REAL,
-                reason TEXT,
-                pushed_to_make INTEGER DEFAULT 0
-            )
-        """)
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(path, check_same_thread=False, timeout=30) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS automation_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT DEFAULT (datetime('now','localtime')),
+                    product_name TEXT,
+                    product_id TEXT,
+                    rule_name TEXT,
+                    action TEXT,
+                    old_price REAL,
+                    new_price REAL,
+                    comp_price REAL,
+                    competitor TEXT,
+                    match_score REAL,
+                    reason TEXT,
+                    pushed_to_make INTEGER DEFAULT 0
+                )
+            """)
+            conn.commit()
     except Exception:
         pass
 
@@ -373,21 +372,20 @@ def log_automation_decision(decision: dict, pushed: bool = False, db=None):
     path = db or DB_PATH
     _ensure_automation_table(path)
     try:
-        conn = sqlite3.connect(path, check_same_thread=False)
-        conn.execute(
-            """INSERT INTO automation_log
-               (product_name, product_id, rule_name, action, old_price,
-                new_price, comp_price, competitor, match_score, reason, pushed_to_make)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (decision.get("product_name", ""), decision.get("product_id", ""),
-             decision.get("rule", ""), decision.get("action", ""),
-             decision.get("old_price", 0), decision.get("new_price", 0),
-             decision.get("comp_price", 0), decision.get("competitor", ""),
-             decision.get("match_score", 0), decision.get("reason", ""),
-             1 if pushed else 0)
-        )
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(path, check_same_thread=False, timeout=30) as conn:
+            conn.execute(
+                """INSERT INTO automation_log
+                   (product_name, product_id, rule_name, action, old_price,
+                    new_price, comp_price, competitor, match_score, reason, pushed_to_make)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (decision.get("product_name", ""), decision.get("product_id", ""),
+                 decision.get("rule", ""), decision.get("action", ""),
+                 decision.get("old_price", 0), decision.get("new_price", 0),
+                 decision.get("comp_price", 0), decision.get("competitor", ""),
+                 decision.get("match_score", 0), decision.get("reason", ""),
+                 1 if pushed else 0)
+            )
+            conn.commit()
     except Exception:
         pass
 
@@ -396,22 +394,27 @@ def get_automation_log(limit: int = 50, db=None) -> List[Dict]:
     """استرجاع سجل الأتمتة"""
     path = db or DB_PATH
     _ensure_automation_table(path)
+    conn = None
     try:
         conn = sqlite3.connect(path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM automation_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
 
 
 def get_automation_stats(days: int = 7, db=None) -> Dict:
     """إحصائيات الأتمتة لآخر X يوم"""
     path = db or DB_PATH
     _ensure_automation_table(path)
+    conn = None
     try:
         conn = sqlite3.connect(path, check_same_thread=False)
         since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -430,8 +433,11 @@ def get_automation_stats(days: int = 7, db=None) -> Dict:
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND pushed_to_make=1",
             (since,)
         ).fetchone()[0]
-        conn.close()
         return {"total": total, "lower": lower, "raise": raised,
                 "keep": total - lower - raised, "pushed": pushed}
     except Exception:
         return {"total": 0, "lower": 0, "raise": 0, "keep": 0, "pushed": 0}
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
