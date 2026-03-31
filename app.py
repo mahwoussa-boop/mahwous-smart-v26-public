@@ -112,6 +112,20 @@ st.session_state.hidden_products = st.session_state.hidden_products | _db_hidden
 # ── نتائج جزئية أثناء الكشط → بطاقات الأقسام (ملف pickle + لقطة JSON) ──
 _LIVE_SNAP_PATH = os.path.join("data", "scrape_live_snapshot.json")
 _LIVE_SESSION_PKL = os.path.join("data", "live_session_results.pkl")
+# خيط التحليل يكتب اللقطة بشكل متكرر؛ القفل + كتابة ذرية تمنع تداخل الكتابات وملفات تالفة
+_LIVE_SESSION_PKL_LOCK = threading.Lock()
+
+
+def _atomic_write_live_session_pkl(payload: dict) -> None:
+    """كتابة pickle ذرية: ملف مؤقت ثم os.replace حتى لا يقرأ القارئ نصف ملف."""
+    os.makedirs("data", exist_ok=True)
+    tmp = _LIVE_SESSION_PKL + ".tmp"
+    with _LIVE_SESSION_PKL_LOCK:
+        with open(tmp, "wb") as f:
+            pickle.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _LIVE_SESSION_PKL)
 
 
 def _hydrate_live_session_results_early():
@@ -128,8 +142,9 @@ def _hydrate_live_session_results_early():
     if not (run_ok or done_gap):
         return
     try:
-        with open(_LIVE_SESSION_PKL, "rb") as f:
-            blob = pickle.load(f)
+        with _LIVE_SESSION_PKL_LOCK:
+            with open(_LIVE_SESSION_PKL, "rb") as f:
+                blob = pickle.load(f)
         st.session_state.results = blob["results"]
         st.session_state.analysis_df = blob.get("analysis_df")
         st.session_state.comp_dfs = blob.get("comp_dfs")
@@ -144,8 +159,12 @@ _hydrate_live_session_results_early()
 
 def _clear_live_session_pkl():
     try:
-        if os.path.isfile(_LIVE_SESSION_PKL):
-            os.remove(_LIVE_SESSION_PKL)
+        with _LIVE_SESSION_PKL_LOCK:
+            if os.path.isfile(_LIVE_SESSION_PKL):
+                os.remove(_LIVE_SESSION_PKL)
+            _tmp = _LIVE_SESSION_PKL + ".tmp"
+            if os.path.isfile(_tmp):
+                os.remove(_tmp)
     except Exception:
         pass
 
@@ -811,20 +830,17 @@ def _make_on_analysis_snapshot(
         _r = dict(r)
         _r["missing"] = missing_df
         try:
-            os.makedirs("data", exist_ok=True)
-            with open(_LIVE_SESSION_PKL, "wb") as f:
-                pickle.dump(
-                    {
-                        "results": _r,
-                        "analysis_df": analysis_df,
-                        "comp_dfs": comp_dfs,
-                        "our_df": our_df,
-                        "is_partial": not is_final,
-                        "comp_key": ck,
-                        "updated_at": datetime.now().isoformat(),
-                    },
-                    f,
-                )
+            _atomic_write_live_session_pkl(
+                {
+                    "results": _r,
+                    "analysis_df": analysis_df,
+                    "comp_dfs": comp_dfs,
+                    "our_df": our_df,
+                    "is_partial": not is_final,
+                    "comp_key": ck,
+                    "updated_at": datetime.now().isoformat(),
+                }
+            )
         except Exception:
             pass
         snap = _read_scrape_live_snapshot()
@@ -1275,8 +1291,10 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         "approved": "✅ موافق",
     }.get(prefix, "⚠️ تحت المراجعة")
 
-       # ── الجدول البصري ─────────────────────
-    for idx, row in page_df.iterrows():
+    # ── الجدول البصري ─────────────────────
+    # row_i + page_num يضمنان مفاتيح session_state فريدة حتى مع تكرار index في DataFrame
+    for row_i, (idx, row) in enumerate(page_df.iterrows()):
+        price_input_key = f"input_price_{prefix}_p{page_num}_r{row_i}"
         our_name   = str(row.get("المنتج", "—"))
         # تخطي المنتجات التي أُرسلت لـ Make أو أُزيلت
         _hide_key = f"{prefix}_{our_name}_{idx}"
@@ -1377,7 +1395,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         with b1:  # AI تحقق ذكي — يُصحح القسم
             _ai_label = {"raise": "🤖 هل نخفض؟", "lower": "🤖 هل نرفع؟",
                          "review": "🤖 هل يطابق؟", "approved": "🤖 تحقق"}.get(prefix, "🤖 تحقق")
-            if st.button(_ai_label, key=f"v_{prefix}_{idx}"):
+            if st.button(_ai_label, key=f"v_{prefix}_p{page_num}_r{row_i}"):
                 with st.spinner("🤖 AI يحلل ويتحقق..."):
                     r = verify_match(our_name, comp_name, our_price, comp_price)
                     if r.get("success"):
@@ -1432,7 +1450,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
 
         with b2:  # بحث سعر السوق ذكي
             _mkt_label = {"raise": "🌐 سعر عادل؟", "lower": "🌐 فرصة رفع؟"}.get(prefix, "🌐 سوق")
-            if st.button(_mkt_label, key=f"mkt_{prefix}_{idx}"):
+            if st.button(_mkt_label, key=f"mkt_{prefix}_p{page_num}_r{row_i}"):
                 with st.spinner("🌐 يبحث في السوق السعودي..."):
                     r = search_market_price(our_name, our_price)
                     if r.get("success"):
@@ -1468,7 +1486,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                         st.warning("تعذر البحث في السوق")
 
         with b3:  # موافق
-            if st.button("✅ موافق", key=f"ok_{prefix}_{idx}"):
+            if st.button("✅ موافق", key=f"ok_{prefix}_p{page_num}_r{row_i}"):
                 st.session_state.decisions_pending[our_name] = {
                     "action": "approved", "reason": "موافقة يدوية",
                     "our_price": our_price, "comp_price": comp_price,
@@ -1487,7 +1505,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 st.rerun()
 
         with b4:  # تأجيل
-            if st.button("⏸️ تأجيل", key=f"df_{prefix}_{idx}"):
+            if st.button("⏸️ تأجيل", key=f"df_{prefix}_p{page_num}_r{row_i}"):
                 st.session_state.decisions_pending[our_name] = {
                     "action": "deferred", "reason": "تأجيل",
                     "our_price": our_price, "comp_price": comp_price,
@@ -1499,7 +1517,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 st.warning("⏸️")
 
         with b5:  # إزالة
-            if st.button("🗑️ إزالة", key=f"rm_{prefix}_{idx}"):
+            if st.button("🗑️ إزالة", key=f"rm_{prefix}_p{page_num}_r{row_i}"):
                 st.session_state.decisions_pending[our_name] = {
                     "action": "removed", "reason": "إزالة",
                     "our_price": our_price, "comp_price": comp_price,
@@ -1519,14 +1537,14 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
 
         with b6:  # سعر يدوي
             _auto_price = round(comp_price - 1, 2) if comp_price > 0 else our_price
-            _custom_price = st.number_input(
+            st.number_input(
                 "سعر", value=_auto_price, min_value=0.0,
-                step=1.0, key=f"cp_{prefix}_{idx}",
+                step=1.0, key=price_input_key,
                 label_visibility="collapsed"
             )
 
         with b7:  # تصدير Make
-            if st.button("📤 Make", key=f"mk_{prefix}_{idx}"):
+            if st.button("📤 Make", key=f"mk_{prefix}_p{page_num}_r{row_i}"):
                 # سحب رقم المنتج من جميع الأعمدة المحتملة
                 _pid_raw = (
                     row.get("معرف_المنتج", "") or
@@ -1542,7 +1560,13 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 except (ValueError, TypeError):
                     _pid = str(_pid_raw).strip()
                 if _pid in ("nan", "None", "NaN", ""): _pid = ""
-                _final_price = _custom_price if _custom_price > 0 else _auto_price
+                try:
+                    _raw_p = st.session_state.get(price_input_key)
+                    _final_price = float(_raw_p) if _raw_p is not None else _auto_price
+                except (TypeError, ValueError):
+                    _final_price = _auto_price
+                if _final_price <= 0:
+                    _final_price = _auto_price
                 res = send_single_product({
                     "product_id": _pid,
                     "name": our_name, "price": _final_price,
@@ -1560,7 +1584,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                     st.rerun()
 
         with b8:  # تحقق AI — يُصحح القسم
-            if st.button("🔍 تحقق", key=f"vrf_{prefix}_{idx}"):
+            if st.button("🔍 تحقق", key=f"vrf_{prefix}_p{page_num}_r{row_i}"):
                 with st.spinner("🤖 يتحقق..."):
                     _vr2 = verify_match(our_name, comp_name, our_price, comp_price)
                     if _vr2.get("success"):
@@ -1573,7 +1597,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                             st.warning(f"يجب نقله → **{_sec2}**")
 
         with b9:  # تاريخ السعر
-            if st.button("📈 تاريخ", key=f"ph_{prefix}_{idx}"):
+            if st.button("📈 تاريخ", key=f"ph_{prefix}_p{page_num}_r{row_i}"):
                 history = get_price_history(our_name, comp_src)
                 if history:
                     rows_h = [f"📅 {h['date']}: {h['price']:,.0f} ر.س" for h in history[:5]]
@@ -1582,7 +1606,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                     st.info("لا يوجد تاريخ بعد")
 
         with b10:  # تحليل عميق (سوق + Gemini)
-            if st.button("🔬 عميق", key=f"deep_{prefix}_{idx}"):
+            if st.button("🔬 عميق", key=f"deep_{prefix}_p{page_num}_r{row_i}"):
                 with st.spinner("🔬 تحليل عميق..."):
                     r_deep = ai_deep_analysis(
                         our_name, our_price, comp_name, comp_price,
@@ -2524,8 +2548,10 @@ elif page == "🔍 منتجات مفقودة":
             pn = st.number_input("الصفحة", 1, tp, 1, key="miss_pg") if tp > 1 else 1
             page_df = filtered.iloc[(pn-1)*PAGE_SIZE : pn*PAGE_SIZE]
 
-            for idx, row in page_df.iterrows():
+            for row_i, (idx, row) in enumerate(page_df.iterrows()):
                 name  = str(row.get("منتج_المنافس", ""))
+                _row_slot = f"miss_p{pn}_r{row_i}"
+                miss_price_key = f"input_price_{_row_slot}"
                 _miss_key = f"missing_{name}_{idx}"
                 if _miss_key in st.session_state.hidden_products:
                     continue
@@ -2604,11 +2630,18 @@ elif page == "🔍 منتجات مفقودة":
                     product_id=_miss_pid
                 ), unsafe_allow_html=True)
 
+                _cpx, _ = st.columns([1, 5])
+                with _cpx:
+                    st.number_input(
+                        "سعر", value=float(suggested_price), min_value=0.0, step=1.0,
+                        key=miss_price_key, label_visibility="collapsed",
+                    )
+
                 # ── الأزرار — صف 1 ────────────────────────────────────
                 b1,b2,b3,b4 = st.columns(4)
 
                 with b1:
-                    if st.button("🖼️ صور المنتج", key=f"imgs_{idx}"):
+                    if st.button("🖼️ صور المنتج", key=f"imgs_{_row_slot}"):
                         with st.spinner("🔍 يبحث عن صور..."):
                             img_result = fetch_product_images(name, brand)
                             images = img_result.get("images", [])
@@ -2631,7 +2664,7 @@ elif page == "🔍 منتجات مفقودة":
                                 st.warning("لم يتم العثور على صور")
 
                 with b2:
-                    if st.button("🌸 مكونات", key=f"notes_{idx}"):
+                    if st.button("🌸 مكونات", key=f"notes_{_row_slot}"):
                         with st.spinner("يجلب من Fragrantica Arabia..."):
                             fi = fetch_fragrantica_info(name)
                             if fi.get("success"):
@@ -2646,12 +2679,12 @@ elif page == "🔍 منتجات مفقودة":
 - **الماركة:** {fi.get('brand','—')} | **السنة:** {fi.get('year','—')} | **العائلة:** {fi.get('fragrance_family','—')}""")
                                 if fi.get("fragrantica_url"):
                                     st.markdown(f"[🔗 Fragrantica Arabia]({fi['fragrantica_url']})")
-                                st.session_state[f"frag_info_{idx}"] = fi
+                                st.session_state[f"frag_info_{_row_slot}"] = fi
                             else:
                                 st.warning("لم يتم العثور على بيانات")
 
                 with b3:
-                    if st.button("🔎 تحقق مهووس", key=f"mhw_{idx}"):
+                    if st.button("🔎 تحقق مهووس", key=f"mhw_{_row_slot}"):
                         with st.spinner("يبحث في mahwous.com..."):
                             r_m = search_mahwous(name)
                             if r_m.get("success"):
@@ -2665,7 +2698,7 @@ elif page == "🔍 منتجات مفقودة":
                                 st.warning("تعذر البحث")
 
                 with b4:
-                    if st.button("💹 سعر السوق", key=f"mkt_m_{idx}"):
+                    if st.button("💹 سعر السوق", key=f"mkt_m_{_row_slot}"):
                         with st.spinner("🌐 يبحث في السوق..."):
                             r_s = search_market_price(name, price)
                             if r_s.get("success"):
@@ -2690,46 +2723,55 @@ elif page == "🔍 منتجات مفقودة":
                 b5,b6,b7,b8 = st.columns(4)
 
                 with b5:
-                    if st.button("✍️ خبير الوصف", key=f"expert_{idx}", type="primary"):
+                    if st.button("✍️ خبير الوصف", key=f"expert_{_row_slot}", type="primary"):
                         with st.spinner("🤖 خبير مهووس يكتب الوصف الكامل..."):
-                            fi_cached = st.session_state.get(f"frag_info_{idx}")
+                            fi_cached = st.session_state.get(f"frag_info_{_row_slot}")
                             if not fi_cached:
                                 fi_cached = fetch_fragrantica_info(name)
-                                st.session_state[f"frag_info_{idx}"] = fi_cached
+                                st.session_state[f"frag_info_{_row_slot}"] = fi_cached
                             desc = generate_mahwous_description(name, suggested_price, fi_cached)
                             # تنظيف أي JSON عارض
                             import re as _re
                             desc = _re.sub(r'```json.*?```','', desc, flags=_re.DOTALL)
-                            st.session_state[f"desc_{idx}"] = desc
+                            st.session_state[f"desc_{_row_slot}"] = desc
                             st.success("✅ الوصف جاهز!")
 
-                    if f"desc_{idx}" in st.session_state:
+                    if f"desc_{_row_slot}" in st.session_state:
                         with st.expander("📄 الوصف الكامل — خبير مهووس", expanded=True):
                             edited_desc = st.text_area(
                                 "راجع وعدّل الوصف قبل الإرسال:",
-                                value=st.session_state[f"desc_{idx}"],
+                                value=st.session_state[f"desc_{_row_slot}"],
                                 height=400,
-                                key=f"desc_edit_{idx}"
+                                key=f"desc_edit_{_row_slot}"
                             )
-                            st.session_state[f"desc_{idx}"] = edited_desc
+                            st.session_state[f"desc_{_row_slot}"] = edited_desc
                             _wc = len(edited_desc.split())
                             _col = "#4caf50" if _wc >= 1000 else "#ff9800"
                             st.markdown(f'<span style="color:{_col};font-size:.8rem">📊 {_wc} كلمة</span>', unsafe_allow_html=True)
 
                 with b6:
-                    _has_desc = f"desc_{idx}" in st.session_state
+                    _has_desc = f"desc_{_row_slot}" in st.session_state
                     _make_lbl = "📤 إرسال Make + وصف" if _has_desc else "📤 إرسال Make"
-                    if st.button(_make_lbl, key=f"mk_m_{idx}", type="primary" if _has_desc else "secondary"):
-                        _desc_send  = st.session_state.get(f"desc_{idx}","")
-                        _fi_send    = st.session_state.get(f"frag_info_{idx}",{})
+                    if st.button(_make_lbl, key=f"mk_m_{_row_slot}", type="primary" if _has_desc else "secondary"):
+                        _desc_send = st.session_state.get(
+                            f"desc_edit_{_row_slot}",
+                            st.session_state.get(f"desc_{_row_slot}", ""),
+                        )
+                        _fi_send    = st.session_state.get(f"frag_info_{_row_slot}",{})
                         _img_url    = _fi_send.get("image_url","") if _fi_send else ""
                         _size_val   = extract_size(name)
                         _size_str   = f"{int(_size_val)}ml" if _size_val else size
+                        try:
+                            _send_price = float(st.session_state.get(miss_price_key, suggested_price))
+                        except (TypeError, ValueError):
+                            _send_price = suggested_price
+                        if _send_price <= 0:
+                            _send_price = suggested_price
                         # إرسال مباشر سواء كان هناك وصف أم لا
                         with st.spinner("📤 يُرسل لـ Make..."):
                             res = send_new_products([{
                                 "أسم المنتج":  name,
-                                "سعر المنتج":  suggested_price,
+                                "سعر المنتج":  _send_price,
                                 "brand":       brand,
                                 "الوصف":       _desc_send,
                                 "image_url":   _img_url,
@@ -2746,16 +2788,16 @@ elif page == "🔍 منتجات مفقودة":
                             st.session_state.hidden_products.add(_mk)
                             save_hidden_product(_mk, name, "sent_to_make")
                             save_processed(_mk, name, comp, "send_missing",
-                                           new_price=suggested_price,
+                                           new_price=_send_price,
                                            notes=f"إضافة جديدة" + (f" + وصف {_wc} كلمة" if _wc > 0 else ""))
-                            for k in [f"desc_{idx}",f"frag_info_{idx}"]:
+                            for k in [f"desc_{_row_slot}", f"frag_info_{_row_slot}", f"desc_edit_{_row_slot}"]:
                                 if k in st.session_state: del st.session_state[k]
                             st.rerun()
                         else:
                             st.error(res["message"])
 
                 with b7:
-                    if st.button("🤖 تكرار؟", key=f"dup_{idx}"):
+                    if st.button("🤖 تكرار؟", key=f"dup_{_row_slot}"):
                         with st.spinner("..."):
                             our_prods = []
                             if st.session_state.analysis_df is not None:
@@ -2769,7 +2811,7 @@ elif page == "🔍 منتجات مفقودة":
                             st.info(_dup_resp if r_dup.get("success") else "فشل")
 
                 with b8:
-                    if st.button("🗑️ تجاهل", key=f"ign_{idx}"):
+                    if st.button("🗑️ تجاهل", key=f"ign_{_row_slot}"):
                         log_decision(name,"missing","ignored","تجاهل",0,price,-price,comp)
                         _ign = f"missing_{name}_{idx}"
                         st.session_state.hidden_products.add(_ign)
@@ -3201,6 +3243,7 @@ elif page == "🤖 الذكاء الصناعي":
                     "source": _res.get("source","Gemini"),
                     "ts": datetime.now().strftime("%H:%M")
                 })
+                st.session_state.chat_history = st.session_state.chat_history[-40:]
                 st.rerun()
             else:
                 st.error(_res["response"])
@@ -3719,6 +3762,11 @@ elif page == "🔄 الأتمتة الذكية":
                         c2.metric("⬇️ خفض سعر", summary["lower"])
                         c3.metric("⬆️ رفع سعر", summary["raise"])
                         c4.metric("✅ إبقاء", summary["keep"])
+                        if summary.get("review", 0) > 0:
+                            st.info(
+                                f"⚠️ **{summary['review']}** قرار أُحيل لمراجعة يدوية "
+                                "(خفض يتجاوز أقصى نزول آمن 25٪ — لن يُرسل تلقائياً إلى Make/سلة)."
+                            )
 
                         if summary["net_impact"] > 0:
                             st.success(f"💰 الأثر المالي المتوقع: +{summary['net_impact']:.0f} ر.س (صافي ربح إضافي)")

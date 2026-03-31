@@ -10,6 +10,7 @@ import csv
 from collections import deque
 import hashlib
 import json
+import logging
 import os
 import queue
 import random
@@ -18,6 +19,7 @@ import threading
 import time as _time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from html import unescape
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -25,6 +27,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from browser_like_http import create_scraper_session
+
+logger = logging.getLogger(__name__)
 
 
 def _is_ld_product_group_node(node: dict) -> bool:
@@ -168,6 +172,9 @@ def read_scraper_bg_state() -> dict[str, Any]:
             out.update(data)
         return out
     except Exception:
+        logger.exception(
+            "read_scraper_bg_state: failed to read/parse %s", SCRAPER_BG_STATE_PATH
+        )
         return dict(default)
 
 
@@ -207,6 +214,28 @@ def _session() -> Any:
     return sess
 
 
+def _close_scraper_session(session: Any) -> None:
+    """يغلق جلسة requests/curl_cffi ويحرر المقابس — ضروري للكشط عالي الحجم."""
+    if session is None:
+        return
+    try:
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+@contextmanager
+def _scraper_session_cm():
+    """سياق جلسة كشط واحدة مع إغلاق مضمون في finally."""
+    sess = _session()
+    try:
+        yield sess
+    finally:
+        _close_scraper_session(sess)
+
+
 def _http_get_armored(session: Any, url: str, timeout: float = 25.0):
     """GET مع تدوير UA (requests فقط) و backoff أسي عند 403/429/5xx. curl_cffi يُترك ببصمة TLS ثابتة."""
     backoff = 5.0
@@ -227,11 +256,23 @@ def _http_get_armored(session: Any, url: str, timeout: float = 25.0):
             return r
         except Exception as e:
             last_exc = e
+            logger.warning(
+                "HTTP GET attempt failed (step=http_get_armored) url=%s attempt=%s/6",
+                url,
+                attempt + 1,
+                exc_info=True,
+            )
             _time.sleep(backoff)
             backoff = min(backoff * 2.0, 60.0)
     with _HTTP_STATUS_LOCK:
         _RECENT_HTTP_STATUS.append(last_status if last_status else 0)
     if last_exc:
+        logger.warning(
+            "HTTP GET exhausted retries url=%s last_status=%s",
+            url,
+            last_status,
+            exc_info=last_exc,
+        )
         return None
     return None
 
@@ -248,6 +289,10 @@ def _parse_sitemap_xml(content: bytes) -> tuple[list[str], bool]:
     try:
         root = ET.fromstring(content)
     except Exception:
+        logger.exception(
+            "sitemap XML parse failed (ElementTree) content_len=%s",
+            len(content) if content else 0,
+        )
         return [], False
     root_tag = _strip_ns(root.tag).lower()
     if root_tag == "sitemapindex":
@@ -277,7 +322,11 @@ def _expand_sitemap_to_page_urls(session: Any, start_url: str, progress_cb=None)
             try:
                 progress_cb(len(seen_sm), len(queue), len(page_urls))
             except Exception:
-                pass
+                logger.exception(
+                    "sitemap progress_cb failed sm_url=%s seen_sm=%s",
+                    sm_url,
+                    len(seen_sm),
+                )
         _jitter_sleep()
         r = _http_get_armored(session, sm_url, timeout=30.0)
         if r is None or r.status_code != 200 or not r.content:
@@ -303,6 +352,7 @@ def _product_url_heuristic(url: str) -> bool:
     try:
         path = urlparse(url).path
     except Exception:
+        logger.exception("urlparse failed for product URL heuristic url=%r", url)
         path = ""
     pl = path.rstrip("/")
     # سلة / زد الشائع: المسار ينتهي بـ /p وأرقام معرّف المنتج
@@ -374,7 +424,7 @@ def _iter_ld_product_dicts(node: Any, out: list[dict[str, Any]]) -> None:
             _iter_ld_product_dicts(x, out)
 
 
-def _extract_from_json_ld(html: str) -> dict[str, Any]:
+def _extract_from_json_ld(html: str, page_url: str | None = None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     fallback_img: str | None = None
     for m in re.finditer(
@@ -386,6 +436,12 @@ def _extract_from_json_ld(html: str) -> dict[str, Any]:
         try:
             data = json.loads(raw)
         except Exception:
+            logger.warning(
+                "JSON-LD script parse failed (step=json_ld_loads skip block) page_url=%s raw_len=%s",
+                page_url or "",
+                len(raw),
+                exc_info=True,
+            )
             continue
         products: list[dict[str, Any]] = []
         _iter_ld_product_dicts(data, products)
@@ -407,7 +463,12 @@ def _extract_from_json_ld(html: str) -> dict[str, Any]:
                             float(str(p).replace(",", "").replace("\u00a0", "")),
                         )
                     except Exception:
-                        pass
+                        logger.warning(
+                            "JSON-LD offer price parse failed (step=json_ld_offer_dict) page_url=%s p=%r",
+                            page_url or "",
+                            p,
+                            exc_info=True,
+                        )
             elif isinstance(offers, list) and offers:
                 o0 = offers[0]
                 if isinstance(o0, dict):
@@ -419,13 +480,18 @@ def _extract_from_json_ld(html: str) -> dict[str, Any]:
                                 float(str(p).replace(",", "").replace("\u00a0", "")),
                             )
                         except Exception:
-                            pass
+                            logger.warning(
+                                "JSON-LD list offer price parse failed (step=json_ld_offer_list) page_url=%s p=%r",
+                                page_url or "",
+                                p,
+                                exc_info=True,
+                            )
     if not out.get("image") and fallback_img:
         out["image"] = fallback_img
     return out
 
 
-def _extract_meta_fallback(html: str) -> dict[str, Any]:
+def _extract_meta_fallback(html: str, page_url: str | None = None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     m = re.search(
         r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
@@ -465,7 +531,12 @@ def _extract_meta_fallback(html: str) -> dict[str, Any]:
                 out["price"] = float(m.group(1))
                 break
             except Exception:
-                pass
+                logger.warning(
+                    "meta fallback regex price parse failed (step=meta_price_regex) page_url=%s m=%r",
+                    page_url or "",
+                    m.group(0)[:80] if m else None,
+                    exc_info=True,
+                )
     return out
 
 
@@ -483,6 +554,11 @@ def _absolutize_image_url(page_url: str, img: str | None) -> str | None:
     try:
         return urljoin(page_url, u)
     except Exception:
+        logger.exception(
+            "absolutize image urljoin failed page_url=%r img=%r",
+            page_url,
+            (u[:120] + "…") if len(u) > 120 else u,
+        )
         return u
 
 
@@ -492,8 +568,8 @@ def _scrape_url(session: Any, page_url: str) -> dict[str, Any] | None:
     if r is None or r.status_code != 200 or not r.text:
         return None
     html = r.text
-    data = _extract_from_json_ld(html)
-    fb = _extract_meta_fallback(html)
+    data = _extract_from_json_ld(html, page_url=page_url)
+    fb = _extract_meta_fallback(html, page_url=page_url)
     if not data.get("name"):
         data.update({k: v for k, v in fb.items() if v is not None})
     if not data.get("name"):
@@ -518,6 +594,7 @@ def _load_sitemap_seeds() -> list[str]:
         with open(LIST_PATH, encoding="utf-8") as f:
             raw = json.load(f)
     except Exception:
+        logger.exception("load sitemap seeds failed path=%s", LIST_PATH)
         return []
     seeds: list[str] = []
     if isinstance(raw, list):
@@ -542,7 +619,7 @@ def _clear_checkpoint_files() -> None:
             if os.path.isfile(p):
                 os.remove(p)
         except Exception:
-            pass
+            logger.exception("clear checkpoint file failed path=%s", p)
 
 
 def _load_checkpoint(seeds_fp: str) -> tuple[set[str], list[dict[str, Any]]]:
@@ -552,6 +629,7 @@ def _load_checkpoint(seeds_fp: str) -> tuple[set[str], list[dict[str, Any]]]:
         with open(CHECKPOINT_JSON, encoding="utf-8") as f:
             d = json.load(f)
     except Exception:
+        logger.exception("load checkpoint failed path=%s", CHECKPOINT_JSON)
         return set(), []
     if d.get("seeds_fp") != seeds_fp:
         return set(), []
@@ -596,7 +674,11 @@ def _save_checkpoint(seeds_fp: str, processed: set[str], rows: list[dict[str, An
                 w.writeheader()
                 w.writerows(rows)
     except Exception:
-        pass
+        logger.exception(
+            "save checkpoint failed seeds_fp=%s rows=%s",
+            seeds_fp,
+            len(rows),
+        )
 
 
 def _pipeline_analysis_worker(
@@ -627,7 +709,11 @@ def _pipeline_analysis_worker(
             try:
                 on_pipeline_before_analysis(rows_snap, bool(is_final))
             except Exception:
-                pass
+                logger.exception(
+                    "on_pipeline_before_analysis failed rows=%s is_final=%s",
+                    len(rows_snap),
+                    is_final,
+                )
         use_ai = True if is_final else use_ai_partial
         try:
             from utils.db_manager import merged_comp_dfs_for_analysis
@@ -647,8 +733,17 @@ def _pipeline_analysis_worker(
                 try:
                     on_analysis_snapshot(rows_snap, df, bool(is_final))
                 except Exception:
-                    pass
+                    logger.exception(
+                        "on_analysis_snapshot failed rows=%s analyzed=%s",
+                        len(rows_snap),
+                        len(df) if df is not None else 0,
+                    )
         except Exception as e:
+            logger.exception(
+                "pipeline run_full_analysis failed comp_key=%s rows_snap=%s",
+                comp_key,
+                len(rows_snap),
+            )
             out["error"] = str(e)
 
 
@@ -666,11 +761,16 @@ def _pipeline_maybe_enqueue(
 
 
 def _fetch_url_row(u: str) -> tuple[str, dict[str, Any] | None]:
+    """خيط منفصل لكل URL — جلسة مؤقتة تُغلق حتماً بعد الطلب."""
     _jitter_sleep()
+    sess = _session()
     try:
-        return u, _scrape_url(_session(), u)
+        return u, _scrape_url(sess, u)
     except Exception:
+        logger.exception("_fetch_url_row scrape failed url=%s", u)
         return u, None
+    finally:
+        _close_scraper_session(sess)
 
 
 def _recent_block_ratio() -> float:
@@ -719,231 +819,240 @@ def run_scraper_sync(
         "skip_zero_price": 0,
     }
 
-    session = _session()
-    all_page_urls: list[str] = []
-    seen_u: set[str] = set()
-    for si, seed in enumerate(seeds):
-        if progress_cb:
-            try:
-                progress_cb(
-                    si + 1,
-                    max(1, len(seeds)),
-                    f"🔍 فهرسة sitemap للمتجر {si + 1}/{len(seeds)}...",
-                )
-            except Exception:
-                pass
-        expanded = _expand_sitemap_to_page_urls(
-            session,
-            seed,
-            progress_cb=lambda seen_sm, queued, found: (
-                progress_cb(
-                    si + 1,
-                    max(1, len(seeds)),
-                    f"🔍 sitemap {si + 1}/{len(seeds)} | خرائط:{seen_sm} | queued:{queued} | روابط:{found}",
-                )
-                if progress_cb
-                else None
-            ),
-        )
-        products = [x for x in expanded if _product_url_heuristic(x)]
-        stats["sitemap_total"] += len(expanded)
-        stats["heuristic_accepted"] += len(products)
-        stats["heuristic_rejected"] += max(0, len(expanded) - len(products))
-        accept_ratio = (len(products) / len(expanded)) if expanded else 1.0
-        prod_set = set(products)
-        rest = [x for x in expanded if x not in prod_set]
-        include_all_urls = False
-        if _HEURISTIC_MODE == "off":
-            merged = expanded
-            include_all_urls = True
-        elif _HEURISTIC_MODE == "loose" and accept_ratio < 0.50:
-            merged = expanded
-            include_all_urls = True
-        else:
-            merged = products + rest
-        for u in merged:
-            if u in seen_u:
-                continue
-            seen_u.add(u)
-            if include_all_urls or _product_url_heuristic(u):
-                all_page_urls.append(u)
-            elif not products and len(all_page_urls) < 80:
-                # لا توجد روابط تبدو كمنتجات — سلوك قديم: املأ حتى 80 رابطاً
-                all_page_urls.append(u)
+    with _scraper_session_cm() as session:
+        all_page_urls: list[str] = []
+        seen_u: set[str] = set()
+        for si, seed in enumerate(seeds):
+            if progress_cb:
+                try:
+                    progress_cb(
+                        si + 1,
+                        max(1, len(seeds)),
+                        f"🔍 فهرسة sitemap للمتجر {si + 1}/{len(seeds)}...",
+                    )
+                except Exception:
+                    logger.exception(
+                        "progress_cb failed during seed expand si=%s seed=%s",
+                        si,
+                        seed[:200] if seed else "",
+                    )
+            expanded = _expand_sitemap_to_page_urls(
+                session,
+                seed,
+                progress_cb=lambda seen_sm, queued, found: (
+                    progress_cb(
+                        si + 1,
+                        max(1, len(seeds)),
+                        f"🔍 sitemap {si + 1}/{len(seeds)} | خرائط:{seen_sm} | queued:{queued} | روابط:{found}",
+                    )
+                    if progress_cb
+                    else None
+                ),
+            )
+            products = [x for x in expanded if _product_url_heuristic(x)]
+            stats["sitemap_total"] += len(expanded)
+            stats["heuristic_accepted"] += len(products)
+            stats["heuristic_rejected"] += max(0, len(expanded) - len(products))
+            accept_ratio = (len(products) / len(expanded)) if expanded else 1.0
+            prod_set = set(products)
+            rest = [x for x in expanded if x not in prod_set]
+            include_all_urls = False
+            if _HEURISTIC_MODE == "off":
+                merged = expanded
+                include_all_urls = True
+            elif _HEURISTIC_MODE == "loose" and accept_ratio < 0.50:
+                merged = expanded
+                include_all_urls = True
+            else:
+                merged = products + rest
+            for u in merged:
+                if u in seen_u:
+                    continue
+                seen_u.add(u)
+                if include_all_urls or _product_url_heuristic(u):
+                    all_page_urls.append(u)
+                elif not products and len(all_page_urls) < 80:
+                    # لا توجد روابط تبدو كمنتجات — سلوك قديم: املأ حتى 80 رابطاً
+                    all_page_urls.append(u)
+                if _max_sitemap_urls_reached(len(all_page_urls)):
+                    break
             if _max_sitemap_urls_reached(len(all_page_urls)):
                 break
-        if _max_sitemap_urls_reached(len(all_page_urls)):
-            break
 
-    total_urls = len(all_page_urls)
-    last_name = "جاري البحث..."
+        total_urls = len(all_page_urls)
+        last_name = "جاري البحث..."
 
-    pipeline_q: queue.Queue | None = None
-    pipeline_thread: threading.Thread | None = None
-    pipe_every = max(0, _PIPELINE_EVERY)
-    use_ai_partial = _PIPELINE_AI_PARTIAL
-    if pipeline and pipeline.get("our_df") is not None:
-        pipe_every = max(0, int(pipeline.get("every") or pipe_every))
-        use_ai_partial = bool(pipeline.get("use_ai_partial", use_ai_partial))
-        pipeline_q = queue.Queue()
-        out = pipeline.setdefault("out", {})
-        comp_key = str(pipeline.get("comp_key") or "Scraped_Competitor")
-        our_df_pl = pipeline["our_df"]
-        on_snap = pipeline.get("on_analysis_snapshot")
-        on_before = pipeline.get("on_pipeline_before_analysis")
-        pipeline_thread = threading.Thread(
-            target=_pipeline_analysis_worker,
-            args=(pipeline_q, out, our_df_pl, comp_key, use_ai_partial, on_snap, on_before),
-            daemon=True,
-        )
-        pipeline_thread.start()
+        pipeline_q: queue.Queue | None = None
+        pipeline_thread: threading.Thread | None = None
+        pipe_every = max(0, _PIPELINE_EVERY)
+        use_ai_partial = _PIPELINE_AI_PARTIAL
+        if pipeline and pipeline.get("our_df") is not None:
+            pipe_every = max(0, int(pipeline.get("every") or pipe_every))
+            use_ai_partial = bool(pipeline.get("use_ai_partial", use_ai_partial))
+            pipeline_q = queue.Queue()
+            out = pipeline.setdefault("out", {})
+            comp_key = str(pipeline.get("comp_key") or "Scraped_Competitor")
+            our_df_pl = pipeline["our_df"]
+            on_snap = pipeline.get("on_analysis_snapshot")
+            on_before = pipeline.get("on_pipeline_before_analysis")
+            pipeline_thread = threading.Thread(
+                target=_pipeline_analysis_worker,
+                args=(pipeline_q, out, our_df_pl, comp_key, use_ai_partial, on_snap, on_before),
+                daemon=True,
+            )
+            pipeline_thread.start()
 
-    inc_cb = pipeline.get("on_incremental_flush") if pipeline else None
-    inc_ev = 0
-    if pipeline and pipeline.get("incremental_every") is not None:
-        inc_ev = max(0, int(pipeline["incremental_every"]))
-    env_inc = os.environ.get("SCRAPER_INCREMENTAL_EVERY", "").strip()
-    if env_inc.isdigit():
-        inc_ev = max(1, int(env_inc))
-    elif inc_ev == 0 and (inc_cb or (pipeline and pipeline.get("our_df") is not None)):
-        inc_ev = pipe_every if pipe_every > 0 else _CHECKPOINT_EVERY
+        inc_cb = pipeline.get("on_incremental_flush") if pipeline else None
+        inc_ev = 0
+        if pipeline and pipeline.get("incremental_every") is not None:
+            inc_ev = max(0, int(pipeline["incremental_every"]))
+        env_inc = os.environ.get("SCRAPER_INCREMENTAL_EVERY", "").strip()
+        if env_inc.isdigit():
+            inc_ev = max(1, int(env_inc))
+        elif inc_ev == 0 and (inc_cb or (pipeline and pipeline.get("our_df") is not None)):
+            inc_ev = pipe_every if pipe_every > 0 else _CHECKPOINT_EVERY
 
-    _scrape_tick = [0, 0.0]
+        _scrape_tick = [0, 0.0]
 
-    def _consume_row(u: str, row: dict[str, Any] | None, i_pos: int):
-        nonlocal last_name
-        if row:
-            name = str(row.get("name", "")).strip()
-            if name:
-                last_name = name
-            stats["extract_ok"] += 1
-            if name:
-                if name in seen_names:
-                    stats["dup_name"] += 1
+        def _consume_row(u: str, row: dict[str, Any] | None, i_pos: int):
+            nonlocal last_name
+            if row:
+                name = str(row.get("name", "")).strip()
+                if name:
+                    last_name = name
+                stats["extract_ok"] += 1
+                if name:
+                    if name in seen_names:
+                        stats["dup_name"] += 1
+                    else:
+                        seen_names.add(name)
+                    price = row.get("price")
+                    if price is None:
+                        price = 0.0
+                    try:
+                        price_f = float(price)
+                    except (TypeError, ValueError):
+                        price_f = 0.0
+                    if _looks_non_product_name(name):
+                        stats["skip_non_product"] += 1
+                        return None
+                    if price_f <= 0:
+                        stats["skip_zero_price"] += 1
+                        return None
+                    img = str(row.get("image", "") or "")
+                    rows.append(
+                        {
+                            "اسم المنتج": name,
+                            "السعر": price_f,
+                            "رقم المنتج": "",
+                            "رابط_الصورة": img,
+                        }
+                    )
                 else:
-                    seen_names.add(name)
-                price = row.get("price")
-                if price is None:
-                    price = 0.0
-                try:
-                    price_f = float(price)
-                except (TypeError, ValueError):
-                    price_f = 0.0
-                if _looks_non_product_name(name):
-                    stats["skip_non_product"] += 1
-                    return None
-                if price_f <= 0:
-                    stats["skip_zero_price"] += 1
-                    return None
-                img = str(row.get("image", "") or "")
-                rows.append(
-                    {
-                        "اسم المنتج": name,
-                        "السعر": price_f,
-                        "رقم المنتج": "",
-                        "رابط_الصورة": img,
-                    }
-                )
+                    stats["extract_fail"] += 1
             else:
                 stats["extract_fail"] += 1
-        else:
-            stats["extract_fail"] += 1
-        _pipeline_maybe_enqueue(pipeline_q, rows, pipe_every)
-        on_tick = pipeline.get("on_scrape_rows_tick") if pipeline else None
-        if on_tick and rows:
-            now = _time.time()
-            n = len(rows)
-            if n == 1 or n - _scrape_tick[0] >= 4 or now - _scrape_tick[1] >= 1.4:
-                _scrape_tick[0] = n
-                _scrape_tick[1] = now
-                try:
-                    on_tick(n)
-                except Exception:
-                    pass
-        if inc_ev > 0 and len(rows) % inc_ev == 0 and rows:
-            write_competitors_csv(rows)
-            if inc_cb:
-                try:
-                    inc_cb(copy.deepcopy(rows))
-                except Exception:
-                    pass
-        if progress_cb:
-            progress_cb(
-                i_pos + 1,
-                total_urls,
-                last_name[:80] if last_name else "جاري البحث...",
-            )
-        if len(rows) % _CHECKPOINT_EVERY == 0 and rows:
-            _save_checkpoint(seeds_fp, processed_urls, rows)
-        if _max_product_rows_reached(len(rows)):
-            return "stop_products"
-        return None
-
-    pending = [u for u in all_page_urls if u not in processed_urls]
-    urls_processed_this_run = [0]
-
-    if _FETCH_WORKERS > 1 and pending:
-        dyn_workers = max(1, min(_FETCH_WORKERS, _MAX_ADAPTIVE_WORKERS))
-        high_success_since: float | None = None
-        p = 0
-        stop_early = False
-        while p < len(pending):
-            chunk = pending[p : p + max(dyn_workers * 4, dyn_workers)]
-            p += len(chunk)
-            with ThreadPoolExecutor(max_workers=dyn_workers) as ex:
-                fut_map = {ex.submit(_fetch_url_row, u): u for u in chunk}
-                for fut in as_completed(fut_map):
+            _pipeline_maybe_enqueue(pipeline_q, rows, pipe_every)
+            on_tick = pipeline.get("on_scrape_rows_tick") if pipeline else None
+            if on_tick and rows:
+                now = _time.time()
+                n = len(rows)
+                if n == 1 or n - _scrape_tick[0] >= 4 or now - _scrape_tick[1] >= 1.4:
+                    _scrape_tick[0] = n
+                    _scrape_tick[1] = now
                     try:
-                        u, row = fut.result()
+                        on_tick(n)
                     except Exception:
-                        u = fut_map[fut]
-                        row = None
-                    if u in processed_urls:
-                        continue
-                    if _max_fetch_urls_reached(urls_processed_this_run[0]):
-                        stop_early = True
-                        break
-                    processed_urls.add(u)
-                    urls_processed_this_run[0] += 1
-                    i_pos = max(0, urls_processed_this_run[0] - 1)
-                    if _consume_row(u, row, i_pos) == "stop_products":
-                        stop_early = True
-                        break
-            if stop_early:
-                break
-            br = _recent_block_ratio()
-            now = _time.time()
-            with _HTTP_STATUS_LOCK:
-                xs = list(_RECENT_HTTP_STATUS)
-            ok_ratio = 0.0
-            if xs:
-                ok_ratio = sum(1 for s in xs if s == 200) / float(len(xs))
-            if len(xs) >= 10 and br > 0.20:
-                if dyn_workers > 1:
-                    dyn_workers -= 1
-                high_success_since = None
-            else:
-                if len(xs) >= 10 and ok_ratio >= 0.95:
-                    if high_success_since is None:
-                        high_success_since = now
-                    elif now - high_success_since >= 60.0 and dyn_workers < _MAX_ADAPTIVE_WORKERS:
-                        dyn_workers += 1
-                        high_success_since = now
-                else:
+                        logger.exception("on_scrape_rows_tick failed n_rows=%s", n)
+            if inc_ev > 0 and len(rows) % inc_ev == 0 and rows:
+                write_competitors_csv(rows)
+                if inc_cb:
+                    try:
+                        inc_cb(copy.deepcopy(rows))
+                    except Exception:
+                        logger.exception(
+                            "on_incremental_flush failed rows=%s", len(rows)
+                        )
+            if progress_cb:
+                progress_cb(
+                    i_pos + 1,
+                    total_urls,
+                    last_name[:80] if last_name else "جاري البحث...",
+                )
+            if len(rows) % _CHECKPOINT_EVERY == 0 and rows:
+                _save_checkpoint(seeds_fp, processed_urls, rows)
+            if _max_product_rows_reached(len(rows)):
+                return "stop_products"
+            return None
+
+        pending = [u for u in all_page_urls if u not in processed_urls]
+        urls_processed_this_run = [0]
+
+        if _FETCH_WORKERS > 1 and pending:
+            dyn_workers = max(1, min(_FETCH_WORKERS, _MAX_ADAPTIVE_WORKERS))
+            high_success_since: float | None = None
+            p = 0
+            stop_early = False
+            while p < len(pending):
+                chunk = pending[p : p + max(dyn_workers * 4, dyn_workers)]
+                p += len(chunk)
+                with ThreadPoolExecutor(max_workers=dyn_workers) as ex:
+                    fut_map = {ex.submit(_fetch_url_row, u): u for u in chunk}
+                    for fut in as_completed(fut_map):
+                        try:
+                            u, row = fut.result()
+                        except Exception:
+                            u = fut_map[fut]
+                            row = None
+                            logger.exception(
+                                "ThreadPoolExecutor future failed url=%s", u
+                            )
+                        if u in processed_urls:
+                            continue
+                        if _max_fetch_urls_reached(urls_processed_this_run[0]):
+                            stop_early = True
+                            break
+                        processed_urls.add(u)
+                        urls_processed_this_run[0] += 1
+                        i_pos = max(0, urls_processed_this_run[0] - 1)
+                        if _consume_row(u, row, i_pos) == "stop_products":
+                            stop_early = True
+                            break
+                if stop_early:
+                    break
+                br = _recent_block_ratio()
+                now = _time.time()
+                with _HTTP_STATUS_LOCK:
+                    xs = list(_RECENT_HTTP_STATUS)
+                ok_ratio = 0.0
+                if xs:
+                    ok_ratio = sum(1 for s in xs if s == 200) / float(len(xs))
+                if len(xs) >= 10 and br > 0.20:
+                    if dyn_workers > 1:
+                        dyn_workers -= 1
                     high_success_since = None
-    else:
-        for i, u in enumerate(all_page_urls):
-            if u in processed_urls:
-                if progress_cb:
-                    progress_cb(i + 1, total_urls, last_name)
-                continue
-            if _max_fetch_urls_reached(urls_processed_this_run[0]):
-                break
-            row = _scrape_url(session, u)
-            processed_urls.add(u)
-            urls_processed_this_run[0] += 1
-            if _consume_row(u, row, i) == "stop_products":
-                break
+                else:
+                    if len(xs) >= 10 and ok_ratio >= 0.95:
+                        if high_success_since is None:
+                            high_success_since = now
+                        elif now - high_success_since >= 60.0 and dyn_workers < _MAX_ADAPTIVE_WORKERS:
+                            dyn_workers += 1
+                            high_success_since = now
+                    else:
+                        high_success_since = None
+        else:
+            for i, u in enumerate(all_page_urls):
+                if u in processed_urls:
+                    if progress_cb:
+                        progress_cb(i + 1, total_urls, last_name)
+                    continue
+                if _max_fetch_urls_reached(urls_processed_this_run[0]):
+                    break
+                row = _scrape_url(session, u)
+                processed_urls.add(u)
+                urls_processed_this_run[0] += 1
+                if _consume_row(u, row, i) == "stop_products":
+                    break
 
     if pipeline_q is not None and pipeline_thread is not None:
         if rows:
