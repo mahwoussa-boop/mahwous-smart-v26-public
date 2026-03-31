@@ -931,7 +931,7 @@ def _run_scrape_chain_background():
         return
 
     total_stores = len(scrape_queue)
-    pipeline_inline_effective = bool(pipeline_inline) and total_stores <= 1
+    pipeline_inline_effective = bool(pipeline_inline)
 
     _merge_scrape_live_snapshot(
         analysis_reset=True,
@@ -2026,8 +2026,8 @@ elif page == "📂 رفع الملفات":
         ),
     )
     st.caption(
-        "**عدة متاجر:** يُكشط كل متجر **بالتسلسل** ويُسجَّل في الكتالوج تحت مفتاحه، ثم يعمل **تحليل واحد** "
-        "يشمل جميع المنافسين. عند **أكثر من متجر** يُعطَّل التحليل المترافق أثناء الجلب (لأسباب دقة وزمن)."
+        "**عدة متاجر:** يُكشط كل متجر **بالتسلسل** ويُسجَّل في الكتالوج تحت مفتاحه، مع **Preview مترافق لكل متجر** "
+        "أثناء الجلب، ثم يعمل **تحليل نهائي موحّد** يشمل جميع المنافسين في النهاية."
     )
     for i in range(len(st.session_state.scraper_urls)):
         st.caption(f"متجر {i+1}")

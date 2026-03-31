@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import csv
+from collections import deque
 import hashlib
 import json
 import os
@@ -91,7 +92,9 @@ _MAX_SITEMAP_INDEX_ENTRIES = _env_int("SCRAPER_SITEMAP_INDEX_CAP", 200000)
 _MAX_SITEMAP_BYTES = _env_int("SCRAPER_MAX_SITEMAP_BYTES", 32 * 1024 * 1024)
 _CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
-_FETCH_WORKERS = max(1, min(16, int(os.environ.get("SCRAPER_FETCH_WORKERS", "1"))))
+_FETCH_WORKERS = max(1, min(16, int(os.environ.get("SCRAPER_FETCH_WORKERS", "3"))))
+_MAX_ADAPTIVE_WORKERS = max(1, min(5, int(os.environ.get("SCRAPER_MAX_ADAPTIVE_WORKERS", "5"))))
+_HEURISTIC_MODE = (os.environ.get("SCRAPER_HEURISTIC_MODE", "loose") or "loose").strip().lower()
 _PIPELINE_EVERY = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100"))
 _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip().lower() in (
     "1",
@@ -100,6 +103,8 @@ _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip()
 )
 
 _PIPELINE_STOP = object()
+_HTTP_STATUS_LOCK = threading.Lock()
+_RECENT_HTTP_STATUS = deque(maxlen=10)
 
 
 def _max_sitemap_urls_reached(n: int) -> bool:
@@ -192,20 +197,26 @@ def _http_get_armored(session: Any, url: str, timeout: float = 25.0):
     """GET مع تدوير UA (requests فقط) و backoff أسي عند 403/429/5xx. curl_cffi يُترك ببصمة TLS ثابتة."""
     backoff = 5.0
     last_exc: Exception | None = None
+    last_status = 0
     for attempt in range(6):
         if isinstance(session, requests.Session):
             session.headers["User-Agent"] = _random_ua()
         try:
             r = session.get(url, timeout=timeout, allow_redirects=True)
+            last_status = int(r.status_code or 0)
             if r.status_code in (429, 403, 503, 502, 500, 504):
                 _time.sleep(backoff)
                 backoff = min(backoff * 2.0, 60.0)
                 continue
+            with _HTTP_STATUS_LOCK:
+                _RECENT_HTTP_STATUS.append(last_status)
             return r
         except Exception as e:
             last_exc = e
             _time.sleep(backoff)
             backoff = min(backoff * 2.0, 60.0)
+    with _HTTP_STATUS_LOCK:
+        _RECENT_HTTP_STATUS.append(last_status if last_status else 0)
     if last_exc:
         return None
     return None
@@ -631,6 +642,15 @@ def _fetch_url_row(u: str) -> tuple[str, dict[str, Any] | None]:
         return u, None
 
 
+def _recent_block_ratio() -> float:
+    with _HTTP_STATUS_LOCK:
+        xs = list(_RECENT_HTTP_STATUS)
+    if not xs:
+        return 0.0
+    blocked = sum(1 for s in xs if s in (403, 429))
+    return float(blocked) / float(len(xs))
+
+
 def run_scraper_sync(
     progress_cb=None,
     pipeline: dict[str, Any] | None = None,
@@ -657,6 +677,14 @@ def run_scraper_sync(
 
     processed_urls, rows = _load_checkpoint(seeds_fp)
     seen_names: set[str] = {str(r.get("اسم المنتج", "")).strip() for r in rows if r.get("اسم المنتج")}
+    stats = {
+        "sitemap_total": 0,
+        "heuristic_accepted": 0,
+        "heuristic_rejected": 0,
+        "extract_ok": 0,
+        "extract_fail": 0,
+        "dup_name": 0,
+    }
 
     session = _session()
     all_page_urls: list[str] = []
@@ -664,9 +692,18 @@ def run_scraper_sync(
     for seed in seeds:
         expanded = _expand_sitemap_to_page_urls(session, seed)
         products = [x for x in expanded if _product_url_heuristic(x)]
+        stats["sitemap_total"] += len(expanded)
+        stats["heuristic_accepted"] += len(products)
+        stats["heuristic_rejected"] += max(0, len(expanded) - len(products))
+        accept_ratio = (len(products) / len(expanded)) if expanded else 1.0
         prod_set = set(products)
         rest = [x for x in expanded if x not in prod_set]
-        merged = products + rest
+        if _HEURISTIC_MODE == "off":
+            merged = expanded
+        elif _HEURISTIC_MODE == "loose" and accept_ratio < 0.50:
+            merged = expanded
+        else:
+            merged = products + rest
         for u in merged:
             if u in seen_u:
                 continue
@@ -722,8 +759,12 @@ def run_scraper_sync(
             name = str(row.get("name", "")).strip()
             if name:
                 last_name = name
-            if name and name not in seen_names:
-                seen_names.add(name)
+            stats["extract_ok"] += 1
+            if name:
+                if name in seen_names:
+                    stats["dup_name"] += 1
+                else:
+                    seen_names.add(name)
                 price = row.get("price")
                 if price is None:
                     price = 0.0
@@ -736,6 +777,10 @@ def run_scraper_sync(
                         "رابط_الصورة": img,
                     }
                 )
+            else:
+                stats["extract_fail"] += 1
+        else:
+            stats["extract_fail"] += 1
         _pipeline_maybe_enqueue(pipeline_q, rows, pipe_every)
         on_tick = pipeline.get("on_scrape_rows_tick") if pipeline else None
         if on_tick and rows:
@@ -772,15 +817,41 @@ def run_scraper_sync(
     urls_processed_this_run = [0]
 
     if _FETCH_WORKERS > 1 and pending:
-        with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
-            fut_map = {ex.submit(_fetch_url_row, u): u for u in pending}
-            for fut in as_completed(fut_map):
-                try:
-                    u, row = fut.result()
-                except Exception:
-                    u = fut_map[fut]
-                    row = None
-                pref[u] = row
+        dyn_workers = max(1, min(_FETCH_WORKERS, _MAX_ADAPTIVE_WORKERS))
+        high_success_since: float | None = None
+        p = 0
+        while p < len(pending):
+            chunk = pending[p : p + max(dyn_workers * 4, dyn_workers)]
+            p += len(chunk)
+            with ThreadPoolExecutor(max_workers=dyn_workers) as ex:
+                fut_map = {ex.submit(_fetch_url_row, u): u for u in chunk}
+                for fut in as_completed(fut_map):
+                    try:
+                        u, row = fut.result()
+                    except Exception:
+                        u = fut_map[fut]
+                        row = None
+                    pref[u] = row
+            br = _recent_block_ratio()
+            now = _time.time()
+            with _HTTP_STATUS_LOCK:
+                xs = list(_RECENT_HTTP_STATUS)
+            ok_ratio = 0.0
+            if xs:
+                ok_ratio = sum(1 for s in xs if s == 200) / float(len(xs))
+            if len(xs) >= 10 and br > 0.20:
+                if dyn_workers > 1:
+                    dyn_workers -= 1
+                high_success_since = None
+            else:
+                if len(xs) >= 10 and ok_ratio >= 0.95:
+                    if high_success_since is None:
+                        high_success_since = now
+                    elif now - high_success_since >= 60.0 and dyn_workers < _MAX_ADAPTIVE_WORKERS:
+                        dyn_workers += 1
+                        high_success_since = now
+                else:
+                    high_success_since = None
         for i, u in enumerate(all_page_urls):
             if u in processed_urls:
                 if progress_cb:
@@ -814,9 +885,21 @@ def run_scraper_sync(
         pipeline_thread.join(timeout=7200)
 
     if not rows:
+        print(
+            f"[SCRAPER] sitemap_total={stats['sitemap_total']} accepted={stats['heuristic_accepted']} "
+            f"rejected={stats['heuristic_rejected']} extract_ok={stats['extract_ok']} "
+            f"extract_fail={stats['extract_fail']} dup_name={stats['dup_name']}",
+            flush=True,
+        )
         return 0
 
     write_competitors_csv(rows)
+    print(
+        f"[SCRAPER] sitemap_total={stats['sitemap_total']} accepted={stats['heuristic_accepted']} "
+        f"rejected={stats['heuristic_rejected']} extract_ok={stats['extract_ok']} "
+        f"extract_fail={stats['extract_fail']} dup_name={stats['dup_name']}",
+        flush=True,
+    )
 
     # اكتمال ناجح → حذف نقاط الحفظ ليبدأ الجلسة القادمة من جديد
     _clear_checkpoint_files()
