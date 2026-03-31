@@ -15,6 +15,7 @@ app.py - نظام التسعير الذكي مهووس v26.0
 """
 import copy
 from html import escape as _html_escape
+from textwrap import dedent as _dedent
 import json
 import os
 import pickle
@@ -64,7 +65,8 @@ from engines.automation import (AutomationEngine, ScheduledSearchManager,
                                  get_automation_stats)
 from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             export_multiple_sheets, parse_pasted_text,
-                            safe_float, format_price, format_diff)
+                            safe_float, format_price, format_diff,
+                            export_missing_products_to_salla_csv_bytes)
 from utils.make_helper import (send_price_updates, send_new_products,
                                 send_missing_products, send_single_product,
                                 verify_webhook_connection, export_to_make_format,
@@ -155,6 +157,125 @@ def _hydrate_live_session_results_early():
 
 
 _hydrate_live_session_results_early()
+
+
+# ── مؤشرات API (ألوان + أيقونات) — يُحدَّث بالكامل بعد «تشخيص شامل» في الإعدادات ──
+_API_STATUS_HINT = {
+    "ok": ("#00C853", "يعمل"),
+    "warn": ("#FF9800", "حد/بطء (429)"),
+    "bill": ("#E65100", "رصيد/فاتورة منتهية (402)"),
+    "bad": ("#FF1744", "رفض/خطأ"),
+    "absent": ("#78909C", "غير مضاف"),
+    "unknown": ("#5C6BC0", "لم يُختبر بعد"),
+}
+
+
+def _classify_provider_line(status: str) -> str:
+    s = status or ""
+    if "غير موجود" in s and "مفتاح" in s:
+        return "absent"
+    if "402" in s or "منته" in s or ("رصيد" in s and "❌" in s):
+        return "bill"
+    if "✅" in s:
+        return "ok"
+    if "⚠️" in s or "429" in s:
+        return "warn"
+    if "❌" in s:
+        return "bad"
+    return "unknown"
+
+
+def _infer_api_diag_summary(diag: dict) -> dict:
+    """تلخيص نتيجة diagnose_ai_providers → حالة لكل مزود."""
+    out: dict = {}
+    if not get_gemini_api_keys():
+        out["gemini"] = "absent"
+    else:
+        gs = diag.get("gemini") or []
+        if not gs:
+            out["gemini"] = "unknown"
+        else:
+            parts = [_classify_provider_line(g.get("status", "")) for g in gs]
+            if "bill" in parts:
+                out["gemini"] = "bill"
+            elif all(p == "ok" for p in parts):
+                out["gemini"] = "ok"
+            elif "ok" in parts and "bad" not in parts and "warn" not in parts:
+                out["gemini"] = "ok"
+            elif "ok" in parts and ("bad" in parts or "warn" in parts):
+                out["gemini"] = "warn"
+            elif "warn" in parts:
+                out["gemini"] = "warn"
+            elif "bad" in parts:
+                out["gemini"] = "bad"
+            else:
+                out["gemini"] = "unknown"
+    if not OPENROUTER_API_KEY:
+        out["openrouter"] = "absent"
+    else:
+        out["openrouter"] = _classify_provider_line(diag.get("openrouter", ""))
+    if not COHERE_API_KEY:
+        out["cohere"] = "absent"
+    else:
+        out["cohere"] = _classify_provider_line(diag.get("cohere", ""))
+    out["wh_price"] = "ok" if WEBHOOK_UPDATE_PRICES else "absent"
+    out["wh_new"] = "ok" if WEBHOOK_NEW_PRODUCTS else "absent"
+    return out
+
+
+def _presence_api_summary() -> dict:
+    """بدون تشخيص — الوجود فقط (مفتاح مضاف أم لا)."""
+    return {
+        "gemini": "ok" if get_gemini_api_keys() else "absent",
+        "openrouter": "ok" if OPENROUTER_API_KEY else "absent",
+        "cohere": "ok" if COHERE_API_KEY else "absent",
+        "wh_price": "ok" if WEBHOOK_UPDATE_PRICES else "absent",
+        "wh_new": "ok" if WEBHOOK_NEW_PRODUCTS else "absent",
+    }
+
+
+def _merged_api_summary() -> dict:
+    d = st.session_state.get("api_diag_summary")
+    if isinstance(d, dict) and d.get("_from_diag"):
+        return {k: v for k, v in d.items() if not str(k).startswith("_")}
+    return _presence_api_summary()
+
+
+def _api_badges_html() -> str:
+    m = _merged_api_summary()
+    wh_has = bool(WEBHOOK_UPDATE_PRICES or WEBHOOK_NEW_PRODUCTS)
+    wh_st = "ok" if wh_has else "absent"
+    items = [
+        ("✨", "Gemini", m.get("gemini", "unknown")),
+        ("🔀", "OpenRouter", m.get("openrouter", "unknown")),
+        ("◎", "Cohere", m.get("cohere", "unknown")),
+        ("🔗", "Make", wh_st),
+    ]
+    chips = []
+    for icon, label, stt in items:
+        col, hint = _API_STATUS_HINT.get(stt, ("#9E9E9E", "?"))
+        chips.append(
+            f'<span title="{_html_escape(hint)}" style="display:inline-flex;align-items:center;gap:3px;'
+            f"background:{col}18;border:1px solid {col};color:{col};border-radius:999px;"
+            f'padding:3px 9px;font-size:0.72rem;font-weight:700;margin:2px">{icon} {label}</span>'
+        )
+    return (
+        '<div style="display:flex;flex-wrap:wrap;gap:4px;justify-content:center;'
+        f'margin-top:6px">{"".join(chips)}</div>'
+        '<p style="font-size:0.65rem;color:#888;text-align:center;margin:4px 0 0 0">'
+        "🟢 يعمل · 🟠 حد · 🟤 فاتورة/رصيد · 🔴 خطأ · ⚪ غير مضاف — "
+        "<b>شغّل «تشخيص شامل» من الإعدادات</b> لتحديث دقيق</p>"
+    )
+
+
+def _settings_api_card_html(name: str, icon: str, stt: str) -> str:
+    col, hint = _API_STATUS_HINT.get(stt, ("#9E9E9E", "?"))
+    return (
+        f'<div style="border-right:4px solid {col};background:{col}10;border-radius:8px;'
+        f'padding:10px 12px;margin-bottom:8px">'
+        f'<div style="font-weight:800;color:{col};font-size:1rem">{icon} {_html_escape(name)}</div>'
+        f'<div style="color:#666;font-size:0.85rem">{_html_escape(hint)}</div></div>'
+    )
 
 
 def _clear_live_session_pkl():
@@ -1646,6 +1767,7 @@ with st.sidebar:
         f'font-weight:700;font-size:.85rem">{ai_label}</div>',
         unsafe_allow_html=True
     )
+    st.markdown(_api_badges_html(), unsafe_allow_html=True)
 
     # زر تشخيص سريع
     if not ai_ok:
@@ -2492,7 +2614,7 @@ elif page == "🔍 منتجات مفقودة":
                 for _iss in _export_issues[:25]:
                     st.warning(_iss)
 
-            cc1,cc2,cc3 = st.columns(3)
+            cc1, cc2, cc3, cc4 = st.columns(4)
             with cc1:
                 if _export_ok:
                     excel_m = export_to_excel(_export_df, "مفقودة")
@@ -2507,6 +2629,19 @@ elif page == "🔍 منتجات مفقودة":
                 else:
                     st.caption("📄 CSV — يتطلب إصلاح الأخطاء أعلاه")
             with cc3:
+                if _export_ok and len(_export_df) > 0:
+                    _salla_b = export_missing_products_to_salla_csv_bytes(_export_df)
+                    st.download_button(
+                        "🛒 سلة CSV",
+                        data=_salla_b,
+                        file_name="missing_salla_import.csv",
+                        mime="text/csv; charset=utf-8",
+                        key="miss_salla_csv",
+                        help="استيراد جماعي سلة — UTF-8 BOM، صفّا رأس مطابقان لقالب سلة",
+                    )
+                else:
+                    st.caption("🛒 سلة CSV — يتطلب بيانات صالحة")
+            with cc4:
                 # ── خيارات الإرسال الذكي ─────────────────────────────
                 _conf_opts = {"🟢 مؤكدة فقط": "green", "🟡 محتملة": "yellow", "🔵 الكل": ""}
                 _conf_sel = st.selectbox("مستوى الثقة", list(_conf_opts.keys()), key="miss_conf_sel")
@@ -2571,22 +2706,7 @@ elif page == "🔍 منتجات مفقودة":
                 size            = str(row.get("الحجم", ""))
                 ptype           = str(row.get("النوع", ""))
                 note            = str(row.get("ملاحظة", ""))
-                # استخراج معرف المنتج (SKU/الكود)
-                _miss_pid_raw = (
-                    row.get("معرف_المنافس", "") or
-                    row.get("product_id", "") or
-                    row.get("رقم المنتج", "") or
-                    row.get("رقم_المنتج", "") or
-                    row.get("SKU", "") or
-                    row.get("sku", "") or
-                    row.get("الكود", "") or
-                    row.get("كود", "") or
-                    row.get("الباركود", "") or ""
-                )
-                _miss_pid = ""
-                if _miss_pid_raw and str(_miss_pid_raw) not in ("", "nan", "None", "0", "NaN"):
-                    try: _miss_pid = str(int(float(str(_miss_pid_raw))))
-                    except: _miss_pid = str(_miss_pid_raw).strip()
+                _img_miss = str(row.get("صورة_المنافس", "") or row.get("image_url", "") or "").strip()
                 variant_label   = str(row.get("نوع_متاح", ""))
                 variant_product = str(row.get("منتج_متاح", ""))
                 variant_score   = safe_float(row.get("نسبة_التشابه", 0))
@@ -2614,15 +2734,17 @@ elif page == "🔍 منتجات مفقودة":
                 if _has_variant:
                     _variant_label_safe = _html_escape(str(variant_label or ""))
                     _variant_product_safe = _html_escape(str(variant_product or ""))
-                    _variant_html = f"""
-                    <div style="margin-top:6px;padding:5px 10px;border-radius:6px;
-                                background:{_badge_bg}22;border:1px solid {_badge_bg}88;
-                                font-size:.78rem;color:{_badge_bg};font-weight:700">
-                        {_variant_label_safe}
-                        <span style="font-weight:400;color:#aaa;margin-right:6px">
-                            ({variant_score:.0f}%) → {_variant_product_safe[:50]}
-                        </span>
-                    </div>"""
+                    _variant_html = _dedent(
+                        f"""
+                        <div style="margin-top:6px;padding:5px 10px;border-radius:6px;
+                                    background:{_badge_bg}22;border:1px solid {_badge_bg}88;
+                                    font-size:.78rem;color:{_badge_bg};font-weight:700">
+                            {_variant_label_safe}
+                            <span style="font-weight:400;color:#aaa;margin-right:6px">
+                                ({variant_score:.0f}%) → {_variant_product_safe[:50]}
+                            </span>
+                        </div>"""
+                    ).strip()
 
                 # ── بادج تستر ─────────────────────────────────────────
                 _tester_badge = ""
@@ -2636,14 +2758,19 @@ elif page == "🔍 منتجات مفقودة":
                     variant_html=_variant_html, tester_badge=_tester_badge,
                     border_color=_border,
                     confidence_level=conf_level, confidence_score=conf_score,
-                    product_id=_miss_pid
+                    image_url=_img_miss,
                 ), unsafe_allow_html=True)
 
                 _cpx, _ = st.columns([1, 5])
                 with _cpx:
                     st.number_input(
-                        "سعر", value=float(suggested_price), min_value=0.0, step=1.0,
-                        key=miss_price_key, label_visibility="collapsed",
+                        "المقترح للإضافة (ر.س)",
+                        value=float(suggested_price),
+                        min_value=0.0,
+                        step=1.0,
+                        key=miss_price_key,
+                        label_visibility="collapsed",
+                        format="%.2f",
                     )
 
                 # ── الأزرار — صف 1 ────────────────────────────────────
@@ -3389,7 +3516,7 @@ elif page == "🤖 الذكاء الصناعي":
                         with _fic1:
                             _img_url = _fi.get("image_url","")
                             if _img_url and _img_url.startswith("http"):
-                                st.image(_img_url, width=200, caption=_fprod)
+                                st.image(_img_url, width=240, caption=_fprod)
                             else:
                                 st.markdown(f"[🔗 Fragrantica Arabia]({_FR}/search/?query={_fprod.replace(' ','+')})")
                         with _fic2:
@@ -3554,14 +3681,31 @@ elif page == "⚙️ الإعدادات":
 
     with tab1:
         # ── الحالة الحالية ────────────────────────────────────────────────
-        gemini_s = f"✅ {len(GEMINI_API_KEYS)} مفتاح" if GEMINI_API_KEYS else "❌ لا توجد مفاتيح"
-        or_s     = "✅ مفعل" if OPENROUTER_API_KEY else "❌ غير موجود"
-        co_s     = "✅ مفعل" if COHERE_API_KEY else "❌ غير موجود"
-        st.info(f"Gemini API: {gemini_s}")
-        st.info(f"OpenRouter: {or_s}")
-        st.info(f"Cohere:     {co_s}")
-        st.info(f"Webhook أسعار:   {'✅' if WEBHOOK_UPDATE_PRICES else '❌'}")
-        st.info(f"Webhook منتجات:  {'✅' if WEBHOOK_NEW_PRODUCTS else '❌'}")
+        _ms = _merged_api_summary()
+        st.markdown("##### لوحة المزودين (لون = الحالة)")
+        st.markdown(
+            _settings_api_card_html("Google Gemini", "✨", _ms.get("gemini", "unknown")),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            _settings_api_card_html("OpenRouter", "🔀", _ms.get("openrouter", "unknown")),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            _settings_api_card_html("Cohere", "◎", _ms.get("cohere", "unknown")),
+            unsafe_allow_html=True,
+        )
+        _whp = "ok" if WEBHOOK_UPDATE_PRICES else "absent"
+        _whn = "ok" if WEBHOOK_NEW_PRODUCTS else "absent"
+        _wh = "ok" if (_whp == "ok" or _whn == "ok") else "absent"
+        st.markdown(
+            _settings_api_card_html("Make.com (Webhooks)", "🔗", _wh),
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "بعد «تشخيص شامل» تظهر هنا **فاتورة/رصيد منتهٍ (402)** و**تجاوز حد (429)** بألوان مميزة. "
+            "بدون تشخيص: يُعرض وجود المفتاح فقط."
+        )
 
         st.markdown("---")
 
@@ -3573,6 +3717,9 @@ elif page == "⚙️ الإعدادات":
             with st.spinner("يختبر الاتصال بـ Gemini, OpenRouter, Cohere..."):
                 from engines.ai_engine import diagnose_ai_providers
                 diag = diagnose_ai_providers()
+            _summ = _infer_api_diag_summary(diag)
+            _summ["_from_diag"] = True
+            st.session_state["api_diag_summary"] = _summ
 
             # ── نتائج Gemini ──────────────────────────────────────────────
             st.markdown("**Gemini API:**")
