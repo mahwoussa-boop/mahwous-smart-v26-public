@@ -90,6 +90,7 @@ _SITEMAP_LOC_CAP = _env_int("SCRAPER_SITEMAP_LOC_CAP", 200000)
 _MAX_SITEMAP_INDEX_ENTRIES = _env_int("SCRAPER_SITEMAP_INDEX_CAP", 200000)
 # حجم استجابة XML واحدة قبل التخطي (متاجر ضخمة قد تولّد ملفات > 8 ميجا)
 _MAX_SITEMAP_BYTES = _env_int("SCRAPER_MAX_SITEMAP_BYTES", 32 * 1024 * 1024)
+_SITEMAP_EXPAND_TIMEOUT_SEC = _env_int("SCRAPER_SITEMAP_EXPAND_TIMEOUT_SEC", 120)
 _CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
 _FETCH_WORKERS = max(1, min(16, int(os.environ.get("SCRAPER_FETCH_WORKERS", "3"))))
@@ -245,17 +246,25 @@ def _parse_sitemap_xml(content: bytes) -> tuple[list[str], bool]:
     return urls, is_index
 
 
-def _expand_sitemap_to_page_urls(session: Any, start_url: str) -> list[str]:
+def _expand_sitemap_to_page_urls(session: Any, start_url: str, progress_cb=None) -> list[str]:
     page_urls: list[str] = []
     seen_sm: set[str] = set()
     queue = [start_url]
+    t0 = _time.time()
     while queue and len(page_urls) < _SITEMAP_LOC_CAP:
+        if _SITEMAP_EXPAND_TIMEOUT_SEC > 0 and (_time.time() - t0) > _SITEMAP_EXPAND_TIMEOUT_SEC:
+            break
         sm_url = queue.pop(0)
         if sm_url in seen_sm:
             continue
         if len(seen_sm) >= _MAX_SITEMAP_INDEX_ENTRIES:
             continue
         seen_sm.add(sm_url)
+        if progress_cb:
+            try:
+                progress_cb(len(seen_sm), len(queue), len(page_urls))
+            except Exception:
+                pass
         _jitter_sleep()
         r = _http_get_armored(session, sm_url, timeout=30.0)
         if r is None or r.status_code != 200 or not r.content:
@@ -689,8 +698,29 @@ def run_scraper_sync(
     session = _session()
     all_page_urls: list[str] = []
     seen_u: set[str] = set()
-    for seed in seeds:
-        expanded = _expand_sitemap_to_page_urls(session, seed)
+    for si, seed in enumerate(seeds):
+        if progress_cb:
+            try:
+                progress_cb(
+                    max(1, si),
+                    max(1, len(seeds)),
+                    f"🔍 فهرسة sitemap للمتجر {si + 1}/{len(seeds)}...",
+                )
+            except Exception:
+                pass
+        expanded = _expand_sitemap_to_page_urls(
+            session,
+            seed,
+            progress_cb=lambda seen_sm, queued, found: (
+                progress_cb(
+                    max(1, si),
+                    max(1, len(seeds)),
+                    f"🔍 sitemap {si + 1}/{len(seeds)} | خرائط:{seen_sm} | queued:{queued} | روابط:{found}",
+                )
+                if progress_cb
+                else None
+            ),
+        )
         products = [x for x in expanded if _product_url_heuristic(x)]
         stats["sitemap_total"] += len(expanded)
         stats["heuristic_accepted"] += len(products)
