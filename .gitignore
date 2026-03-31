@@ -3,3 +3,5 @@ __pycache__/
 *.pyo
 *.db
 .streamlit/secrets.toml
+.streamlit/secrets.toml
+API_SETUP.md
