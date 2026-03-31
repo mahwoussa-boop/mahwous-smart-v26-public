@@ -3121,7 +3121,7 @@ elif page == "🤖 الذكاء الصناعي":
         # إدخال
         _mc1, _mc2 = st.columns([5, 1])
         with _mc1:
-            _user_in = st.text_input("", key="gem_in",
+            _user_in = st.text_input("اكتب رسالتك", key="gem_in",
                 placeholder="اسأل Gemini — عن المنتجات، الأسعار، التوصيات...",
                 label_visibility="collapsed")
         with _mc2:
