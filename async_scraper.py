@@ -105,7 +105,7 @@ _MAX_SITEMAP_BYTES = _env_int("SCRAPER_MAX_SITEMAP_BYTES", 32 * 1024 * 1024)
 _SITEMAP_EXPAND_TIMEOUT_SEC = _env_int("SCRAPER_SITEMAP_EXPAND_TIMEOUT_SEC", 600)
 _CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
-_MAX_CONCURRENT_FETCH = max(1, min(64, _env_int("SCRAPER_MAX_CONCURRENT_FETCH", 20)))
+_MAX_CONCURRENT_FETCH = max(1, min(64, _env_int("SCRAPER_MAX_CONCURRENT_FETCH", 28)))
 _HEURISTIC_MODE = (os.environ.get("SCRAPER_HEURISTIC_MODE", "loose") or "loose").strip().lower()
 _PIPELINE_EVERY = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100"))
 _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip().lower() in (
@@ -745,6 +745,7 @@ def _pipeline_analysis_worker(
                 len(rows_snap),
             )
             out["error"] = str(e)
+            out["is_final"] = False
 
 
 def _pipeline_maybe_enqueue(
@@ -1071,10 +1072,20 @@ async def _run_scraper_async(
                 await asyncio.gather(*tasks, return_exceptions=True)
 
     if pipeline_q is not None and pipeline_thread is not None:
+        _pout = pipeline.setdefault("out", {})
         if rows:
             pipeline_q.put((copy.deepcopy(rows), True))
         pipeline_q.put(_PIPELINE_STOP)
         pipeline_thread.join(timeout=7200)
+        if pipeline_thread.is_alive():
+            logger.error(
+                "pipeline analysis worker did not finish within 7200s — "
+                "downstream may use full analysis job instead of fast path"
+            )
+            _prev = str(_pout.get("error") or "").strip()
+            _msg = "انتهت مهلة انتظار محرك الفرز أثناء الكشط — سيتم التحليل الشامل لاحقاً"
+            _pout["error"] = f"{_prev} | {_msg}" if _prev else _msg
+            _pout["is_final"] = False
 
     _wall_sec = _time.time() - scrape_wall_t0
     if not rows:

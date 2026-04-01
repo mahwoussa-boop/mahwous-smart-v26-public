@@ -4,6 +4,7 @@ config.py - الإعدادات المركزية v19.0
 """
 import json as _json
 import os as _os
+import tempfile
 
 # ===== معلومات التطبيق =====
 APP_TITLE   = "نظام التسعير الذكي - مهووس"
@@ -123,6 +124,13 @@ EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 # ══════════════════════════════════════════════
 WEBHOOK_UPDATE_PRICES = _s("WEBHOOK_UPDATE_PRICES") or ""
 WEBHOOK_NEW_PRODUCTS = _s("WEBHOOK_NEW_PRODUCTS") or ""
+
+# ══════════════════════════════════════════════
+#  كشط (async_scraper.py) — تُقرأ من os.environ على التشغيل
+#  • SCRAPER_MAX_CONCURRENT_FETCH (افتراضي 28، حد أعلى 64) — تزيد السرعة؛ خفّضها عند الحظر
+#  • SCRAPER_PIPELINE_EVERY — فاصل لقطات الفرز أثناء الكشط (افتراضي 100 صف)
+#  • MAHWOUS_UI_LIVE_REFRESH_MS — تبطئة تحديث واجهة Streamlit أثناء الكشط الطويل
+# ══════════════════════════════════════════════
 
 # ══════════════════════════════════════════════
 #  ألوان
@@ -255,8 +263,8 @@ SECTIONS = [
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-# مسار SQLite — معرّف مباشرة لتجنب circular import مع db_manager
-DB_PATH = _os.path.join("/tmp", "pricing_v18.db")
+# مسار SQLite — نفس الاسم في كل الوحدات؛ temp يعمل على Windows وLinux وStreamlit Cloud
+DB_PATH = _os.path.join(tempfile.gettempdir(), "pricing_v18.db")
 
 # قائمة المنافسين الافتراضية للكشط — يُحمَّل من الملف؛ يمكن تعديل JSON دون المساس بالكود
 PRESET_COMPETITORS_PATH = _os.path.join("data", "preset_competitors.json")

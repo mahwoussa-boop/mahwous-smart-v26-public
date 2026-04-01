@@ -88,6 +88,14 @@ from utils.db_manager import (init_db, log_event, log_decision,
                                get_processed_keys, migrate_db_v26)
 
 
+def _ui_autorefresh_interval(ms_default: int) -> int:
+    """فاصل التحديث الحي (ملّي ث). يمكن رفعه عبر MAHWOUS_UI_LIVE_REFRESH_MS لتخفيف ثقل الواجهة أثناء الكشط."""
+    v = os.environ.get("MAHWOUS_UI_LIVE_REFRESH_MS", "").strip()
+    if v.isdigit():
+        return max(2500, int(v))
+    return ms_default
+
+
 def _format_elapsed_compact(sec: float | int) -> str:
     """عرض مدة قصيرة للواجهة: ١٢٣ث أو ٤:٠٥."""
     try:
@@ -826,8 +834,10 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
     # ── المرحلة 1: التحليل الرئيسي ──────────────────────────────────
     try:
         analysis_df = run_full_analysis(
-            our_df, comp_dfs,
-            progress_callback=progress_cb
+            our_df,
+            comp_dfs,
+            progress_callback=progress_cb,
+            use_ai=True,
         )
     except Exception as e:
         import traceback
@@ -1183,6 +1193,7 @@ def _run_scrape_chain_background():
     _last_live = [0.0]
     pl_dict_last: dict | None = None
     last_comp_df_ok: pd.DataFrame | None = None
+    last_comp_key_ok: str | None = None
     stores_completed = 0
     total_rows_across = 0
     chain_t0 = time.time()
@@ -1295,6 +1306,7 @@ def _run_scrape_chain_background():
         stores_completed += 1
         total_rows_across += int(nrows)
         last_comp_df_ok = comp_df
+        last_comp_key_ok = comp_key
 
     try:
         all_smaps = [j.get("sitemap") for j in scrape_queue if j.get("sitemap")]
@@ -1322,7 +1334,7 @@ def _run_scrape_chain_background():
         )
         comp_dfs = load_all_comp_catalog_as_comp_dfs()
         if not comp_dfs and last_comp_df_ok is not None:
-            _lck = str(scrape_queue[-1].get("comp_key") or "Scraped_Competitor")
+            _lck = str(last_comp_key_ok or "").strip() or "Scraped_Competitor"
             comp_dfs = merged_comp_dfs_for_analysis(_lck, last_comp_df_ok)
     except Exception as e:
         merge_scraper_bg_state(active=False, phase="error", error=f"الكتالوج: {e}")
@@ -2007,7 +2019,7 @@ with st.sidebar:
         try:
             from streamlit_autorefresh import st_autorefresh
 
-            st_autorefresh(interval=2500, key="sidebar_live_dual_refresh")
+            st_autorefresh(interval=_ui_autorefresh_interval(2500), key="sidebar_live_dual_refresh")
         except ImportError:
             time.sleep(2.5)
             st.rerun()
@@ -2033,7 +2045,7 @@ with st.sidebar:
         try:
             from streamlit_autorefresh import st_autorefresh
 
-            st_autorefresh(interval=3000, key="scrape_bg_refresh")
+            st_autorefresh(interval=_ui_autorefresh_interval(3000), key="scrape_bg_refresh")
         except ImportError:
             time.sleep(3)
             st.rerun()
@@ -2054,7 +2066,7 @@ with st.sidebar:
                 # تحديث تلقائي كل 4 ثوانٍ بدون إعادة تشغيل الكود كاملاً
                 try:
                     from streamlit_autorefresh import st_autorefresh
-                    st_autorefresh(interval=4000, key="progress_refresh")
+                    st_autorefresh(interval=_ui_autorefresh_interval(4000), key="progress_refresh")
                 except ImportError:
                     # fallback: rerun عادي إذا لم تكن المكتبة موجودة
                     time.sleep(4)
@@ -2264,20 +2276,23 @@ elif page == "📂 رفع الملفات":
         try:
             from streamlit_autorefresh import st_autorefresh
 
-            st_autorefresh(interval=2000, key="scrape_live_dashboard_refresh")
+            st_autorefresh(interval=_ui_autorefresh_interval(2000), key="scrape_live_dashboard_refresh")
         except ImportError:
             time.sleep(2)
             st.rerun()
         st.markdown("---")
     elif _snap_live.get("done"):
+        # يجب تحميل pickle قبل حذف اللقطة/الملفات — وإلا تُفقد النتائج إذا اكتمل الكشط أثناء الجلسة
+        # (كان التحميل يحدث مرة عند استيراد الوحدة فقط).
+        _hydrate_live_session_results_early()
         if not _snap_live.get("success") and _snap_live.get("error"):
             st.error(f"❌ {_snap_live['error'][:400]}")
         else:
             st.success(
                 "✅ انتهت مرحلة الكشط والتحضير — راقب **الشريط الجانبي** لاكتمال التحليل (Job) أو النتائج."
             )
-        _clear_live_session_pkl()
         _clear_scrape_live_snapshot()
+        _clear_live_session_pkl()
         st.rerun()
 
     st.header("🕸️ كشط الويب والتحليل")
@@ -3657,7 +3672,7 @@ elif page == "🤖 الذكاء الصناعي":
                         _csv_p = _df_p.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                         st.download_button("📄 تحميل CSV", data=_csv_p,
                             file_name="pasted.csv", mime="text/csv", key="paste_dl")
-                    except:
+                    except Exception:
                         st.warning("تعذر التحويل لجدول — جرب تنسيق CSV أو TSV")
 
     # ═══ TAB 3: تحقق منتج ══════════════════════
