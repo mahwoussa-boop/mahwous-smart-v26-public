@@ -5,19 +5,19 @@ utils/db_manager.py - v18.0
 - قرارات لكل منتج (موافق/تأجيل/إزالة)
 - سجل كامل بالتاريخ والوقت
 
-مسار قاعدة البيانات (DB_PATH) — المصدر الوحيد: يُستورد من هنا في config.py
-للأتمتة وباقي الوحدات حتى لا يُكتب سجل الأتمتة في ملف منفصل.
+مسار قاعدة البيانات (DB_PATH) — يطابق config.DB_PATH (نفس الملف؛ يُعرّف هنا لتجنب circular import).
 """
 import hashlib
 import os
 import sqlite3
+import tempfile
 from datetime import datetime
 
 from utils.jsonfast import dumps as json_dumps, loads as json_loads
 
-# استخدام /tmp لضمان الكتابة على Streamlit Cloud (مجلد الكود read-only)
+# مجلد temp النظامي: يعمل محلياً وعلى Cloud (مجلد الكود غالباً read-only)
 _DB_NAME = "pricing_v18.db"
-DB_PATH = os.path.join("/tmp", _DB_NAME)
+DB_PATH = os.path.join(tempfile.gettempdir(), _DB_NAME)
 
 
 def _log_db_err(where: str, err: Exception) -> None:
