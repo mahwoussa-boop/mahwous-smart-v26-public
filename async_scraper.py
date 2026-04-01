@@ -640,6 +640,39 @@ def load_checkpoint_rows_if_any() -> list[dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict)]
 
 
+def get_checkpoint_recovery_status() -> dict[str, Any]:
+    """للواجهة: هل يوجد ملف، عدد الصفوف، وتطابق بصمة `competitors_list.json` مع جلسة النقطة."""
+    seeds = _load_sitemap_seeds()
+    seeds_fp = _seeds_fingerprint(seeds) if seeds else ""
+    raw_rows: list = []
+    ck_fp = ""
+    file_exists = os.path.isfile(CHECKPOINT_JSON)
+    fp_match = False
+    if file_exists:
+        try:
+            with open(CHECKPOINT_JSON, encoding="utf-8") as f:
+                d = json_load(f)
+            ck_fp = str(d.get("seeds_fp") or "")
+            raw = d.get("rows", [])
+            raw_rows = raw if isinstance(raw, list) else []
+            fp_match = bool(seeds_fp) and (ck_fp == seeds_fp)
+        except Exception:
+            raw_rows = []
+    usable = (
+        [r for r in raw_rows if isinstance(r, dict)]
+        if fp_match
+        else []
+    )
+    return {
+        "file_exists": file_exists,
+        "raw_row_count": len(raw_rows),
+        "usable_row_count": len(usable),
+        "fingerprint_match": fp_match,
+        "has_seeds_json": bool(seeds),
+        "checkpoint_path": CHECKPOINT_JSON,
+    }
+
+
 def _load_checkpoint(seeds_fp: str) -> tuple[set[str], list[dict[str, Any]]]:
     if not os.path.isfile(CHECKPOINT_JSON):
         return set(), []

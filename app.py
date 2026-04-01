@@ -38,6 +38,7 @@ from async_scraper import (
     _load_sitemap_seeds,
     load_checkpoint_rows_if_any,
     get_scraper_sitemap_seeds,
+    get_checkpoint_recovery_status,
 )
 from sitemap_resolve import resolve_store_to_sitemap_url
 
@@ -1176,15 +1177,24 @@ def _infer_comp_key_for_checkpoint_recovery() -> str:
 def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
     """زر طوارئ واحد: فرز من `data/scraper_checkpoint.json` عند توقف الكشط دون ضياع الصفوف المحفوظة."""
     try:
+        st_ck = get_checkpoint_recovery_status()
+    except Exception:
+        st_ck = {
+            "file_exists": False,
+            "raw_row_count": 0,
+            "usable_row_count": 0,
+            "fingerprint_match": False,
+            "has_seeds_json": False,
+            "checkpoint_path": os.path.join("data", "scraper_checkpoint.json"),
+        }
+    try:
         ck_rows = load_checkpoint_rows_if_any()
     except Exception:
         ck_rows = []
 
     busy = bool(snap_live.get("running")) and not bool(snap_live.get("done"))
     n_ck = len(ck_rows)
-
-    if n_ck == 0:
-        return
+    n_use = int(st_ck.get("usable_row_count") or 0)
 
     with st.container(border=True):
         st.markdown("#### 🛟 طوارئ — فرز من نقطة الحفظ")
@@ -1192,12 +1202,25 @@ def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
             "إذا توقف الكشط قبل اكتمال التحليل، يُفرز **ما حُفظ في نقطة الاستعادة** بنفس محرك المطابقة. "
             "يُشترط أن تطابق خرائط المواقع الحالية (`data/competitors_list.json`) جلسة الكشط التي أنتجت الملف."
         )
-        if n_ck:
-            st.caption(f"📦 **{n_ck:,}** صف في نقطة الحفظ (`data/scraper_checkpoint.json`).")
-        else:
-            st.caption(
-                "📭 لا توجد صفوف مطابقة لخرائط المواقع الحالية، أو لا يوجد ملف نقطة حفظ."
+        _cp = st_ck.get("checkpoint_path") or "data/scraper_checkpoint.json"
+        if not st_ck.get("file_exists"):
+            st.info(
+                f"📭 لا يوجد ملف نقطة حفظ حالياً (`{_cp}`). "
+                "يُنشأ أثناء الكشط؛ إذا لم يبدأ كشط بعد، هذا طبيعي."
             )
+        elif not st_ck.get("has_seeds_json"):
+            st.warning(
+                "⚠️ لا يوجد `data/competitors_list.json` أو فارغ — أعد تجهيز روابط الخرائط كما عند بدء الكشط."
+            )
+        elif not st_ck.get("fingerprint_match"):
+            st.warning(
+                f"⚠️ يوجد **{st_ck.get('raw_row_count', 0):,}** صف في الملف لكن **بصمة الخرائط لا تطابق** الجلسة الحالية. "
+                "أعد نفس روابط المتاجر/الخرائط التي استُخدمت أثناء الكشط، أو لن يُحمّل الزر أي صف."
+            )
+        elif n_use > 0:
+            st.success(f"📦 **{n_use:,}** صف جاهز للفرز من نقطة الحفظ.")
+        else:
+            st.caption("📭 ملف النقطة موجود لكن لا توجد صفوف صالحة داخله.")
 
         if busy:
             st.caption("⏳ الكشط يعمل — الزر معطّل حتى يتوقف المسار.")
@@ -1206,7 +1229,7 @@ def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
             "⚙️ فرز ما تم كشطه الآن (من نقطة الحفظ)",
             key="btn_checkpoint_force_recovery",
             disabled=busy or n_ck == 0,
-            help="معطّل أثناء الكشط. يحتاج كتالوجاً محفوظاً وصفوفاً في نقطة الحفظ المطابقة للخرائط.",
+            help="معطّل أثناء الكشط أو عند عدم وجود صفوف مطابقة لبصمة الخرائط.",
             use_container_width=True,
         )
 
