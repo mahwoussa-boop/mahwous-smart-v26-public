@@ -36,7 +36,7 @@ from async_scraper import (
     read_scraper_bg_state,
     run_scraper_sync,
     _load_sitemap_seeds,
-    load_checkpoint_rows_if_any,
+    load_checkpoint_rows_ignore_fingerprint,
     get_scraper_sitemap_seeds,
     get_checkpoint_recovery_status,
 )
@@ -1175,7 +1175,7 @@ def _infer_comp_key_for_checkpoint_recovery() -> str:
 
 
 def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
-    """زر طوارئ واحد: فرز من `data/scraper_checkpoint.json` عند توقف الكشط دون ضياع الصفوف المحفوظة."""
+    """فرز ومقارنة من `scraper_checkpoint.json` — لا يعتمد على استمرار الكشط ولا على بصمة الخرائط."""
     try:
         st_ck = get_checkpoint_recovery_status()
     except Exception:
@@ -1188,48 +1188,47 @@ def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
             "checkpoint_path": os.path.join("data", "scraper_checkpoint.json"),
         }
     try:
-        ck_rows = load_checkpoint_rows_if_any()
+        ck_rows = load_checkpoint_rows_ignore_fingerprint()
     except Exception:
         ck_rows = []
 
     busy = bool(snap_live.get("running")) and not bool(snap_live.get("done"))
     n_ck = len(ck_rows)
-    n_use = int(st_ck.get("usable_row_count") or 0)
+    n_raw = int(st_ck.get("raw_row_count") or 0)
+    fp_ok = bool(st_ck.get("fingerprint_match"))
 
     with st.container(border=True):
-        st.markdown("#### 🛟 طوارئ — فرز من نقطة الحفظ")
+        st.markdown("#### 🛟 طوارئ — فرز ومقارنة من نقطة الحفظ")
         st.caption(
-            "إذا توقف الكشط قبل اكتمال التحليل، يُفرز **ما حُفظ في نقطة الاستعادة** بنفس محرك المطابقة. "
-            "يُشترط أن تطابق خرائط المواقع الحالية (`data/competitors_list.json`) جلسة الكشط التي أنتجت الملف."
+            "يحمّل **كل الصفوف** من `data/scraper_checkpoint.json` ويشغّل **الفرز والمقارنة** فقط "
+            "(محرك المطابقة + كتالوجك). **لا حاجة** لتطابق بصمة الخرائط مع الجلسة الحالية ولا لإيقاف الكشط."
         )
         _cp = st_ck.get("checkpoint_path") or "data/scraper_checkpoint.json"
         if not st_ck.get("file_exists"):
             st.info(
-                f"📭 لا يوجد ملف نقطة حفظ حالياً (`{_cp}`). "
-                "يُنشأ أثناء الكشط؛ إذا لم يبدأ كشط بعد، هذا طبيعي."
+                f"📭 لا يوجد ملف (`{_cp}`). يُنشأ أثناء جلسة كشط؛ بدون ملف لا يوجد ما يُفرَز."
             )
-        elif not st_ck.get("has_seeds_json"):
-            st.warning(
-                "⚠️ لا يوجد `data/competitors_list.json` أو فارغ — أعد تجهيز روابط الخرائط كما عند بدء الكشط."
-            )
-        elif not st_ck.get("fingerprint_match"):
-            st.warning(
-                f"⚠️ يوجد **{st_ck.get('raw_row_count', 0):,}** صف في الملف لكن **بصمة الخرائط لا تطابق** الجلسة الحالية. "
-                "أعد نفس روابط المتاجر/الخرائط التي استُخدمت أثناء الكشط، أو لن يُحمّل الزر أي صف."
-            )
-        elif n_use > 0:
-            st.success(f"📦 **{n_use:,}** صف جاهز للفرز من نقطة الحفظ.")
+        elif n_ck > 0:
+            st.success(f"📦 **{n_ck:,}** صف في الملف — جاهز للفرز والمقارنة.")
+            if not fp_ok and n_raw > 0:
+                st.caption(
+                    "ℹ️ بصمة `competitors_list.json` الحالية تختلف عن جلسة حفظ الملف — **لا يمنع الفرز**؛ "
+                    "اسم مفتاح المنافس يُشتق من إعداداتك الحالية."
+                )
         else:
-            st.caption("📭 ملف النقطة موجود لكن لا توجد صفوف صالحة داخله.")
+            st.caption("📭 الملف موجود لكن لا توجد صفوف صالحة داخله.")
 
-        if busy:
-            st.caption("⏳ الكشط يعمل — الزر معطّل حتى يتوقف المسار.")
+        if busy and n_ck > 0:
+            st.caption(
+                "⏳ **لقطة الواجهة** تُظهر «كشطاً قيد التشغيل» — يمكنك الضغط على الفرز إن أردت المقارنة فقط؛ "
+                "إن كان الكشط عالقاً أعد تحميل الصفحة."
+            )
 
         do_recover = st.button(
-            "⚙️ فرز ما تم كشطه الآن (من نقطة الحفظ)",
+            "⚙️ تشغيل الفرز والمقارنة من نقطة الحفظ",
             key="btn_checkpoint_force_recovery",
-            disabled=busy or n_ck == 0,
-            help="معطّل أثناء الكشط أو عند عدم وجود صفوف مطابقة لبصمة الخرائط.",
+            disabled=n_ck == 0,
+            help="يقرأ كل الصفوف من ملف النقطة ويشغّل المطابقة مع كتالوج mahwous_catalog.csv.",
             use_container_width=True,
         )
 

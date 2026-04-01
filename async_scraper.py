@@ -640,6 +640,22 @@ def load_checkpoint_rows_if_any() -> list[dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict)]
 
 
+def load_checkpoint_rows_ignore_fingerprint() -> list[dict[str, Any]]:
+    """كل صفوف المنتج من `scraper_checkpoint.json` — بدون شرط بصمة الخرائط (فرز/مقارنة فقط)."""
+    if not os.path.isfile(CHECKPOINT_JSON):
+        return []
+    try:
+        with open(CHECKPOINT_JSON, encoding="utf-8") as f:
+            d = json_load(f)
+        rows = d.get("rows", [])
+        if not isinstance(rows, list):
+            return []
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception:
+        logger.exception("load_checkpoint_rows_ignore_fingerprint failed path=%s", CHECKPOINT_JSON)
+        return []
+
+
 def get_checkpoint_recovery_status() -> dict[str, Any]:
     """للواجهة: هل يوجد ملف، عدد الصفوف، وتطابق بصمة `competitors_list.json` مع جلسة النقطة."""
     seeds = _load_sitemap_seeds()
