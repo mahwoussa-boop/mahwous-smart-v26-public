@@ -27,7 +27,8 @@ except ImportError:
     AUTO_PUSH_TO_MAKE = False
     AUTO_SEARCH_INTERVAL_MINUTES = 360
     import os
-    DB_PATH = os.path.join("/tmp", "pricing_v18.db")
+    import tempfile as _tf
+    DB_PATH = os.path.join(_tf.gettempdir(), "pricing_v18.db")
 
 # أقصى نسبة انخفاض مسموح بها تلقائياً (يمنع «السباق نحو الصفر» عند أخطاء بيانات المنافس)
 MAX_DROP_PCT = 0.25

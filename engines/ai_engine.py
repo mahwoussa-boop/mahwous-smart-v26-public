@@ -549,7 +549,8 @@ def _search_ddg(query, num_results=5):
                 if isinstance(rel, dict) and rel.get("Text"):
                     results.append({"snippet": rel.get("Text",""), "url": rel.get("FirstURL","")})
             return results
-    except: pass
+    except Exception:
+        pass
     return []
 
 def call_ai(prompt, page="general"):
