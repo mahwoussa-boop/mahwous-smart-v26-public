@@ -13,7 +13,7 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 import base64
 import os as _os
 import requests, json, re, time, traceback
-from config import get_gemini_api_keys, get_openrouter_api_key, get_cohere_api_key
+from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
 try:
     from engines.engine import _clean_ai_json
@@ -25,15 +25,6 @@ _GV = _os.environ.get("GEMINI_VISION_MODEL", _GM)
 _GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
 _GVU = f"https://generativelanguage.googleapis.com/v1beta/models/{_GV}:generateContent"
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
-
-# نماذج OpenRouter المجربة — يُحدَّث عند إزالة معرّفات من المنصة (خطأ 400)
-OPENROUTER_FALLBACK_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "google/gemma-3-27b-it:free",
-]
 _CO  = "https://api.cohere.ai/v1/generate"
 
 # ── سجل الأخطاء الأخيرة (يُعرض في صفحة التشخيص) ─────────────────────────
@@ -57,7 +48,7 @@ def diagnose_ai_providers() -> dict:
 
     # ── Gemini ────────────────────────────────────────────────────────────
     gemini_results = []
-    for i, key in enumerate(get_gemini_api_keys() or []):
+    for i, key in enumerate(GEMINI_API_KEYS or []):
         if not key:
             gemini_results.append({"key": i+1, "status": "❌ مفتاح فارغ"})
             continue
@@ -76,10 +67,7 @@ def diagnose_ai_providers() -> dict:
             elif r.status_code == 403:
                 gemini_results.append({"key": i+1, "status": "❌ 403 — مفتاح غير مصرح أو IP محظور"})
             elif r.status_code == 429:
-                gemini_results.append({
-                    "key": i+1,
-                    "status": "⚠️ 429 — تجاوز الحد (انتظر أو جرّب مفتاحاً آخر / ارفع الحصة في Google AI)",
-                })
+                gemini_results.append({"key": i+1, "status": "⚠️ 429 — تجاوز الحد (Rate Limit)"})
             elif r.status_code == 404:
                 gemini_results.append({"key": i+1, "status": f"❌ 404 — النموذج {_GM} غير متاح"})
             else:
@@ -94,78 +82,52 @@ def diagnose_ai_providers() -> dict:
             gemini_results.append({"key": i+1, "status": f"❌ خطأ: {str(e)[:80]}"})
     results["gemini"] = gemini_results
 
-    # ── OpenRouter — تجربة نماذج صالحة (المعرّفات القديمة مثل google/gemini-2.0-flash تُرفض بـ 400)
-    _or_key = get_openrouter_api_key()
-    if _or_key:
-        or_ok = False
-        last_or = ""
-        for _model in OPENROUTER_FALLBACK_MODELS:
-            try:
-                r = requests.post(
-                    _OR,
-                    json={
-                        "model": _model,
-                        "messages": [{"role": "user", "content": "test"}],
-                        "max_tokens": 5,
-                    },
-                    headers={
-                        "Authorization": f"Bearer {_or_key}",
-                        "HTTP-Referer": "https://mahwous.com",
-                    },
-                    timeout=15,
-                )
-                if r.status_code == 200:
-                    results["openrouter"] = f"✅ يعمل (نموذج: {_model})"
-                    or_ok = True
-                    break
-                if r.status_code == 401:
-                    results["openrouter"] = "❌ 401 — مفتاح OpenRouter غير صحيح"
-                    or_ok = True
-                    break
-                if r.status_code == 402:
-                    results["openrouter"] = "❌ 402 — رصيد OpenRouter منتهٍ"
-                    or_ok = True
-                    break
-                if r.status_code == 429:
-                    last_or = f"⚠️ 429 — تجاوز الحد ({_model})"
-                    continue
-                try:
-                    msg = r.json().get("error", {}).get("message", "")
-                except Exception:
-                    msg = r.text[:100]
-                last_or = f"❌ {r.status_code} — {msg[:100]} ({_model})"
-            except requests.exceptions.ConnectionError:
-                results["openrouter"] = "❌ لا اتصال بـ openrouter.ai — قد يكون محظوراً"
-                or_ok = True
-                break
-            except requests.exceptions.Timeout:
-                last_or = f"❌ Timeout ({_model})"
-            except Exception as e:
-                last_or = f"❌ {str(e)[:80]} ({_model})"
-        if not or_ok:
-            results["openrouter"] = last_or or "❌ فشلت كل نماذج OpenRouter"
+    # ── OpenRouter ────────────────────────────────────────────────────────
+    if OPENROUTER_API_KEY:
+        try:
+            r = requests.post(_OR, json={
+                "model": "google/gemini-2.0-flash",  # ← مستقر
+                "messages": [{"role":"user","content":"test"}],
+                "max_tokens": 5
+            }, headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "HTTP-Referer": "https://mahwous.com"
+            }, timeout=15)
+            if r.status_code == 200:
+                results["openrouter"] = "✅ يعمل"
+            elif r.status_code == 401:
+                results["openrouter"] = "❌ 401 — مفتاح OpenRouter غير صحيح"
+            elif r.status_code == 402:
+                results["openrouter"] = "❌ 402 — رصيد OpenRouter منتهٍ"
+            elif r.status_code == 429:
+                results["openrouter"] = "⚠️ 429 — تجاوز الحد"
+            else:
+                try: msg = r.json().get("error",{}).get("message","")
+                except: msg = r.text[:100]
+                results["openrouter"] = f"❌ {r.status_code} — {msg[:80]}"
+        except requests.exceptions.ConnectionError:
+            results["openrouter"] = "❌ لا اتصال بـ openrouter.ai — قد يكون محظوراً"
+        except requests.exceptions.Timeout:
+            results["openrouter"] = "❌ Timeout"
+        except Exception as e:
+            results["openrouter"] = f"❌ {str(e)[:80]}"
     else:
         results["openrouter"] = "⚠️ مفتاح غير موجود"
 
     # ── Cohere ────────────────────────────────────────────────────────────
-    _ch_key = get_cohere_api_key()
-    if _ch_key:
+    if COHERE_API_KEY:
         try:
             r = requests.post("https://api.cohere.com/v2/chat", json={
                 "model": "command-a-03-2025",
                 "messages": [{"role": "user", "content": "test"}],
             }, headers={
-                "Authorization": f"Bearer {_ch_key}",
+                "Authorization": f"Bearer {COHERE_API_KEY}",
                 "Content-Type": "application/json",
             }, timeout=15)
             if r.status_code == 200:
                 results["cohere"] = "✅ يعمل (command-a-03-2025)"
             elif r.status_code == 401:
-                # اختياري — لا يُعرض كخطأ أحمر؛ التطبيق يعمل بدون Cohere
-                results["cohere"] = (
-                    "⚠️ 401 — مفتاح Cohere غير صالح (اختياري). "
-                    "احذف COHERE_API_KEY من Secrets أو ضع مفتاحاً صحيحاً من dashboard.cohere.com"
-                )
+                results["cohere"] = "❌ 401 — مفتاح Cohere غير صحيح"
             elif r.status_code == 402:
                 results["cohere"] = "❌ 402 — رصيد Cohere منتهٍ"
             else:
@@ -220,7 +182,7 @@ def vision_match_court(
     يعيد: same_product (bool), reason (str), ok (نجح الطلب).
     """
     out: dict = {"same_product": False, "reason": "", "ok": False}
-    keys = get_gemini_api_keys() or []
+    keys = GEMINI_API_KEYS or []
     if not keys:
         out["reason"] = "لا يوجد مفتاح Gemini"
         return out
@@ -288,57 +250,6 @@ MAHWOUS_EXPERT_SYSTEM = """أنت خبير عالمي في كتابة أوصاف
 - لا تكتب JSON أو أكواد — نص مقروء فقط
 """
 
-# ══ وصف منتجات مفقودة — «خبير مهووس» الموحّد + SEO (Gemini) ═════════════════
-MISSING_PAGE_SYSTEM = """## الهوية والأسلوب (Persona)
-أنت الآن خبير عطور سعودي محترف تعمل في متجر (مهووس - Mahwous). أسلوبك شاعري، واثق، دقيق تقنياً، ومقنع تسويقياً. لغتك العربية فصيحة بلمسة خليجية راقية، تركز على الأصالة والثبات والتميز. خاطب الذوق السعودي والخليجي (استخدم كلمات مثل: فوحان، ثبات، تميز).
-
-## المهمة
-توليد وصف تسويقي كامل لكل «عطر مفقود» (غير مدرج بعد في كتالوج مهووس). استخدم Markdown للعناوين والتنسيق. المحتوى العربي أولاً.
-
-## الهيكل الإلزامي للوصف (Description Structure)
-التزم بهذا الترتيب والعناوين:
-
-### العنوان الجذاب
-سطر واحد يجمع: اسم العطر + الماركة + الحجم + (تركيز العطر مثل EDP/EDT) حسب المدخلات.
-
-### المقدمة الشاعرية
-وصف حسي يلامس المشاعر (مثال أسلوبي: رحلة تأخذك إلى غابات الأرز…) دون مبالغة فارغة.
-
-### الهرم العطري (الرحلة العطرية)
-- **المقدمة (Top Notes):** المكونات الافتتاحية.
-- **القلب (Heart Notes):** جوهر العطر.
-- **القاعدة (Base Notes):** المكونات المستقرة والعميقة.
-
-### لماذا تختار هذا العطر؟
-أربع نقاط قوى واضحة تغطي: الثبات، الفوحان، التميز، القيمة.
-
-### متى وأين ترتديه؟
-الفصول المناسبة (صيف/شتاء)، الأوقات (صباح/مساء)، والمناسبات.
-
-### لمسة خبير من مهووس
-- تقييم **الفوحان** على مقياس من 1 إلى 10 مع جملة توضيحية قصيرة.
-- تقييم **الثبات** على مقياس من 1 إلى 10 مع جملة توضيحية قصيرة.
-- **نصيحة رش احترافية** (مثال: رشة على أماكن النبض لثبات يدوم).
-
-### الأسئلة الشائعة
-3 إلى 5 أسئلة تهم العميل السعودي عن العطر، مع إجابة مختصرة لكل سؤال.
-
-## بيانات SEO الذكية (JSON)
-بعد انتهاء الوصف بالكامل، اترك سطراً فارغاً ثم أخرج **كائناً JSON واحداً صالحاً فقط** (بدون ``` وبدون نص بعده) بالشكل:
-{
-  "page_title": "عنوان جذاب لمحركات البحث",
-  "meta_description": "ملخص تسويقي حوالي 150 حرفاً",
-  "url_slug": "perfume-slug-in-english-lowercase",
-  "alt_text": "وصف مختصر للصورة بالعربية",
-  "tags": ["ماركة", "عطر رجالي أو نسائي", "صيفي أو شتوي", "..."]
-}
-
-## قواعد صارمة (Strict Rules)
-- **الأصالة:** أكد صراحةً في مكان مناسب أن العطر «أصلي 100%» من مصادر موثوقة عند التوريد من مهووس.
-- **الدقة:** لا تخترع مكونات؛ استند إلى المعرفة الموثوقة عن العطر وإن وُجد بحث، وإن لم تتوفر تفاصيل الهرم بدقة فاذكر ذلك باختصار وصِغ وصفاً حسياً عاماً دون تسمية مكونات وهمية.
-- **الجمهور:** لغة تناسب العميل السعودي والخليجي؛ ركز على فوحان وثبات وتميز.
-- لا تستخدم إيموجي في الوصف النهائي. الـ url_slug وtags باللاتينية/الإنجليزية حيث يلزم للـ SEO."""
-
 # ══ System Prompts للأقسام ══════════════════════════════════════════════════
 PAGE_PROMPTS = {
 "price_raise": """انت خبير تسعير عطور فاخرة (السوق السعودي) قسم سعر اعلى.
@@ -349,9 +260,8 @@ PAGE_PROMPTS = {
 سعرنا اقل من المنافس = فرصة ربح ضائعة. فرق<10 ابقاء | 10-50 رفع تدريجي | >50 رفع فوري.
 لكل منتج: 1.هل يمكن رفع السعر؟ 2.السعر الامثل. اجب بالعربية بايجاز.""",
 "approved": "انت خبير تسعير عطور. راجع المنتجات الموافق عليها وتاكد من استمرار صلاحيتها. اجب بالعربية.",
-"missing": """أكمل المهمة بناءً على المدخلات. التزم بهيكل الوصف وSEO في النظام أعلاه.""",
-"missing_analysis": """أنت مستشار تسعير واستيراد لمتجر مهووس. مهمتك تحليل قوائم المفقودات تشغيلياً (أولويات، ماركات، أسعار) وليس كتابة وصف منتج كامل.
-أجب بالعربية بشكل منظم وواضح. لا تكرر هيكل «خبير الوصف» الطويل.""",
+"missing": """انت خبير عطور فاخرة متخصص في المنتجات المفقودة بمتجر مهووس.
+لكل منتج: 1.هل هو حقيقي وموثوق؟ 2.هل يستحق الاضافة؟ 3.السعر المقترح. 4.اولوية الاضافة (عالية/متوسطة/منخفضة). اجب بالعربية.""",
 "review": """انت خبير تسعير عطور. هذه منتجات بمطابقة غير مؤكدة.
 لكل منتج: هل هما نفس العطر فعلا؟ نعم / لا / غير متاكد. اشرح السبب. اجب بالعربية.""",
 "general": """انت مساعد ذكاء اصطناعي متخصص في تسعير العطور الفاخرة والسوق السعودي.
@@ -384,12 +294,11 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     if grounding:
         payload["tools"] = [{"google_search": {}}]
 
-    keys = get_gemini_api_keys()
-    if not keys:
+    if not GEMINI_API_KEYS:
         _log_err("Gemini", "لا توجد مفاتيح API")
         return None
 
-    for i, key in enumerate(keys):
+    for i, key in enumerate(GEMINI_API_KEYS):
         if not key:
             continue
         try:
@@ -426,16 +335,25 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     return None
 
 def _call_openrouter(prompt, system=""):
-    or_key = get_openrouter_api_key()
-    if not or_key:
+    if not OPENROUTER_API_KEY:
         return None
+
+    # نماذج مجانية صحيحة (محدَّثة مارس 2026)
+    # نماذج مستقرة فقط — بدون النماذج التجريبية (exp)
+    FREE_MODELS = [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        "mistralai/mistral-7b-instruct:free",
+        "qwen/qwen-2.5-72b-instruct:free",
+        "google/gemma-3-27b-it:free",
+    ]
 
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
 
-    for model in OPENROUTER_FALLBACK_MODELS:
+    for model in FREE_MODELS:
         try:
             r = requests.post(_OR, json={
                 "model": model,
@@ -443,7 +361,7 @@ def _call_openrouter(prompt, system=""):
                 "temperature": 0.3,
                 "max_tokens": 8192
             }, headers={
-                "Authorization": f"Bearer {or_key}",
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "HTTP-Referer": "https://mahwous.com",
                 "X-Title": "Mahwous"
             }, timeout=45)
@@ -487,8 +405,7 @@ def _call_cohere(prompt, system=""):
     Cohere — Fallback صامت فقط.
     أي خطأ (401/402/429/...) يُسجَّل ويُعاد None بدون إيقاف سير العمل.
     """
-    ch_key = get_cohere_api_key()
-    if not ch_key:
+    if not COHERE_API_KEY:
         return None
     try:
         messages = []
@@ -499,7 +416,7 @@ def _call_cohere(prompt, system=""):
         r = requests.post(
             "https://api.cohere.com/v2/chat",
             json={"model": "command-r-plus", "messages": messages, "temperature": 0.3},
-            headers={"Authorization": f"Bearer {ch_key}",
+            headers={"Authorization": f"Bearer {COHERE_API_KEY}",
                      "Content-Type": "application/json"},
             timeout=30
         )
@@ -549,20 +466,13 @@ def _search_ddg(query, num_results=5):
                 if isinstance(rel, dict) and rel.get("Text"):
                     results.append({"snippet": rel.get("Text",""), "url": rel.get("FirstURL","")})
             return results
-    except Exception:
-        pass
+    except: pass
     return []
 
 def call_ai(prompt, page="general"):
-    # «missing» فقط = وصف منتج مفقود كامل + SEO (البرومبت الموحّد لخبير مهووس)
-    if page == "missing":
-        sys = f"{MISSING_PAGE_SYSTEM}\n\nتعليمات إضافية:\n{PAGE_PROMPTS.get('missing', '')}"
-    else:
-        sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
-    # بحث Google مع Gemini عند توليد وصف مفقود (مكونات موثوقة)
-    _miss_ground = page == "missing"
+    sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
     for fn, src in [
-        (lambda: _call_gemini(prompt, sys, grounding=_miss_ground), "Gemini"),
+        (lambda: _call_gemini(prompt, sys), "Gemini"),
         (lambda: _call_openrouter(prompt, sys), "OpenRouter"),
         (lambda: _call_cohere(prompt, sys), "Cohere")
     ]:
@@ -585,7 +495,7 @@ def gemini_chat(message, history=None, system_extra=""):
                "generationConfig":{"temperature":0.4,"maxOutputTokens":4096,"topP":0.9}}
     if needs_web:
         payload["tools"] = [{"google_search":{}}]
-    for key in get_gemini_api_keys():
+    for key in GEMINI_API_KEYS:
         if not key: continue
         try:
             r = requests.post(f"{_GU}?key={key}", json=payload, timeout=40)
@@ -1049,30 +959,6 @@ def check_duplicate(product_name, our_products):
     prompt = f"""هل العطر {product_name} موجود بشكل مشابه في هذه القائمة؟
 القائمة: {', '.join(str(p) for p in our_products[:30])}
 اجب: نعم (وذكر اقرب مطابقة) او لا مع السبب."""
-    return call_ai(prompt, "general")
-
-# ══ وصف مفقود — خبير مهووس (Gemini + البرومبت الموحّد) ═══════════════════════
-def generate_missing_product_description(
-    product_name: str,
-    *,
-    brand: str = "",
-    size_concentration: str = "",
-    competitor_price: float = 0.0,
-    competitor_name: str = "",
-    extra_context: str = "",
-) -> dict:
-    """
-    يولّد وصفاً كاملاً + JSON SEO عبر call_ai(page='missing') وMISSING_PAGE_SYSTEM.
-    """
-    prompt = f"""اكتب وصف المنتج المفقود التالي وفق النظام والهيكل المحددين.
-
-**الاسم:** {product_name}
-**الماركة:** {brand or "غير محدد"}
-**الحجم والتركيز:** {size_concentration or "استخرجه من الاسم إن أمكن"}
-**سعر مرجعي (منافس):** {competitor_price:.2f} ر.س إن وُجد
-**اسم المنافس:** {competitor_name or "—"}
-{f"**ملاحظات إضافية:** {extra_context}" if extra_context.strip() else ""}
-"""
     return call_ai(prompt, "missing")
 
 # ══ تحليل مجمع ════════════════════════════════════════════════════════════════

@@ -2,6 +2,7 @@
 styles.py - التصميم v20.0 — بطاقات محسنة + عرض المنافسين
 """
 from html import escape as _html_escape
+from textwrap import dedent
 
 
 def get_styles():
@@ -52,7 +53,8 @@ def get_main_css():
 /* ── بطاقة المنتج المفقود المحسنة ── */
 .miss-card{border-radius:10px;padding:14px;margin:6px 0;background:linear-gradient(135deg,#0a1628,#0e1a30)}
 .miss-card .miss-header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.miss-card .miss-info{flex:1}
+.miss-card .miss-info{flex:1;min-width:0}
+.miss-card .miss-thumb{flex-shrink:0}
 .miss-card .miss-name{font-weight:700;color:#4fc3f7;font-size:1rem}
 .miss-card .miss-meta{font-size:.75rem;color:#888;margin-top:4px}
 .miss-card .miss-prices{text-align:left;min-width:120px}
@@ -125,12 +127,12 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
     ou = str(our_img or "").strip()
     cu = str(comp_img or "").strip()
     our_img_html = (
-        f'<img src="{_html_escape(ou, quote=True)}" style="width:30px;height:30px;border-radius:4px;object-fit:cover;margin-bottom:4px;border:1px solid #6C63FF">'
+        f'<img src="{_html_escape(ou, quote=True)}" style="width:44px;height:44px;border-radius:6px;object-fit:cover;margin-bottom:6px;border:1px solid #6C63FF">'
         if ou and ou.lower() not in ("nan", "none")
         else ""
     )
     comp_img_html = (
-        f'<img src="{_html_escape(cu, quote=True)}" style="width:30px;height:30px;border-radius:4px;object-fit:cover;margin-bottom:4px;border:1px solid #ff9800">'
+        f'<img src="{_html_escape(cu, quote=True)}" style="width:44px;height:44px;border-radius:6px;object-fit:cover;margin-bottom:6px;border:1px solid #ff9800">'
         if cu and cu.lower() not in ("nan", "none")
         else ""
     )
@@ -141,16 +143,49 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
 </div><div style="text-align:center;background:#1A1A2E;padding:4px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:.9rem">الفرق: {diff:+.0f} ر.س</span></div>'''
 
 
-def comp_strip(all_comps):
-    """شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم واسم المنتج لديهم مرتبين من الأقل"""
-    if not all_comps or not isinstance(all_comps, list) or len(all_comps) == 0:
+def comp_strip(all_comps, our_price=None, rank_by_threat=False, show_threat_badge=False):
+    """شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم واسم المنتج لديهم.
+
+    - افتراضياً: ترتيب من **الأقل سعراً** (سلوك قديم).
+    - إذا ``rank_by_threat=True`` و``our_price`` > 0: ترتيب بـ **Threat Score** (WTI) عند توفر ``utils.threat_score``.
+    - يقبل ``list[dict]`` أو ``pandas.DataFrame`` (صفوف كمنافسين).
+    """
+    if all_comps is None:
         return ""
-    # ترتيب من الأقل سعراً
-    sorted_comps = sorted(all_comps, key=lambda c: float(c.get("price", 0) or 0))
+    try:
+        import pandas as pd
+
+        _has_pd = True
+    except ImportError:
+        pd = None
+        _has_pd = False
+    if _has_pd and isinstance(all_comps, pd.DataFrame):
+        if all_comps.empty:
+            return ""
+        work = all_comps.to_dict("records")
+    elif isinstance(all_comps, list):
+        if len(all_comps) == 0:
+            return ""
+        work = [dict(c) if isinstance(c, dict) else c for c in all_comps]
+    else:
+        return ""
+    if rank_by_threat and our_price is not None and float(our_price) > 0:
+        try:
+            from utils.threat_score import rank_competitors_for_ui
+
+            sorted_comps = rank_competitors_for_ui(work, float(our_price))
+        except Exception:
+            sorted_comps = sorted(
+                work, key=lambda c: float(c.get("price", c.get("comp_price", 0)) or 0)
+            )
+    else:
+        sorted_comps = sorted(
+            work, key=lambda c: float(c.get("price", c.get("comp_price", 0)) or 0)
+        )
     rows = []
     for i, cm in enumerate(sorted_comps):
         c_store = str(cm.get("competitor", "")).strip()
-        c_price = float(cm.get("price", 0) or 0)
+        c_price = float(cm.get("price", cm.get("comp_price", 0)) or 0)
         c_pname = str(cm.get("name", "")).strip()
         c_score = float(cm.get("score", 0) or 0)
         c_img = str(cm.get("image_url", "") or cm.get("image", "") or "").strip()
@@ -162,10 +197,20 @@ def comp_strip(all_comps):
         # اسم المنتج لدى المنافس (مختصر)
         short_pname = c_pname[:50] + ".." if len(c_pname) > 50 else c_pname
         score_html = f'<span style="color:#888;font-size:.62rem">{c_score:.0f}%</span>' if c_score > 0 else ""
+        threat_html = ""
+        if show_threat_badge and cm.get("threat_score") is not None:
+            try:
+                ts = float(cm["threat_score"])
+                threat_html = (
+                    f'<span style="color:#ff8a80;font-size:.58rem;margin-inline-start:4px" '
+                    f'title="Threat Score">⚡{ts:.1f}</span>'
+                )
+            except (TypeError, ValueError):
+                threat_html = ""
         img_html = (
             f'<img src="{_html_escape(c_img, quote=True)}" '
-            f'style="width:38px;height:38px;border-radius:8px;object-fit:cover;'
-            f'border:1px solid {border};background:#0e1628;flex:0 0 38px" '
+            f'style="width:50px;height:50px;border-radius:10px;object-fit:cover;'
+            f'border:1px solid {border};background:#0e1628;flex:0 0 50px" '
             f'onerror="this.style.display=\'none\'" />'
             if c_img and c_img.lower() not in ("nan", "none")
             else ""
@@ -179,7 +224,7 @@ def comp_strip(all_comps):
             f'<span style="font-weight:900;font-size:.8rem">{crown}</span>'
             f'<span style="font-weight:700;color:{name_color};font-size:.75rem;white-space:nowrap">{c_store}</span>'
             f'<span style="color:#aaa;font-size:.7rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px" title="{c_pname}">{short_pname}</span>'
-            f'{score_html}'
+            f'{score_html}{threat_html}'
             f'</div>'
             f'<span style="font-weight:900;color:{"#ff9800" if is_leader else "#9e9eff"};font-size:.85rem;white-space:nowrap">{c_price:,.0f} ر.س</span>'
             f'</div>'
@@ -189,15 +234,14 @@ def comp_strip(all_comps):
 
 def miss_card(name, price, brand, size, ptype, comp, suggested_price,
               note="", variant_html="", tester_badge="", border_color="#007bff44",
-              confidence_level="green", confidence_score=0, product_id=""):
-    """بطاقة المنتج المفقود المحسنة — أنيقة وواضحة مع عرض الكود"""
+              confidence_level="green", confidence_score=0, image_url=""):
+    """بطاقة المنتج المفقود — HTML بدون مسافات بادئة (تجنب تفسير Markdown ككتلة كود)."""
     safe_name = _html_escape(str(name or ""))
     safe_brand = _html_escape(str(brand or "—"))
     safe_size = _html_escape(str(size or "—"))
     safe_ptype = _html_escape(str(ptype or "—"))
     safe_comp = _html_escape(str(comp or "—"))
     safe_note = _html_escape(str(note or ""))
-    # شارة الثقة
     trust_map = {
         "green":  ("trust-green",  "مؤكد"),
         "yellow": ("trust-yellow", "محتمل"),
@@ -208,29 +252,30 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
 
     note_html = f'<div style="font-size:.72rem;color:#ff9800;margin-top:4px">{safe_note}</div>' if safe_note and "⚠️" in safe_note else ""
 
-    # عرض الكود/المعرف إذا موجود
-    pid_html = ""
-    if product_id and str(product_id).strip() and str(product_id) not in ("", "nan", "None", "0"):
-        safe_pid = _html_escape(str(product_id))
-        pid_html = f'<span style="font-size:.7rem;padding:2px 8px;border-radius:8px;background:#1a237e44;color:#90caf9;margin-right:6px;font-family:monospace;letter-spacing:1px">📌 {safe_pid}</span>'
+    u = str(image_url or "").strip()
+    img_html = ""
+    if u.lower().startswith("http"):
+        eu = _html_escape(u, quote=True)
+        img_html = (
+            f'<div class="miss-thumb"><img src="{eu}" alt="" '
+            'style="width:76px;height:76px;border-radius:10px;object-fit:cover;'
+            'border:1px solid #444466;background:#0e1628" loading="lazy" '
+            'referrerpolicy="no-referrer" onerror="this.style.display=\'none\'" /></div>'
+        )
 
-    return f"""
-    <div class="miss-card" style="border:1px solid {border_color}">
-      <div class="miss-header">
-        <div class="miss-info">
-          <div class="miss-name">
-            {trust_html}{tester_badge}{pid_html}{safe_name}
-          </div>
-          <div class="miss-meta">
-            🏷️ {safe_brand} &nbsp;|&nbsp; 📏 {safe_size} &nbsp;|&nbsp;
-            🧴 {safe_ptype} &nbsp;|&nbsp; 🏪 {safe_comp}
-          </div>
-          {variant_html}
-          {note_html}
-        </div>
-        <div class="miss-prices">
-          <div class="miss-comp-price">{price:,.0f} ر.س</div>
-          <div class="miss-suggested">مقترح: {suggested_price:,.0f} ر.س</div>
-        </div>
-      </div>
-    </div>"""
+    inner = f"""<div class="miss-card" style="border:1px solid {border_color};margin:8px 0;border-radius:10px;padding:12px;background:linear-gradient(135deg,#0a1628,#0e1a30)">
+<div style="display:flex;gap:14px;align-items:flex-start;direction:rtl;flex-wrap:wrap">
+{img_html}
+<div style="flex:1;min-width:0">
+<div class="miss-name" style="font-weight:700;color:#4fc3f7;font-size:1rem;line-height:1.35">{trust_html}{tester_badge}{safe_name}</div>
+<div class="miss-meta" style="font-size:.75rem;color:#888;margin-top:6px;line-height:1.5">🏷️ {safe_brand} &nbsp;|&nbsp; 📏 {safe_size} &nbsp;|&nbsp; 🧴 {safe_ptype} &nbsp;|&nbsp; 🏪 {safe_comp}</div>
+{variant_html}
+{note_html}
+</div>
+<div class="miss-prices" style="text-align:left;min-width:108px;flex-shrink:0">
+<div class="miss-comp-price" style="font-size:1.15rem;font-weight:900;color:#ff9800">{price:,.0f} ر.س</div>
+<div class="miss-suggested" style="font-size:.72rem;color:#4caf50;margin-top:4px">مقترح: {suggested_price:,.0f} ر.س</div>
+</div>
+</div>
+</div>"""
+    return dedent(inner).strip()

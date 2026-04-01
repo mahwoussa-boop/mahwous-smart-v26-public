@@ -2,8 +2,21 @@ streamlit>=1.30.0
 pandas>=2.0.0
 openpyxl>=3.1.0
 rapidfuzz>=3.0.0
+orjson>=3.9.0
 requests>=2.31.0
 curl-cffi>=0.7.0
+# كاشط سلة مستقل: mahwous_ultimate_scraper.py
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+aiofiles>=23.2.0
 playwright>=1.49.0
 plotly>=5.18.0
 streamlit-autorefresh>=1.0.1
+httpx>=0.27.0
+uvloop>=0.19.0; sys_platform != "win32"
+# Hyper pipeline prototype (engines/hyper_pipeline.py) — DOM سريع اختياري
+selectolax>=0.3.21
+# عند ربط FAISS/Polars فعلياً، أزل التعليق أو استخدم extras منفصلة (حجم تثبيت كبير على Railway)
+# faiss-cpu>=1.8.0
+# sentence-transformers>=2.6.0
+# polars>=0.20.19

@@ -25,14 +25,8 @@ from typing import List, Dict, Any, Optional
 def _get_webhook_url(key: str, default: str) -> str:
     return os.environ.get(key, "") or default
 
-WEBHOOK_UPDATE_PRICES = _get_webhook_url(
-    "WEBHOOK_UPDATE_PRICES",
-    "https://hook.eu2.make.com/8jia6gc7s1cpkeg6catlrvwck768sbfk"
-)
-WEBHOOK_NEW_PRODUCTS = _get_webhook_url(
-    "WEBHOOK_NEW_PRODUCTS",
-    "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
-)
+WEBHOOK_UPDATE_PRICES = _get_webhook_url("WEBHOOK_UPDATE_PRICES", "")
+WEBHOOK_NEW_PRODUCTS = _get_webhook_url("WEBHOOK_NEW_PRODUCTS", "")
 
 TIMEOUT = 15  # ثانية
 
