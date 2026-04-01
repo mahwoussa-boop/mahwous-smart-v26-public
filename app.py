@@ -36,6 +36,8 @@ from async_scraper import (
     read_scraper_bg_state,
     run_scraper_sync,
     _load_sitemap_seeds,
+    load_checkpoint_rows_if_any,
+    get_scraper_sitemap_seeds,
 )
 from sitemap_resolve import resolve_store_to_sitemap_url
 
@@ -52,7 +54,7 @@ from styles import get_styles, stat_card, vs_card, comp_strip, miss_card, get_si
 from engines.engine import (read_file, run_full_analysis, find_missing_products,
                              extract_brand, extract_size, extract_type, is_sample,
                              smart_missing_barrier)
-from engines.mahwous_core import validate_export_product_dataframe
+from engines.mahwous_core import ensure_export_brands, validate_export_product_dataframe
 from engines.ai_engine import (call_ai, gemini_chat, chat_with_ai,
                                 verify_match, analyze_product,
                                 bulk_verify, suggest_price,
@@ -94,6 +96,27 @@ def _ui_autorefresh_interval(ms_default: int) -> int:
     if v.isdigit():
         return max(2500, int(v))
     return ms_default
+
+
+def _scrape_live_snapshot_min_interval_sec(total_urls: int) -> float:
+    """
+    أقل فاصل بين كتابات لقطة الكشط الحية — يمنع قراءة/كتابة JSON آلاف المرات.
+    يُعدّل عبر MAHWOUS_SCRAPE_UI_MIN_INTERVAL_SEC (ثوانٍ).
+    """
+    env = (os.environ.get("MAHWOUS_SCRAPE_UI_MIN_INTERVAL_SEC") or "").strip()
+    if env:
+        try:
+            return max(0.2, float(env.replace(",", ".")))
+        except ValueError:
+            pass
+    t = int(total_urls or 0)
+    if t > 1200:
+        return 1.8
+    if t > 600:
+        return 1.45
+    if t > 250:
+        return 0.95
+    return 0.5
 
 
 def _format_elapsed_compact(sec: float | int) -> str:
@@ -148,10 +171,36 @@ _defaults = {
     "scrape_preset_selection": [],  # أسماء منافسين من preset_competitors.json
     "brands_df": None,   # من data/brands.csv — إثراء المفقودات
     "categories_df": None,  # من data/categories.csv
+    "legacy_tools_mode": False,  # أدوات v11 المعزولة (legacy_tools_dashboard)
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+def _ensure_make_webhooks_session():
+    """
+    مزامنة روابط Make: Secrets/البيئة → جلسة Streamlit → os.environ
+    (يستخدمها utils/make_helper عند الإرسال).
+    • WEBHOOK_UPDATE_PRICES → تعديل أسعار (🔴 أعلى 🟢 أقل ✅ موافق)
+    • WEBHOOK_MISSING_PRODUCTS → مفقودات فقط (سيناريو أتمتة التسعير)
+    """
+    if "WEBHOOK_UPDATE_PRICES" not in st.session_state:
+        st.session_state["WEBHOOK_UPDATE_PRICES"] = get_webhook_update_prices()
+    if "WEBHOOK_MISSING_PRODUCTS" not in st.session_state:
+        if st.session_state.get("WEBHOOK_NEW_PRODUCTS"):
+            st.session_state["WEBHOOK_MISSING_PRODUCTS"] = st.session_state["WEBHOOK_NEW_PRODUCTS"]
+        else:
+            st.session_state["WEBHOOK_MISSING_PRODUCTS"] = get_webhook_missing_products()
+    os.environ["WEBHOOK_UPDATE_PRICES"] = (
+        st.session_state.get("WEBHOOK_UPDATE_PRICES") or ""
+    ).strip()
+    _miss = (st.session_state.get("WEBHOOK_MISSING_PRODUCTS") or "").strip()
+    os.environ["WEBHOOK_MISSING_PRODUCTS"] = _miss
+    os.environ["WEBHOOK_NEW_PRODUCTS"] = _miss
+
+
+_ensure_make_webhooks_session()
 
 
 def _enrich_missing_df(missing_df: pd.DataFrame) -> pd.DataFrame:
@@ -292,8 +341,8 @@ def _infer_api_diag_summary(diag: dict) -> dict:
         out["cohere"] = "absent"
     else:
         out["cohere"] = _classify_provider_line(diag.get("cohere", ""))
-    out["wh_price"] = "ok" if WEBHOOK_UPDATE_PRICES else "absent"
-    out["wh_new"] = "ok" if WEBHOOK_NEW_PRODUCTS else "absent"
+    out["wh_price"] = "ok" if get_webhook_update_prices() else "absent"
+    out["wh_new"] = "ok" if get_webhook_missing_products() else "absent"
     return out
 
 
@@ -303,8 +352,8 @@ def _presence_api_summary() -> dict:
         "gemini": "ok" if get_gemini_api_keys() else "absent",
         "openrouter": "ok" if get_openrouter_api_key() else "absent",
         "cohere": "ok" if get_cohere_api_key() else "absent",
-        "wh_price": "ok" if WEBHOOK_UPDATE_PRICES else "absent",
-        "wh_new": "ok" if WEBHOOK_NEW_PRODUCTS else "absent",
+        "wh_price": "ok" if get_webhook_update_prices() else "absent",
+        "wh_new": "ok" if get_webhook_missing_products() else "absent",
     }
 
 
@@ -317,7 +366,7 @@ def _merged_api_summary() -> dict:
 
 def _api_badges_html() -> str:
     m = _merged_api_summary()
-    wh_has = bool(WEBHOOK_UPDATE_PRICES or WEBHOOK_NEW_PRODUCTS)
+    wh_has = bool(get_webhook_update_prices() or get_webhook_missing_products())
     wh_st = "ok" if wh_has else "absent"
     items = [
         ("✨", "Gemini", m.get("gemini", "unknown")),
@@ -1115,6 +1164,105 @@ def _render_live_scrape_dashboard(snap: dict):
     )
 
 
+def _infer_comp_key_for_checkpoint_recovery() -> str:
+    """يستنتج مفتاح المنافس كما في بدء الكشط — متجر واحد يحترم اسم العرض."""
+    seeds = get_scraper_sitemap_seeds()
+    if not seeds:
+        return "Scraped_Competitor"
+    user_label = str(st.session_state.get("competitor_display_name") or "").strip()
+    return _comp_key_for_queue_entry(seeds[0], user_label, len(seeds) <= 1)
+
+
+def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
+    """زر طوارئ واحد: فرز من `data/scraper_checkpoint.json` عند توقف الكشط دون ضياع الصفوف المحفوظة."""
+    try:
+        ck_rows = load_checkpoint_rows_if_any()
+    except Exception:
+        ck_rows = []
+
+    busy = bool(snap_live.get("running")) and not bool(snap_live.get("done"))
+    n_ck = len(ck_rows)
+
+    if n_ck == 0:
+        return
+
+    with st.container(border=True):
+        st.markdown("#### 🛟 طوارئ — فرز من نقطة الحفظ")
+        st.caption(
+            "إذا توقف الكشط قبل اكتمال التحليل، يُفرز **ما حُفظ في نقطة الاستعادة** بنفس محرك المطابقة. "
+            "يُشترط أن تطابق خرائط المواقع الحالية (`data/competitors_list.json`) جلسة الكشط التي أنتجت الملف."
+        )
+        if n_ck:
+            st.caption(f"📦 **{n_ck:,}** صف في نقطة الحفظ (`data/scraper_checkpoint.json`).")
+        else:
+            st.caption(
+                "📭 لا توجد صفوف مطابقة لخرائط المواقع الحالية، أو لا يوجد ملف نقطة حفظ."
+            )
+
+        if busy:
+            st.caption("⏳ الكشط يعمل — الزر معطّل حتى يتوقف المسار.")
+
+        do_recover = st.button(
+            "⚙️ فرز ما تم كشطه الآن (من نقطة الحفظ)",
+            key="btn_checkpoint_force_recovery",
+            disabled=busy or n_ck == 0,
+            help="معطّل أثناء الكشط. يحتاج كتالوجاً محفوظاً وصفوفاً في نقطة الحفظ المطابقة للخرائط.",
+            use_container_width=True,
+        )
+
+        if not do_recover:
+            return
+
+        try:
+            our_path = os.path.join("data", "mahwous_catalog.csv")
+            if not os.path.isfile(our_path):
+                st.error("❌ لا يوجد `data/mahwous_catalog.csv` — ارفع الكتالوج أولاً.")
+                return
+            our_df = pd.read_csv(our_path)
+            if our_df.empty:
+                st.error("❌ كتالوج منتجاتنا فارغ.")
+                return
+            st.session_state.our_df = our_df
+
+            comp_key = _infer_comp_key_for_checkpoint_recovery()
+            cdf = pd.DataFrame(ck_rows)
+            comp_dfs = merged_comp_dfs_for_analysis(comp_key, cdf)
+
+            with st.spinner("جاري الفرز والمطابقة — قد يستغرق وقتاً…"):
+                analysis_df = run_full_analysis(
+                    our_df,
+                    comp_dfs,
+                    progress_callback=None,
+                    use_ai=True,
+                )
+                try:
+                    apply_gemini_reclassify_to_analysis_df(analysis_df)
+                except Exception:
+                    pass
+                r = _split_results(analysis_df)
+                missing_df = pd.DataFrame()
+                try:
+                    raw_m = find_missing_products(our_df, comp_dfs)
+                    missing_df = smart_missing_barrier(raw_m, our_df)
+                    missing_df = _enrich_missing_df(missing_df)
+                except Exception:
+                    missing_df = pd.DataFrame()
+                r["missing"] = missing_df
+
+                st.session_state.results = r
+                st.session_state.analysis_df = analysis_df
+                st.session_state.comp_dfs = comp_dfs
+
+            _focus_sidebar_on_analysis_results(r)
+            db_log("upload", "checkpoint_recovery", f"rows={n_ck} comp={comp_key[:80]}")
+            st.success(
+                f"✅ تم فرز **{n_ck:,}** صف من نقطة الحفظ — راجع الأقسام في الشريط الجانبي."
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ تعذر الفرز من نقطة الحفظ: {e}")
+
+
 def _run_scrape_chain_background():
     """كشط في الخيط: طابور متاجر بالتسلسل، ثم تحليل يشمل جميع المنافسين في الكتالوج."""
     try:
@@ -1238,29 +1386,32 @@ def _run_scrape_chain_background():
             ppm = 0.0
             if elapsed > 2.0 and current > 0:
                 urls_pm = (float(current) / elapsed) * 60.0
-            try:
-                _snap_r = _read_scrape_live_snapshot()
-                sr = int((_snap_r.get("analysis") or {}).get("scraped_rows") or 0)
-                if elapsed > 2.0 and sr > 0:
-                    ppm = (float(sr) / elapsed) * 60.0
-            except Exception:
-                pass
             span = 1.0 / max(_ts, 1)
             base = _si / max(_ts, 1)
             pct = base + span * (current / max(total, 1))
             nm = (last_name or "")[:80]
             lbl = f"🏪 متجر {_si + 1}/{_ts} | 🕸️ {current}/{total} | {nm}"
-            if scrape_bg:
-                if now - _last_merge[0] >= 1.2 or current >= total:
-                    _last_merge[0] = now
-                    merge_scraper_bg_state(
-                        progress=min(pct, 0.998),
-                        message=lbl[:220],
-                        elapsed_sec=elapsed_i,
-                        urls_per_min=round(urls_pm, 1),
-                        products_per_min=round(ppm, 1),
-                    )
-            if now - _last_live[0] >= 0.35 or current >= total:
+            live_iv = _scrape_live_snapshot_min_interval_sec(int(total or 0))
+            need_live = (now - _last_live[0] >= live_iv) or (current >= total)
+            need_bg = scrape_bg and ((now - _last_merge[0] >= 1.35) or (current >= total))
+            if need_live or need_bg:
+                try:
+                    _snap_r = _read_scrape_live_snapshot()
+                    sr = int((_snap_r.get("analysis") or {}).get("scraped_rows") or 0)
+                    if elapsed > 2.0 and sr > 0:
+                        ppm = (float(sr) / elapsed) * 60.0
+                except Exception:
+                    pass
+            if need_bg:
+                _last_merge[0] = now
+                merge_scraper_bg_state(
+                    progress=min(pct, 0.998),
+                    message=lbl[:220],
+                    elapsed_sec=elapsed_i,
+                    urls_per_min=round(urls_pm, 1),
+                    products_per_min=round(ppm, 1),
+                )
+            if need_live:
                 _last_live[0] = now
                 _merge_scrape_live_snapshot(
                     scrape={
@@ -1525,6 +1676,10 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
             st.session_state.decisions_pending = {}
             st.rerun()
 
+    st.caption(
+        "📤 أزرار Make في هذا الجدول تُرسل إلى **تعديل الأسعار** (🔴 أعلى / 🟢 أقل / ✅ موافق) — "
+        "وليس إلى سيناريو المفقودات."
+    )
     st.caption(f"عرض {len(filtered)} من {len(df)} منتج — {datetime.now().strftime('%H:%M:%S')}")
 
     # ── Pagination ─────────────────────────────
@@ -2113,6 +2268,11 @@ with st.sidebar:
                     )
                 st.session_state.job_running = False
 
+    st.markdown("---")
+    if st.button("🛠️ التدقيق والتحسين", key="nav_legacy_tools", use_container_width=True):
+        st.session_state.legacy_tools_mode = True
+        st.rerun()
+
     page = st.radio(
         "الأقسام",
         SECTIONS,
@@ -2151,6 +2311,16 @@ with st.sidebar:
                     f'border-radius:6px;padding:6px;text-align:center;color:#FF1744;'
                     f'font-size:.8rem">📦 {pending_cnt} قرار معلق</div>',
                     unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════
+#  أدوات v11 المعزولة (مقارنة / مدقق متجر / SEO) — legacy_core + legacy_tools_dashboard
+# ════════════════════════════════════════════════
+if st.session_state.get("legacy_tools_mode"):
+    from legacy_tools_dashboard import render_legacy_dashboard
+
+    render_legacy_dashboard()
+    st.stop()
 
 
 # ════════════════════════════════════════════════
@@ -2217,6 +2387,9 @@ if page == "📊 لوحة التحكم":
                     data=excel_all, file_name="mahwous_all.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         with cc2:
+            st.caption(
+                "الدفعات: 🔴🟢✅ → تعديل أسعار؛ 🔍 مفقودة → Webhook المفقودات (أتمتة التسعير)."
+            )
             if st.button("📤 إرسال كل شيء لـ Make (دفعات ذكية)"):
                 _prog_all = st.progress(0, text="جاري الإرسال...")
                 _status_all = st.empty()
@@ -2297,6 +2470,7 @@ elif page == "📂 رفع الملفات":
 
     st.header("🕸️ كشط الويب والتحليل")
     db_log("upload", "view")
+    _render_checkpoint_recovery_panel(_snap_live)
     our_path = os.path.join("data", "mahwous_catalog.csv")
 
     # اظهر رافع الكتالوج دائماً حتى تتمكن الاختبارات/المستخدم من رفع الملف دون الدخول في مسار البدء.
@@ -2598,6 +2772,21 @@ elif page == "📂 رفع الملفات":
 
 
 # ════════════════════════════════════════════════
+#  2b. منتج سريع — صف واحد لاستيراد سلة
+# ════════════════════════════════════════════════
+elif page == "➕ منتج سريع":
+    st.header("➕ منتج سريع")
+    st.caption(
+        "إضافة صف واحد بصيغة **بيانات المنتج** لسلة (40 عموداً كما في `export_missing_products_to_salla_csv_bytes`). "
+        "التحقق عبر `validate_export_product_dataframe` في `mahwous_core`."
+    )
+    db_log("quick_add", "view")
+    from utils.quick_add import render_quick_add_tab
+
+    render_quick_add_tab()
+
+
+# ════════════════════════════════════════════════
 #  3. سعر أعلى
 # ════════════════════════════════════════════════
 elif page == "🔴 سعر أعلى":
@@ -2775,6 +2964,8 @@ elif page == "🔍 منتجات مفقودة":
                 _before_n = len(_export_df)
                 _export_df = _export_df[pd.to_numeric(_export_df["سعر_المنافس"], errors="coerce").fillna(0) > 0]
                 _dropped_zero = max(0, _before_n - len(_export_df))
+            # ملء الماركة الفارغة (استيراد سلة يتطلب عموداً غير فارغ)
+            _export_df = ensure_export_brands(_export_df)
             _export_ok, _export_issues = validate_export_product_dataframe(_export_df)
             if _dropped_zero > 0:
                 st.info(f"ℹ️ تم استبعاد {_dropped_zero} صف بسعر منافس غير صالح (<= 0) من التصدير فقط.")
@@ -2858,6 +3049,10 @@ elif page == "🔍 منتجات مفقودة":
                     st.caption("🛒 سلة — يتطلب بيانات صالحة")
             with cc4:
                 # ── خيارات الإرسال الذكي ─────────────────────────────
+                st.caption(
+                    f"📎 Webhook المفقودات = سيناريو [أتمتة التسعير]({MAKE_DOCS_SCENARIO_PRICING_AUTOMATION}) "
+                    "(ليس سيناريو تعديل الأسعار 🔴🟢✅)."
+                )
                 _conf_opts = {"🟢 مؤكدة فقط": "green", "🟡 محتملة": "yellow", "🔵 الكل": ""}
                 _conf_sel = st.selectbox("مستوى الثقة", list(_conf_opts.keys()), key="miss_conf_sel")
                 _conf_val = _conf_opts[_conf_sel]
@@ -2899,6 +3094,10 @@ elif page == "🔍 منتجات مفقودة":
                                     st.caption(f"• {_en}")
 
             st.caption(f"{len(filtered)} منتج — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            st.caption(
+                "📤 «إرسال Make» في كل بطاقة أدناه يذهب إلى **مفقودات** (سيناريو أتمتة التسعير) — "
+                "وليس إلى تعديل أسعار 🔴🟢✅."
+            )
 
             # ── عرض المنتجات ──────────────────────────────────────────────
             PAGE_SIZE = 20
@@ -3832,6 +4031,10 @@ elif page == "🤖 الذكاء الصناعي":
 elif page == "⚡ أتمتة Make":
     st.header("⚡ أتمتة Make.com")
     db_log("make", "view")
+    st.caption(
+        "**تعديل أسعار** (🔴 أعلى 🟢 أقل ✅ موافق) ← `WEBHOOK_UPDATE_PRICES`. "
+        "**مفقودات** ← `WEBHOOK_MISSING_PRODUCTS` (سيناريو أتمتة التسعير فقط)."
+    )
 
     tab1, tab2, tab3 = st.tabs(["🔗 حالة الاتصال", "📤 إرسال", "📦 القرارات المعلقة"])
 
@@ -3839,10 +4042,15 @@ elif page == "⚡ أتمتة Make":
         if st.button("🔍 فحص الاتصال"):
             with st.spinner("..."):
                 results = verify_webhook_connection()
+                _wh_labels = {
+                    "update_prices": "تعديل الأسعار (🔴🟢✅)",
+                    "new_products": "مفقودات / أتمتة التسعير",
+                }
                 for name, r in results.items():
                     if name != "all_connected":
                         color = "🟢" if r["success"] else "🔴"
-                        st.markdown(f"{color} **{name}:** {r['message']}")
+                        _lbl = _wh_labels.get(name, name)
+                        st.markdown(f"{color} **{_lbl}:** {r['message']}")
                 if results.get("all_connected"):
                     st.success("✅ جميع الاتصالات تعمل")
 
@@ -3919,7 +4127,7 @@ elif page == "⚙️ الإعدادات":
     st.header("⚙️ الإعدادات")
     db_log("settings", "view")
 
-    tab1, tab2, tab3 = st.tabs(["🔑 المفاتيح", "⚙️ المطابقة", "📜 السجل"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🔑 المفاتيح", "⚙️ المطابقة", "📜 السجل", "🏷️ صف ماركة جديدة"])
 
     with tab1:
         # ── الحالة الحالية ────────────────────────────────────────────────
@@ -3937,8 +4145,8 @@ elif page == "⚙️ الإعدادات":
             _settings_api_card_html("Cohere", "◎", _ms.get("cohere", "unknown")),
             unsafe_allow_html=True,
         )
-        _whp = "ok" if WEBHOOK_UPDATE_PRICES else "absent"
-        _whn = "ok" if WEBHOOK_NEW_PRODUCTS else "absent"
+        _whp = "ok" if get_webhook_update_prices() else "absent"
+        _whn = "ok" if get_webhook_missing_products() else "absent"
         _wh = "ok" if (_whp == "ok" or _whn == "ok") else "absent"
         st.markdown(
             _settings_api_card_html("Make.com (Webhooks)", "🔗", _wh),
@@ -3948,6 +4156,37 @@ elif page == "⚙️ الإعدادات":
             "بعد «تشخيص شامل» تظهر هنا **فاتورة/رصيد منتهٍ (402)** و**تجاوز حد (429)** بألوان مميزة. "
             "بدون تشخيص: يُعرض وجود المفتاح فقط."
         )
+
+        with st.expander("🔗 ربط Make.com — لصق روابط الـ Webhook (ليس رابط المشاركة العامة)", expanded=False):
+            st.markdown(
+                f"**أ)** **تعديل أسعار المنتجات الموجودة** — 🔴 سعر أعلى، 🟢 سعر أقل، ✅ موافق عليها فقط. "
+                f"سيناريو مرجعي: [Integration Webhooks, Salla]({MAKE_DOCS_SCENARIO_UPDATE_PRICES})"
+            )
+            st.markdown(
+                f"**ب)** **قسم المفقودات فقط** (القسم + بطاقة كل منتج مفقود). "
+                f"سيناريو: [mahwous-pricing-automation-salla]({MAKE_DOCS_SCENARIO_PRICING_AUTOMATION})"
+            )
+            st.caption(
+                "في Make: استنسخ السيناريو → **Custom Webhook** → انسخ `https://hook...` وليس رابط المشاركة. "
+                "للإنتاج: `WEBHOOK_UPDATE_PRICES` و `WEBHOOK_MISSING_PRODUCTS` في Railway أو Secrets. "
+                "المتغير القديم `WEBHOOK_NEW_PRODUCTS` ما زال يعمل كاحتياط لنفس رابط **ب**."
+            )
+            st.text_input(
+                "WEBHOOK_UPDATE_PRICES — 🔴🟢✅ تعديل الأسعار",
+                placeholder="https://hook.eu2.make.com/...",
+                key="WEBHOOK_UPDATE_PRICES",
+                help="يُستخدم لإرسال {\"products\": [...]} من أقسام سعر أعلى / أقل / موافق فقط.",
+            )
+            st.text_input(
+                "WEBHOOK_MISSING_PRODUCTS — 🔍 مفقودات فقط (أتمتة التسعير)",
+                placeholder="https://hook.eu2.make.com/...",
+                key="WEBHOOK_MISSING_PRODUCTS",
+                help="يُستخدم لقسم المفقودات وبطاقات الإرسال إلى Make فقط — Payload {\"data\": [...]}.",
+            )
+            if st.button("🔄 مزامنة الروابط مع الإرسال الآن", key="btn_sync_make_webhooks"):
+                _ensure_make_webhooks_session()
+                st.success("تمت المزامنة — شريط «🔗 Make» في الشريط الجانبي يتحدّث بعد إعادة التحميل.")
+                st.rerun()
 
         st.markdown("---")
 
@@ -4067,6 +4306,111 @@ elif page == "⚙️ الإعدادات":
             }).head(200), use_container_width=True)
         else:
             st.info("لا توجد قرارات مسجلة")
+
+    with tab4:
+        from engines.reference_data import BRANDS_CSV
+        from engines.brand_row_builder import (
+            ai_fill_brand_seo_fields,
+            brand_row_to_csv_bytes,
+            build_brand_row,
+            load_brands_csv_columns,
+            slugify_seo_latin,
+            suggest_logo_urls,
+        )
+
+        st.subheader("🏷️ تجهيز صف ماركة لـ brands.csv")
+        st.caption(
+            "عندما لا توجد الماركة في `data/brands.csv`، ولّد صفاً بنفس أعمدة الملف، وادمجها يدوياً أو عبر استيراد سلة. "
+            "جلب الشعار: يُقترح رابط Clearbit أو أيقونة Google فقط عند إدخال **نطاق** الموقع (بدون API)."
+        )
+        _bcols = load_brands_csv_columns(BRANDS_CSV)
+        st.caption(f"الأعمدة المقروءة من الملف: {len(_bcols)} عموداً.")
+
+        _bn = st.text_input(
+            "اسم الماركة (عربي | English)",
+            placeholder='مثال: دار عطر جديدة | New House',
+            key="new_brand_name_bilingual",
+        )
+        _ben = st.text_input(
+            "مقطع SEO بالإنجليزية (اختياري — للعمود رابط الصفحة)",
+            placeholder="new-house",
+            key="new_brand_name_en_slug",
+        )
+        _dom = st.text_input(
+            "موقع الماركة (نطاق أو رابط) لاقتراح شعار",
+            placeholder="example.com",
+            key="new_brand_domain",
+        )
+        _logo_manual = st.text_input(
+            "أو الصق رابط شعار جاهز (CDN)",
+            placeholder="https://...",
+            key="new_brand_logo_url",
+        )
+        _use_ai = st.checkbox(
+            "تعبئة الوصف وعنوان الصفحة ووصف الميتا بالذكاء الاصطناعي",
+            value=False,
+            key="new_brand_use_ai",
+        )
+
+        if st.button("🧩 تجميع صف ماركة", key="new_brand_build_btn"):
+            if not (_bn or "").strip():
+                st.warning("أدخل اسم الماركة أولاً.")
+            else:
+                _logo = (_logo_manual or "").strip()
+                if not _logo and (_dom or "").strip():
+                    _cands = suggest_logo_urls(_dom)
+                    _logo = _cands[0] if _cands else ""
+                    if _cands:
+                        st.info(f"مقترح شعار (جرّب الرابط؛ إن فشل استخدم البديل أو الصق رابطاً): `{_cands[0]}`")
+                        if len(_cands) > 1:
+                            st.caption(f"بديل: {_cands[1]}")
+
+                _slug = (_ben or "").strip()
+                if not _slug:
+                    _part = _bn.split("|")[-1].strip() if "|" in _bn else _bn
+                    _slug = slugify_seo_latin(_part)
+
+                _short = ""
+                _title = ""
+                _pdesc = ""
+                if _use_ai:
+                    with st.spinner("جاري طلب الذكاء الاصطناعي…"):
+                        _ai = ai_fill_brand_seo_fields(_bn.strip())
+                    _short = _ai.get("وصف مختصر عن الماركة", "")
+                    _title = _ai.get("(Page Title) عنوان صفحة العلامة التجارية", "")
+                    _pdesc = _ai.get("(Page Description) وصف صفحة العلامة التجارية", "")
+                    if not _ai:
+                        st.warning("لم يُرجع AI حقولاً — املأ الوصف يدوياً أو جرّب لاحقاً.")
+
+                if not _title:
+                    _title = f"{_bn.split('|')[0].strip()} | عطور فاخرة — مهووس"[:120]
+
+                _row = build_brand_row(
+                    name_bilingual=_bn.strip(),
+                    short_description=_short,
+                    logo_url=_logo,
+                    banner_url="",
+                    page_title=_title,
+                    seo_slug_latin=_slug,
+                    page_description=_pdesc,
+                    columns=_bcols,
+                )
+                st.session_state["new_brand_row_preview"] = _row
+                st.session_state["new_brand_row_cols"] = _bcols
+
+        _prev = st.session_state.get("new_brand_row_preview")
+        _pcols = st.session_state.get("new_brand_row_cols")
+        if _prev and isinstance(_prev, dict) and _pcols:
+            st.dataframe(pd.DataFrame([_prev]), use_container_width=True)
+            _blob = brand_row_to_csv_bytes(_pcols, _prev)
+            st.download_button(
+                "📥 تحميل صف ماركة (CSV لدمج)",
+                data=_blob,
+                file_name="brand_row_new.csv",
+                mime="text/csv; charset=utf-8",
+                key="dl_new_brand_row",
+            )
+            st.caption("افتح `data/brands.csv` في Excel، انسخ الصف الجديد تحت آخر صف، أو استورد الدفعة من لوحة سلة.")
 
 
 # ════════════════════════════════════════════════

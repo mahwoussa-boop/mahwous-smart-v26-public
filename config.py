@@ -120,16 +120,50 @@ COHERE_API_KEY     = get_cohere_api_key()
 EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 
 # ══════════════════════════════════════════════
-#  Make Webhooks
+#  Make Webhooks (يُفضَّل الدوال — تقرأ البيئة/Secrets بعد مزامنة الجلسة في app.py)
 # ══════════════════════════════════════════════
-WEBHOOK_UPDATE_PRICES = _s("WEBHOOK_UPDATE_PRICES") or ""
-WEBHOOK_NEW_PRODUCTS = _s("WEBHOOK_NEW_PRODUCTS") or ""
+def get_webhook_update_prices() -> str:
+    return (_s("WEBHOOK_UPDATE_PRICES") or "").strip()
+
+
+def get_webhook_missing_products() -> str:
+    """
+    سيناريو «أتمتة التسعير» / إضافة المفقودات في سلة فقط.
+    يفضّل WEBHOOK_MISSING_PRODUCTS؛ إن وُجد WEBHOOK_NEW_PRODUCTS قديماً يُستخدم كاحتياط.
+    """
+    v = (_s("WEBHOOK_MISSING_PRODUCTS") or "").strip()
+    if v:
+        return v
+    return (_s("WEBHOOK_NEW_PRODUCTS") or "").strip()
+
+
+def get_webhook_new_products() -> str:
+    """توافق خلفي — نفس دالة المفقودات."""
+    return get_webhook_missing_products()
+
+
+# توثيق روابط سيناريوهات Make المشتركة (الاستنساخ من المتصفح — الرابط الفعلي للـ Webhook من لوحتك)
+MAKE_DOCS_SCENARIO_UPDATE_PRICES = (
+    "https://eu2.make.com/public/shared-scenario/9uue7ENfzO5/integration-webhooks-salla"
+)
+MAKE_DOCS_SCENARIO_PRICING_AUTOMATION = (
+    "https://eu2.make.com/public/shared-scenario/UsesKnA62xy/mahwous-pricing-automation-salla"
+)
 
 # ══════════════════════════════════════════════
 #  كشط (async_scraper.py) — تُقرأ من os.environ على التشغيل
 #  • SCRAPER_MAX_CONCURRENT_FETCH (افتراضي 28، حد أعلى 64) — تزيد السرعة؛ خفّضها عند الحظر
 #  • SCRAPER_PIPELINE_EVERY — فاصل لقطات الفرز أثناء الكشط (افتراضي 100 صف)
 #  • MAHWOUS_UI_LIVE_REFRESH_MS — تبطئة تحديث واجهة Streamlit أثناء الكشط الطويل
+#  • MAHWOUS_SCRAPE_UI_MIN_INTERVAL_SEC — أقل فاصل (ثوانٍ) بين كتابات لقطة JSON للتقدم الحي (افتراضي حسب حجم الطابور)
+#  استيراد سلة (utils/helpers.py export_missing_products_to_salla_csv_bytes):
+#  • SALLA_IMPORT_DEFAULT_CATEGORY — مسار تصنيف افتراضي يطابق categories.csv / لوحة سلة
+#  • SALLA_IMPORT_FALLBACK_BRAND — ماركة احتياط عند «غير محدد» (نص كما في brands.csv)
+#  • WEBHOOK_UPDATE_PRICES — تعديل أسعار (🔴 أعلى 🟢 أقل ✅ موافق)؛ WEBHOOK_MISSING_PRODUCTS — مفقودات فقط
+#  • WEBHOOK_NEW_PRODUCTS — اسم قديم؛ يُقرأ كاحتياط إن لم يُضبط WEBHOOK_MISSING_PRODUCTS
+#  AI (engines/ai_engine.py):
+#  • OPENROUTER_MODELS — معرّفات نماذج OpenRouter مفصولة بفواصل (تجاوز القائمة الافتراضية)
+#  • احذف COHERE_API_KEY من Secrets إذا كان 401 لتقليل الضوضاء (Cohere اختياري)
 # ══════════════════════════════════════════════
 
 # ══════════════════════════════════════════════
@@ -249,6 +283,7 @@ REVIEW_VERIFY_MIN_CONFIDENCE = 72
 SECTIONS = [
     "📊 لوحة التحكم",
     "📂 رفع الملفات",
+    "➕ منتج سريع",
     "🔴 سعر أعلى",
     "🟢 سعر أقل",
     "✅ موافق عليها",
