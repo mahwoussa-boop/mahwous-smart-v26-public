@@ -1,4 +1,4 @@
-# توحيد تسميات القرار بين verify_match والمحرك و_app (_split_results)
+# توحيد تسميات القرار بين verify_match والمحرك و_app (split_analysis_results في utils/analysis_sections)
 # نصوص القرار في النتائج يجب أن تحتوي: أعلى | أقل | موافق | مراجعة كما تتوقع دالة التقسيم.
 
 UI_RAISE = "🔴 سعر أعلى"

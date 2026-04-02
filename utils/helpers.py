@@ -9,7 +9,8 @@ import json
 import os
 import re
 import pandas as pd
-from typing import Any, Callable, Dict, List, Optional, Union
+from rapidfuzz import fuzz, process as rf_process
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 
 # ===== safe_float =====
@@ -293,6 +294,189 @@ def _salla_price_numeric(row: Dict[str, Any]) -> str:
     return s if s else "0"
 
 
+def _salla_plain_image_alt_text(s: str) -> str:
+    """
+    سلة ترفض «وصف صورة المنتج» إن وُجدت HTML أو أحرف خاصة — نص عربي/لاتيني بسيط فقط.
+    """
+    t = str(s or "")
+    t = re.sub(r"<[^>]*>", " ", t)
+    t = re.sub(r"[<>&\[\]{}\\|`#*_{}\"]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return (t[:480] if t else "صورة المنتج").strip()
+
+
+def _load_valid_salla_category_paths() -> List[str]:
+    """مسارات «أب > فرع» من data/categories.csv كما في لوحة سلة."""
+    try:
+        from engines.pipeline_enrichment import _build_category_rows
+        from engines.reference_data import CATEGORIES_CSV
+    except Exception:
+        return []
+    cdf = None
+    for enc in ("utf-8-sig", "utf-8"):
+        try:
+            cdf = pd.read_csv(CATEGORIES_CSV, encoding=enc, on_bad_lines="skip")
+            break
+        except Exception:
+            continue
+    if cdf is None or cdf.empty:
+        return []
+    try:
+        all_rows, sub_rows = _build_category_rows(cdf)
+        pool = sub_rows if sub_rows else all_rows
+        return [str(p["path"]).strip() for p in pool if p.get("path")]
+    except Exception:
+        return []
+
+
+def _pick_default_salla_category(valid_paths: List[str]) -> str:
+    """مسار افتراضي يطابق أقسام المتجر الفعلية (ليس «عطور للجنسين» إن لم تكن في CSV)."""
+    env = (os.environ.get("SALLA_IMPORT_DEFAULT_CATEGORY") or "").strip()
+    if env:
+        for p in valid_paths:
+            if p.replace(" ", "") == env.replace(" ", "") or p == env:
+                return p
+        if env in valid_paths:
+            return env
+    for key in ("عطور فرمونية", "عطور رجالية", "عطور نسائية", "عطور التستر"):
+        for p in valid_paths:
+            if key in p:
+                return p
+    return valid_paths[0] if valid_paths else "العطور > عطور رجالية"
+
+
+def _resolve_category_for_salla(
+    cat_raw: str,
+    valid_paths: List[str],
+    fallback: str,
+) -> str:
+    c = (cat_raw or "").strip()
+    if not c:
+        return fallback
+    c = re.sub(r"\s*>\s*", " > ", c)
+    for p in valid_paths:
+        if p.strip() == c or p.replace(" ", "") == c.replace(" ", ""):
+            return p
+    best_p, best_sc = None, 0
+    for p in valid_paths:
+        sc = fuzz.token_set_ratio(c, p)
+        if sc > best_sc:
+            best_sc, best_p = sc, p
+    if best_p and best_sc >= 86:
+        return best_p
+    # مسارات قديمة/غير موجودة في المتجر
+    if any(x in c for x in ("للجنسين", "جنسين", "يونيسكس")):
+        for p in valid_paths:
+            if "فرمون" in p or "للجنسين" in p or "جنسين" in p:
+                return p
+        return fallback
+    return fallback
+
+
+def _build_salla_brand_lookup(brands_df: pd.DataFrame) -> List[Tuple[str, List[str]]]:
+    out: List[Tuple[str, List[str]]] = []
+    if brands_df is None or brands_df.empty:
+        return out
+    col = None
+    for c in ("اسم الماركة", "الماركة", "brand", "Brand"):
+        if c in brands_df.columns:
+            col = c
+            break
+    if not col:
+        return out
+    for _, r in brands_df.iterrows():
+        cell = str(r.get(col, "") or "").strip()
+        if not cell or cell.lower() == "nan":
+            continue
+        tokens = [p.strip().lower() for p in cell.split("|") if p.strip()]
+        out.append((cell, tokens))
+    return out
+
+
+def _resolve_brand_for_salla(
+    raw_brand: str,
+    product_name: str,
+    lookup: List[Tuple[str, List[str]]],
+) -> str:
+    """
+    يطابق اسم الماركة مع عمود «اسم الماركة» في brands.csv (عربي | English)
+    كما تتوقع سلة — لا يُرسل «Gucci» فقط إن كان الملف يستخدم «غوتشي | Gucci».
+    """
+    canonical = [x[0] for x in lookup]
+    raw = (raw_brand or "").strip()
+    pname = (product_name or "").strip()
+
+    def _infer_from_product() -> str:
+        try:
+            from engines.mahwous_core import _infer_brand_from_name
+            from config import KNOWN_BRANDS
+
+            kb = list(KNOWN_BRANDS) if isinstance(KNOWN_BRANDS, (list, tuple)) else []
+            inf = _infer_brand_from_name(pname, kb)
+            if not inf:
+                return ""
+            for cell, tokens in lookup:
+                if inf.lower() in cell.lower():
+                    return cell
+                for tok in tokens:
+                    if fuzz.token_set_ratio(inf.lower(), tok) >= 88:
+                        return cell
+            m = rf_process.extractOne(inf, canonical, scorer=fuzz.token_set_ratio)
+            if m and m[1] >= 78:
+                return m[0]
+        except Exception:
+            pass
+        return ""
+
+    if raw.lower() in ("غير محدد", "غير محدد.", "", "nan", "none"):
+        fb = (os.environ.get("SALLA_IMPORT_FALLBACK_BRAND") or "").strip()
+        if fb and canonical:
+            m = rf_process.extractOne(fb, canonical, scorer=fuzz.token_set_ratio)
+            if m and m[1] >= 70:
+                return m[0]
+        inferred = _infer_from_product()
+        if inferred:
+            return inferred
+        if canonical:
+            return canonical[0]
+        return "غير محدد"
+
+    if canonical:
+        m = rf_process.extractOne(raw, canonical, scorer=fuzz.token_set_ratio)
+        if m and m[1] >= 82:
+            return m[0]
+    for cell, tokens in lookup:
+        for tok in tokens:
+            if fuzz.token_set_ratio(raw.lower(), tok) >= 88:
+                return cell
+        if fuzz.token_set_ratio(raw.lower(), cell.lower()) >= 85:
+            return cell
+    return raw
+
+
+def _salla_export_context() -> Dict[str, Any]:
+    """يُحمَّل مرة لكل تصدير: مسارات تصنيف + ماركات مرجعية."""
+    valid_paths = _load_valid_salla_category_paths()
+    fallback_cat = _pick_default_salla_category(valid_paths)
+    try:
+        from engines.reference_data import BRANDS_CSV
+
+        bdf = pd.read_csv(BRANDS_CSV, encoding="utf-8-sig", on_bad_lines="skip")
+    except Exception:
+        try:
+            from engines.reference_data import BRANDS_CSV
+
+            bdf = pd.read_csv(BRANDS_CSV, encoding="utf-8", on_bad_lines="skip")
+        except Exception:
+            bdf = pd.DataFrame()
+    brand_lookup = _build_salla_brand_lookup(bdf)
+    return {
+        "valid_paths": valid_paths,
+        "fallback_cat": fallback_cat,
+        "brand_lookup": brand_lookup,
+    }
+
+
 def default_salla_missing_html_description(row: Dict[str, Any]) -> str:
     """وصف HTML افتراضي لقالب سلة (بدون استدعاء ذكاء اصطناعي)."""
     name = str(row.get("منتج_المنافس", "") or row.get("name", "") or "").strip()
@@ -571,14 +755,30 @@ def make_salla_desc_fn(
 
 def _missing_row_to_salla_cells(
     row: Dict[str, Any],
-    default_category: str,
+    default_category: Optional[str],
     desc_fn: Callable[[Dict[str, Any]], str],
+    ctx: Dict[str, Any],
 ) -> List[str]:
+    valid_paths: List[str] = ctx.get("valid_paths") or []
+    fallback_cat: str = ctx.get("fallback_cat") or "العطور > عطور رجالية"
+    brand_lookup: List[Tuple[str, List[str]]] = ctx.get("brand_lookup") or []
+
     name = str(row.get("منتج_المنافس", "") or row.get("name", "") or "").strip()
-    brand = str(row.get("الماركة", "") or "").strip()
-    cat = str(row.get("تصنيف_مرجعي", "") or "").strip() or default_category
+    brand_raw = str(row.get("الماركة", "") or "").strip()
+    cat_raw = str(
+        row.get("تصنيف_مرجعي", "")
+        or row.get("category_auto_path", "")
+        or ""
+    ).strip()
+    if not cat_raw:
+        cat_raw = (default_category or "").strip()
+    if not cat_raw:
+        cat_raw = fallback_cat
+    cat = _resolve_category_for_salla(cat_raw, valid_paths, fallback_cat)
+    brand = _resolve_brand_for_salla(brand_raw, name, brand_lookup)
+
     img = str(row.get("صورة_المنافس", "") or row.get("image_url", "") or "").strip()
-    alt = f"{name} الأصلية" if name else ""
+    alt = _salla_plain_image_alt_text(f"{name} الأصلية" if name else "صورة المنتج")
     desc_html = desc_fn(row)
     out: List[str] = [""] * _SALLA_COL_COUNT
     out[0] = "منتج"
@@ -604,16 +804,22 @@ def export_missing_products_to_salla_csv(
     missing_products_list: Union[pd.DataFrame, List[Dict[str, Any]]],
     output_filepath: str,
     *,
-    default_category: str = "العطور > عطور للجنسين",
+    default_category: Optional[str] = None,
     generate_description: Optional[Callable[[Dict[str, Any]], str]] = None,
 ) -> str:
     """
     يكتب ملف CSV بصيغة استيراد سلة لمنتجات مفقودة: UTF-8 مع BOM، صفّا رأس مطابقان، ثم البيانات.
 
     generate_description: دالة اختيارية تُرجع HTML للوصف؛ الافتراضي قالب HTML ثابت (بدون AI).
+
+    متغيرات بيئة اختيارية:
+    - SALLA_IMPORT_DEFAULT_CATEGORY: مسار تصنيف افتراضي يطابق لوحة سلة (مثل: العطور > عطور فرمونية)
+    - SALLA_IMPORT_FALLBACK_BRAND: ماركة احتياط عند «غير محدد» (نص كما في brands.csv)
     """
     rows = _normalize_missing_rows_for_salla(missing_products_list)
     desc_fn = generate_description or default_salla_missing_html_description
+    ctx = _salla_export_context()
+    dc = (default_category or "").strip() or None
     _dir = os.path.dirname(os.path.abspath(output_filepath))
     if _dir:
         os.makedirs(_dir, exist_ok=True)
@@ -624,23 +830,29 @@ def export_missing_products_to_salla_csv(
         w.writerow(["بيانات المنتج"] + [""] * (_SALLA_COL_COUNT - 1))
         w.writerow(SALLA_MISSING_HEADER_ROW2)
         for row in rows:
-            w.writerow(_missing_row_to_salla_cells(row, default_category, desc_fn))
+            w.writerow(_missing_row_to_salla_cells(row, dc, desc_fn, ctx))
     return os.path.abspath(output_filepath)
 
 
 def export_missing_products_to_salla_csv_bytes(
     missing_products_list: Union[pd.DataFrame, List[Dict[str, Any]]],
     *,
-    default_category: str = "العطور > عطور للجنسين",
+    default_category: Optional[str] = None,
     generate_description: Optional[Callable[[Dict[str, Any]], str]] = None,
 ) -> bytes:
-    """نفس منطق التصدير إلى ملف، لكن يُرجع بايتات للتنزيل في Streamlit."""
+    """
+    نفس منطق التصدير إلى ملف، لكن يُرجع بايتات للتنزيل في Streamlit.
+
+    يُطابق التصنيف والماركة مع data/categories.csv و data/brands.csv لتقليل أخطاء الاستيراد في سلة.
+    """
     buf = io.StringIO()
     rows = _normalize_missing_rows_for_salla(missing_products_list)
     desc_fn = generate_description or default_salla_missing_html_description
+    ctx = _salla_export_context()
+    dc = (default_category or "").strip() or None
     w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
     w.writerow(["بيانات المنتج"] + [""] * (_SALLA_COL_COUNT - 1))
     w.writerow(SALLA_MISSING_HEADER_ROW2)
     for row in rows:
-        w.writerow(_missing_row_to_salla_cells(row, default_category, desc_fn))
+        w.writerow(_missing_row_to_salla_cells(row, dc, desc_fn, ctx))
     return buf.getvalue().encode("utf-8-sig")
