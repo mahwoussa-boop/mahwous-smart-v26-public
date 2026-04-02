@@ -86,6 +86,32 @@ details summary span[data-testid] svg {
     direction: rtl;
     font-family: 'Tajawal', sans-serif !important;
 }
+/* ── زر «التدقيق والتحسين» — نفس إحساس صفوف الراديو (أقسام) ── */
+section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-secondary"],
+section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-tertiary"] {
+    background: transparent !important;
+    border: 1px solid rgba(51, 51, 68, 0.45) !important;
+    border-radius: 8px !important;
+    color: rgba(250, 250, 250, 0.95) !important;
+    font-weight: 400 !important;
+    font-size: 0.9375rem !important;
+    padding: 0.3rem 0.65rem !important;
+    min-height: 2.15rem !important;
+    box-shadow: none !important;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease !important;
+}
+section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-secondary"]:hover,
+section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-secondary"]:focus-visible,
+section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-tertiary"]:hover,
+section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-tertiary"]:focus-visible {
+    background: rgba(108, 99, 255, 0.12) !important;
+    border-color: rgba(108, 99, 255, 0.45) !important;
+    color: #fff !important;
+}
+section[data-testid="stSidebar"] .st-key-nav_audit_tools button p {
+    font-family: 'Tajawal', sans-serif !important;
+    font-size: 0.9375rem !important;
+}
 /* ── زر القائمة الجانبية ── منقول إلى get_sidebar_toggle_js */
 </style>"""
 

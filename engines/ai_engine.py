@@ -11,9 +11,23 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 ✅ v26.0: بحث أشمل في المتاجر السعودية مع تحليل JSON دقيق
 """
 import base64
+import logging
 import os as _os
 import requests, json, re, time, traceback
 from config import get_gemini_api_keys, get_openrouter_api_key, get_cohere_api_key
+
+_logger = logging.getLogger(__name__)
+
+# رسائل للواجهة — صياغة محايدة (بدون إلقاء اللوم على مزوّد معيّن)
+USER_MSG_AI_UNAVAILABLE = (
+    "تعذّر إكمال الطلب الآن — جرّب إعادة المحاولة أو تحقق من الاتصال والمفاتيح."
+)
+USER_MSG_VERIFY_UNAVAILABLE = (
+    "تعذّر إكمال التحقق من المطابقة — يمكنك المراجعة يدوياً أو إعادة المحاولة لاحقاً."
+)
+USER_MSG_VISION_UNAVAILABLE = (
+    "تعذّر إكمال مقارنة الصور — راجع المنتج يدوياً عند الحاجة."
+)
 
 try:
     from engines.engine import _clean_ai_json
@@ -26,15 +40,30 @@ _GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateC
 _GVU = f"https://generativelanguage.googleapis.com/v1beta/models/{_GV}:generateContent"
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
 
-# نماذج OpenRouter المجربة — يُحدَّث عند إزالة معرّفات من المنصة (خطأ 400)
-OPENROUTER_FALLBACK_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
+# نماذج افتراضية — بدون معرّفات أُزيلت من الطبقة المجانية (404 No endpoints).
+# يمكن تجاوزها بالكامل عبر OPENROUTER_MODELS (مفصولة بفواصل) في البيئة.
+_OPENROUTER_DEFAULT_MODELS = (
+    "openrouter/free",
     "google/gemma-3-27b-it:free",
-]
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-2-9b-it:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+)
+
+
+def _openrouter_models_list():
+    raw = _os.environ.get("OPENROUTER_MODELS", "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    return list(_OPENROUTER_DEFAULT_MODELS)
+
+
+# توافق خلفي مع أي استيراد لاسم القائمة القديم
+OPENROUTER_FALLBACK_MODELS = list(_OPENROUTER_DEFAULT_MODELS)
 _CO  = "https://api.cohere.ai/v1/generate"
+
+# Cohere اختياري — بعد 401 لا نكرر الاستدعاءات ولا نملأ سجل الأخطاء
+_COHERE_KEY_INVALID = False
 
 # ── سجل الأخطاء الأخيرة (يُعرض في صفحة التشخيص) ─────────────────────────
 _LAST_ERRORS: list = []
@@ -99,7 +128,7 @@ def diagnose_ai_providers() -> dict:
     if _or_key:
         or_ok = False
         last_or = ""
-        for _model in OPENROUTER_FALLBACK_MODELS:
+        for _model in _openrouter_models_list():
             try:
                 r = requests.post(
                     _OR,
@@ -133,6 +162,9 @@ def diagnose_ai_providers() -> dict:
                     msg = r.json().get("error", {}).get("message", "")
                 except Exception:
                     msg = r.text[:100]
+                msg_l = (msg or "").lower()
+                if r.status_code == 404 or "no endpoints" in msg_l:
+                    continue
                 last_or = f"❌ {r.status_code} — {msg[:100]} ({_model})"
             except requests.exceptions.ConnectionError:
                 results["openrouter"] = "❌ لا اتصال بـ openrouter.ai — قد يكون محظوراً"
@@ -143,7 +175,9 @@ def diagnose_ai_providers() -> dict:
             except Exception as e:
                 last_or = f"❌ {str(e)[:80]} ({_model})"
         if not or_ok:
-            results["openrouter"] = last_or or "❌ فشلت كل نماذج OpenRouter"
+            results["openrouter"] = last_or or (
+                "❌ لا يوجد نموذج يعمل — راجع المعرفات على openrouter.ai أو OPENROUTER_MODELS"
+            )
     else:
         results["openrouter"] = "⚠️ مفتاح غير موجود"
 
@@ -203,6 +237,7 @@ def _vision_fetch_image(url: str):
             return r.content, "image/webp"
         return r.content, "image/jpeg"
     except Exception:
+        _logger.debug("vision image fetch failed url=%s", str(url)[:80], exc_info=True)
         return None, "image/jpeg"
 
 
@@ -222,7 +257,7 @@ def vision_match_court(
     out: dict = {"same_product": False, "reason": "", "ok": False}
     keys = get_gemini_api_keys() or []
     if not keys:
-        out["reason"] = "لا يوجد مفتاح Gemini"
+        out["reason"] = "لم يُضبط مفتاح API للمقارنة البصرية — راجع إعدادات المفاتيح."
         return out
 
     b1, m1 = _vision_fetch_image(our_img_url)
@@ -273,7 +308,7 @@ def vision_match_court(
             _log_err("vision_match_court", str(e)[:120])
             continue
 
-    out["reason"] = "فشل كل مفاتيح Gemini للمحكمة البصرية"
+    out["reason"] = USER_MSG_VISION_UNAVAILABLE
     return out
 
 
@@ -338,6 +373,27 @@ MISSING_PAGE_SYSTEM = """## الهوية والأسلوب (Persona)
 - **الدقة:** لا تخترع مكونات؛ استند إلى المعرفة الموثوقة عن العطر وإن وُجد بحث، وإن لم تتوفر تفاصيل الهرم بدقة فاذكر ذلك باختصار وصِغ وصفاً حسياً عاماً دون تسمية مكونات وهمية.
 - **الجمهور:** لغة تناسب العميل السعودي والخليجي؛ ركز على فوحان وثبات وتميز.
 - لا تستخدم إيموجي في الوصف النهائي. الـ url_slug وtags باللاتينية/الإنجليزية حيث يلزم للـ SEO."""
+
+
+def _append_mahwous_kb(base: str) -> str:
+    """يُلحق قاعدة روابط مهووس من data/mahwous_internal_links_kb.md عند وجود الملف."""
+    path = _os.path.normpath(_os.path.join(_os.path.dirname(__file__), "..", "data", "mahwous_internal_links_kb.md"))
+    try:
+        with open(path, encoding="utf-8") as f:
+            kb = f.read()
+        if not kb.strip():
+            return base
+        return (
+            base
+            + "\n\n---\n## قاعدة روابط مهووس (استخدمها للروابط الداخلية في قسم «اكتشف المزيد»)\n"
+            + kb
+        )
+    except OSError:
+        return base
+
+
+MAHWOUS_EXPERT_SYSTEM = _append_mahwous_kb(MAHWOUS_EXPERT_SYSTEM)
+MISSING_PAGE_SYSTEM = _append_mahwous_kb(MISSING_PAGE_SYSTEM)
 
 # ══ System Prompts للأقسام ══════════════════════════════════════════════════
 PAGE_PROMPTS = {
@@ -435,7 +491,9 @@ def _call_openrouter(prompt, system=""):
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
 
-    for model in OPENROUTER_FALLBACK_MODELS:
+    models = _openrouter_models_list()
+    logged_429 = False
+    for model in models:
         try:
             r = requests.post(_OR, json={
                 "model": model,
@@ -453,8 +511,13 @@ def _call_openrouter(prompt, system=""):
                 if content and content.strip():
                     return content
             elif r.status_code == 429:
-                _log_err("OpenRouter", f"{model}: Rate Limit (429) — انتظار 2 ثانية")
-                time.sleep(2)  # ← 2 ثانية للـ 429
+                if not logged_429:
+                    _log_err(
+                        "OpenRouter",
+                        "429 — تجاوز الحد؛ جرّب نموذجاً آخر في القائمة (بدون انتظار طويل)",
+                    )
+                    logged_429 = True
+                # نموذج آخر قد يكون تحت حدّ مختلف — لا ننام هنا لتسريع السلسلة
                 continue
             elif r.status_code == 402:
                 _log_err("OpenRouter", f"{model}: رصيد منتهٍ (402) — جرب النموذج التالي")
@@ -467,6 +530,9 @@ def _call_openrouter(prompt, system=""):
                     msg = r.json().get("error", {}).get("message", "")
                 except Exception:
                     msg = r.text[:100]
+                msg_l = (msg or "").lower()
+                if r.status_code == 404 or "no endpoints" in msg_l:
+                    continue
                 _log_err("OpenRouter", f"{model}: {r.status_code} — {msg[:80]}")
                 continue
 
@@ -487,6 +553,9 @@ def _call_cohere(prompt, system=""):
     Cohere — Fallback صامت فقط.
     أي خطأ (401/402/429/...) يُسجَّل ويُعاد None بدون إيقاف سير العمل.
     """
+    global _COHERE_KEY_INVALID
+    if _COHERE_KEY_INVALID:
+        return None
     ch_key = get_cohere_api_key()
     if not ch_key:
         return None
@@ -507,6 +576,7 @@ def _call_cohere(prompt, system=""):
             data = r.json()
             return data.get("message", {}).get("content", [{}])[0].get("text", "")
         elif r.status_code == 401:
+            _COHERE_KEY_INVALID = True
             _log_err("Cohere", "مفتاح غير صحيح (401) — تجاوز Cohere")
             return None  # ← لا يوقف العمل، يمرر للـ fallback التالي
         elif r.status_code in (402, 403):
@@ -550,7 +620,7 @@ def _search_ddg(query, num_results=5):
                     results.append({"snippet": rel.get("Text",""), "url": rel.get("FirstURL","")})
             return results
     except Exception:
-        pass
+        _logger.debug("DuckDuckGo search failed", exc_info=True)
     return []
 
 def call_ai(prompt, page="general"):
@@ -568,7 +638,7 @@ def call_ai(prompt, page="general"):
     ]:
         r = fn()
         if r: return {"success":True,"response":r,"source":src}
-    return {"success":False,"response":"فشل الاتصال بجميع مزودي AI","source":"none"}
+    return {"success": False, "response": USER_MSG_AI_UNAVAILABLE, "source": "none"}
 
 # ══ Gemini Chat ══════════════════════════════════════════════════════════════
 def gemini_chat(message, history=None, system_extra=""):
@@ -601,7 +671,7 @@ def gemini_chat(message, history=None, system_extra=""):
         except: continue
     r = _call_openrouter(message, sys)
     if r: return {"success":True,"response":r,"source":"OpenRouter"}
-    return {"success":False,"response":"فشل الاتصال","source":"none"}
+    return {"success": False, "response": USER_MSG_AI_UNAVAILABLE, "source": "none"}
 
 # ══ جلب صور المنتج من مصادر متعددة ══════════════════════════════════════════
 def fetch_product_images(product_name, brand=""):
@@ -850,7 +920,8 @@ def verify_match(p1, p2, pr1=0, pr2=0):
     sys = PAGE_PROMPTS["verify"]
     txt = _call_gemini(prompt, sys, temperature=0.1) or _call_openrouter(prompt, sys)
     if not txt:
-        return {"success":False,"match":False,"confidence":0,"reason":"فشل AI","correct_section":"تحت المراجعة","suggested_price":0,
+        return {"success": False, "match": False, "confidence": 0, "reason": USER_MSG_VERIFY_UNAVAILABLE,
+                "correct_section": "تحت المراجعة", "suggested_price": 0,
                 "ui_decision": ui_decision_from_verify_section("تحت المراجعة", False)}
     data = _parse_json(txt)
     if data:
@@ -913,6 +984,7 @@ def apply_gemini_reclassify_to_analysis_df(analysis_df, min_confidence: float = 
     try:
         mask = analysis_df["القرار"].astype(str).str.contains("مراجعة", na=False)
     except Exception:
+        _logger.warning("apply_gemini_reclassify: failed to build review mask", exc_info=True)
         return analysis_df
     row_indices = analysis_df.index[mask].tolist()
     if not row_indices:
@@ -940,6 +1012,7 @@ def apply_gemini_reclassify_to_analysis_df(analysis_df, min_confidence: float = 
         try:
             results = reclassify_review_items(items)
         except Exception:
+            _logger.exception("reclassify_review_items failed batch start=%s", start)
             continue
         if not results:
             continue
@@ -1027,7 +1100,7 @@ def ai_deep_analysis(our_product, our_price, comp_product, comp_price, section="
 اجب بتقرير مختصر: هل المطابقة صحيحة؟ السعر المقترح بالرقم؟ الاجراء الفوري؟"""
     txt = _call_gemini(prompt, grounding=bool(web_ctx)) or _call_openrouter(prompt)
     if txt: return {"success":True,"response":txt,"source":"Gemini" + (" + ويب" if web_ctx else "")}
-    return {"success":False,"response":"فشل التحليل"}
+    return {"success": False, "response": USER_MSG_AI_UNAVAILABLE}
 
 # ══ بحث mahwous.com ══════════════════════════════════════════════════════════
 def search_mahwous(product_name):

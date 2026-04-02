@@ -5,19 +5,16 @@ utils/db_manager.py - v18.0
 - قرارات لكل منتج (موافق/تأجيل/إزالة)
 - سجل كامل بالتاريخ والوقت
 
-مسار قاعدة البيانات (DB_PATH) — يطابق config.DB_PATH (نفس الملف؛ يُعرّف هنا لتجنب circular import).
+مسار قاعدة البيانات: يُستورد DB_PATH من config.py (مصدر واحد).
 """
 import hashlib
 import os
 import sqlite3
-import tempfile
 from datetime import datetime
 
-from utils.jsonfast import dumps as json_dumps, loads as json_loads
+from config import DB_PATH
 
-# مجلد temp النظامي: يعمل محلياً وعلى Cloud (مجلد الكود غالباً read-only)
-_DB_NAME = "pricing_v18.db"
-DB_PATH = os.path.join(tempfile.gettempdir(), _DB_NAME)
+from utils.jsonfast import dumps as json_dumps, loads as json_loads
 
 
 def _log_db_err(where: str, err: Exception) -> None:

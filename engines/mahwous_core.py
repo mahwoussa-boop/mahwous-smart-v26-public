@@ -170,6 +170,79 @@ def apply_strict_pipeline_filters(
     }
 
 
+# قيمة افتراضية لاستيراد سلة عند تعذّر استنتاج الماركة من الاسم
+_EXPORT_BRAND_FALLBACK = "غير محدد"
+_BRAND_COL_CANDS = ("الماركة", "brand", "Brand", "العلامة")
+
+
+def _row_brand_explicit(row: pd.Series) -> str:
+    """أول قيمة صالحة من أعمدة الماركة المعروفة."""
+    for key in _BRAND_COL_CANDS:
+        try:
+            b = str(row.get(key, "") or "").strip()
+        except Exception:
+            continue
+        if b and b.lower() not in ("nan", "none", "—", "-"):
+            return b
+    return ""
+
+
+def _infer_brand_from_name(product_name: str, known_brands: list[str]) -> str:
+    """يطابق أطول علامة من القائمة تظهر في اسم المنتج (حروف غير حساسة)."""
+    if not product_name or not str(product_name).strip():
+        return ""
+    low = str(product_name).lower()
+    best = ""
+    brands_sorted = sorted(
+        (str(b).strip() for b in known_brands if b and str(b).strip()),
+        key=len,
+        reverse=True,
+    )
+    for bs in brands_sorted:
+        if len(bs) < 2:
+            continue
+        if bs.lower() in low:
+            if len(bs) > len(best):
+                best = bs
+    return best
+
+
+def _effective_brand_for_export(row: pd.Series, known_brands: list[str]) -> str:
+    explicit = _row_brand_explicit(row)
+    if explicit:
+        return explicit
+    name = ""
+    for nc in ("منتج_المنافس", "المنتج", "اسم المنتج"):
+        try:
+            n = str(row.get(nc, "") or "").strip()
+        except Exception:
+            n = ""
+        if n:
+            name = n
+            break
+    inferred = _infer_brand_from_name(name, known_brands)
+    return inferred if inferred else _EXPORT_BRAND_FALLBACK
+
+
+def ensure_export_brands(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    يضمن وجود عمود «الماركة» غير فارغ للتصدير إلى سلة / Make.
+    يملأ من أعمدة بديلة، أو مطابقة اسم المنتج مع KNOWN_BRANDS، ثم «غير محدد».
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        from config import KNOWN_BRANDS
+    except Exception:
+        KNOWN_BRANDS = []
+    out = df.copy()
+    if "الماركة" not in out.columns:
+        out["الماركة"] = ""
+    kb = list(KNOWN_BRANDS) if isinstance(KNOWN_BRANDS, (list, tuple)) else []
+    out["الماركة"] = out.apply(lambda r: _effective_brand_for_export(r, kb), axis=1)
+    return out
+
+
 def validate_export_product_dataframe(df: pd.DataFrame) -> tuple[bool, list[str]]:
     """
     مدقق التصدير قبل Make / CSV — اسم، سعر، ماركة، تاريخ YYYY-MM-DD عند وجوده.

@@ -1,9 +1,10 @@
 """
-config.py - الإعدادات المركزية v19.0
-المفاتيح محمية عبر Streamlit Secrets
+config.py - الإعدادات المركزية (v26.0)
+المفاتيح عبر Streamlit Secrets / متغيرات البيئة
 """
 import json as _json
 import os as _os
+import shutil as _shutil
 import tempfile
 
 # ===== معلومات التطبيق =====
@@ -120,16 +121,52 @@ COHERE_API_KEY     = get_cohere_api_key()
 EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 
 # ══════════════════════════════════════════════
-#  Make Webhooks
+#  Make Webhooks (يُفضَّل الدوال — تقرأ البيئة/Secrets بعد مزامنة الجلسة في app.py)
 # ══════════════════════════════════════════════
-WEBHOOK_UPDATE_PRICES = _s("WEBHOOK_UPDATE_PRICES") or ""
-WEBHOOK_NEW_PRODUCTS = _s("WEBHOOK_NEW_PRODUCTS") or ""
+def get_webhook_update_prices() -> str:
+    return (_s("WEBHOOK_UPDATE_PRICES") or "").strip()
+
+
+def get_webhook_missing_products() -> str:
+    """
+    سيناريو «أتمتة التسعير» / إضافة المفقودات في سلة فقط.
+    يفضّل WEBHOOK_MISSING_PRODUCTS؛ إن وُجد WEBHOOK_NEW_PRODUCTS قديماً يُستخدم كاحتياط.
+    """
+    v = (_s("WEBHOOK_MISSING_PRODUCTS") or "").strip()
+    if v:
+        return v
+    return (_s("WEBHOOK_NEW_PRODUCTS") or "").strip()
+
+
+def get_webhook_new_products() -> str:
+    """توافق خلفي — نفس دالة المفقودات."""
+    return get_webhook_missing_products()
+
+
+# توثيق روابط سيناريوهات Make المشتركة (الاستنساخ من المتصفح — الرابط الفعلي للـ Webhook من لوحتك)
+MAKE_DOCS_SCENARIO_UPDATE_PRICES = (
+    "https://eu2.make.com/public/shared-scenario/9uue7ENfzO5/integration-webhooks-salla"
+)
+MAKE_DOCS_SCENARIO_PRICING_AUTOMATION = (
+    "https://eu2.make.com/public/shared-scenario/UsesKnA62xy/mahwous-pricing-automation-salla"
+)
 
 # ══════════════════════════════════════════════
 #  كشط (async_scraper.py) — تُقرأ من os.environ على التشغيل
 #  • SCRAPER_MAX_CONCURRENT_FETCH (افتراضي 28، حد أعلى 64) — تزيد السرعة؛ خفّضها عند الحظر
 #  • SCRAPER_PIPELINE_EVERY — فاصل لقطات الفرز أثناء الكشط (افتراضي 100 صف)
 #  • MAHWOUS_UI_LIVE_REFRESH_MS — تبطئة تحديث واجهة Streamlit أثناء الكشط الطويل
+#  • MAHWOUS_SCRAPE_UI_MIN_INTERVAL_SEC — أقل فاصل (ثوانٍ) بين كتابات لقطة JSON للتقدم الحي (افتراضي حسب حجم الطابور)
+#  • MAHWOUS_DB_PATH — مسار ملف SQLite كاملاً (تجاوز data/pricing_v18.db الافتراضي)
+#  • MAHWOUS_LOG_LEVEL — مستوى التسجيل: DEBUG / INFO / WARNING / ERROR (افتراضي INFO)
+#  استيراد سلة (utils/helpers.py export_missing_products_to_salla_csv_bytes):
+#  • SALLA_IMPORT_DEFAULT_CATEGORY — مسار تصنيف افتراضي يطابق categories.csv / لوحة سلة
+#  • SALLA_IMPORT_FALLBACK_BRAND — ماركة احتياط عند «غير محدد» (نص كما في brands.csv)
+#  • WEBHOOK_UPDATE_PRICES — تعديل أسعار (🔴 أعلى 🟢 أقل ✅ موافق)؛ WEBHOOK_MISSING_PRODUCTS — مفقودات فقط
+#  • WEBHOOK_NEW_PRODUCTS — اسم قديم؛ يُقرأ كاحتياط إن لم يُضبط WEBHOOK_MISSING_PRODUCTS
+#  AI (engines/ai_engine.py):
+#  • OPENROUTER_MODELS — معرّفات نماذج OpenRouter مفصولة بفواصل (تجاوز القائمة الافتراضية)
+#  • احذف COHERE_API_KEY من Secrets إذا كان 401 لتقليل الضوضاء (Cohere اختياري)
 # ══════════════════════════════════════════════
 
 # ══════════════════════════════════════════════
@@ -249,6 +286,7 @@ REVIEW_VERIFY_MIN_CONFIDENCE = 72
 SECTIONS = [
     "📊 لوحة التحكم",
     "📂 رفع الملفات",
+    "➕ منتج سريع",
     "🔴 سعر أعلى",
     "🟢 سعر أقل",
     "✅ موافق عليها",
@@ -263,8 +301,43 @@ SECTIONS = [
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-# مسار SQLite — نفس الاسم في كل الوحدات؛ temp يعمل على Windows وLinux وStreamlit Cloud
-DB_PATH = _os.path.join(tempfile.gettempdir(), "pricing_v18.db")
+
+
+def _project_root_dir() -> str:
+    """مجلد جذر المشروع (حيث يقع config.py)."""
+    return _os.path.dirname(_os.path.abspath(__file__))
+
+
+def _resolve_db_path() -> str:
+    """
+    مسار SQLite موحّد لكل الوحدات.
+    - الأولوية: متغير البيئة MAHWOUS_DB_PATH (مسار كامل للملف).
+    - الافتراضي: data/pricing_v18.db تحت جذر المشروع (دائم أكثر من مجلد temp).
+    - احتياطي: مجلد temp النظام إن تعذّر إنشاء/الكتابة في data/.
+    - ترحيل لمرة واحدة: إن وُجدت قاعدة قديمة في temp ولم يُنشأ الملف في data بعد، تُنسخ.
+    """
+    env = (_os.environ.get("MAHWOUS_DB_PATH") or "").strip()
+    if env:
+        return env
+    legacy_temp = _os.path.join(tempfile.gettempdir(), "pricing_v18.db")
+    data_dir = _os.path.join(_project_root_dir(), "data")
+    try:
+        _os.makedirs(data_dir, exist_ok=True)
+        candidate = _os.path.join(data_dir, "pricing_v18.db")
+        if not _os.path.isfile(candidate) and _os.path.isfile(legacy_temp):
+            try:
+                _shutil.copy2(legacy_temp, candidate)
+            except Exception:
+                pass
+        return candidate
+    except Exception:
+        return legacy_temp if _os.path.isfile(legacy_temp) else _os.path.join(
+            tempfile.gettempdir(), "pricing_v18.db"
+        )
+
+
+# نفس الاسم في config و db_manager (استورد من هنا فقط)
+DB_PATH = _resolve_db_path()
 
 # قائمة المنافسين الافتراضية للكشط — يُحمَّل من الملف؛ يمكن تعديل JSON دون المساس بالكود
 PRESET_COMPETITORS_PATH = _os.path.join("data", "preset_competitors.json")

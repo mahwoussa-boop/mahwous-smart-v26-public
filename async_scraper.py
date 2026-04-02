@@ -298,6 +298,7 @@ async def _expand_sitemap_to_page_urls_async(
     seen_sm: set[str] = set()
     q: list[str] = [start_url]
     t0 = _time.time()
+    _sm_prog_last = [0.0]  # خفض تكرار progress أثناء فهرسة sitemap (كان يُستدعى كل ملف)
     while q and len(page_urls) < _SITEMAP_LOC_CAP:
         if _SITEMAP_EXPAND_TIMEOUT_SEC > 0 and (_time.time() - t0) > _SITEMAP_EXPAND_TIMEOUT_SEC:
             break
@@ -308,14 +309,17 @@ async def _expand_sitemap_to_page_urls_async(
             continue
         seen_sm.add(sm_url)
         if progress_cb:
-            try:
-                progress_cb(len(seen_sm), len(q), len(page_urls))
-            except Exception:
-                logger.exception(
-                    "sitemap progress_cb failed sm_url=%s seen_sm=%s",
-                    sm_url,
-                    len(seen_sm),
-                )
+            now_sm = _time.time()
+            if len(seen_sm) <= 1 or (now_sm - _sm_prog_last[0]) >= 0.55:
+                _sm_prog_last[0] = now_sm
+                try:
+                    progress_cb(len(seen_sm), len(q), len(page_urls))
+                except Exception:
+                    logger.exception(
+                        "sitemap progress_cb failed sm_url=%s seen_sm=%s",
+                        sm_url,
+                        len(seen_sm),
+                    )
         await _async_jitter_sleep()
         got = await _async_http_get_armored(fetcher, sm_url, timeout=30.0)
         if got is None:
@@ -617,6 +621,73 @@ def _clear_checkpoint_files() -> None:
                 os.remove(p)
         except Exception:
             logger.exception("clear checkpoint file failed path=%s", p)
+
+
+def get_scraper_sitemap_seeds() -> list[str]:
+    """نفس مصدر روابط الكشط (`data/competitors_list.json`) — للاستعادة من نقطة الحفظ."""
+    return list(_load_sitemap_seeds())
+
+
+def load_checkpoint_rows_if_any() -> list[dict[str, Any]]:
+    """صفوف محفوظة في نقطة الاستعادة إذا تطابقت بصمة الخرائط مع الجلسة الحالية؛ وإلا قائمة فارغة."""
+    seeds = _load_sitemap_seeds()
+    if not seeds:
+        return []
+    seeds_fp = _seeds_fingerprint(seeds)
+    _done, rows = _load_checkpoint(seeds_fp)
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def load_checkpoint_rows_ignore_fingerprint() -> list[dict[str, Any]]:
+    """كل صفوف المنتج من `scraper_checkpoint.json` — بدون شرط بصمة الخرائط (فرز/مقارنة فقط)."""
+    if not os.path.isfile(CHECKPOINT_JSON):
+        return []
+    try:
+        with open(CHECKPOINT_JSON, encoding="utf-8") as f:
+            d = json_load(f)
+        rows = d.get("rows", [])
+        if not isinstance(rows, list):
+            return []
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception:
+        logger.exception("load_checkpoint_rows_ignore_fingerprint failed path=%s", CHECKPOINT_JSON)
+        return []
+
+
+def get_checkpoint_recovery_status() -> dict[str, Any]:
+    """للواجهة: هل يوجد ملف، عدد الصفوف، وتطابق بصمة `competitors_list.json` مع جلسة النقطة."""
+    seeds = _load_sitemap_seeds()
+    seeds_fp = _seeds_fingerprint(seeds) if seeds else ""
+    raw_rows: list = []
+    ck_fp = ""
+    file_exists = os.path.isfile(CHECKPOINT_JSON)
+    fp_match = False
+    if file_exists:
+        try:
+            with open(CHECKPOINT_JSON, encoding="utf-8") as f:
+                d = json_load(f)
+            ck_fp = str(d.get("seeds_fp") or "")
+            raw = d.get("rows", [])
+            raw_rows = raw if isinstance(raw, list) else []
+            fp_match = bool(seeds_fp) and (ck_fp == seeds_fp)
+        except Exception:
+            logger.exception("get_checkpoint_recovery_status: read checkpoint failed path=%s", CHECKPOINT_JSON)
+            raw_rows = []
+    usable = (
+        [r for r in raw_rows if isinstance(r, dict)]
+        if fp_match
+        else []
+    )
+    return {
+        "file_exists": file_exists,
+        "raw_row_count": len(raw_rows),
+        "usable_row_count": len(usable),
+        "fingerprint_match": fp_match,
+        "has_seeds_json": bool(seeds),
+        "checkpoint_path": CHECKPOINT_JSON,
+    }
 
 
 def _load_checkpoint(seeds_fp: str) -> tuple[set[str], list[dict[str, Any]]]:
@@ -945,6 +1016,32 @@ async def _run_scraper_async(
                 logger.exception("emit scrape event failed")
 
         _scrape_tick = [0, 0.0]
+        # تخفيف progress_cb: آلاف الاستدعاءات تُبطئ الواجهة (قراءة/كتابة لقطة JSON في app)
+        _prog_emit = [0.0, -1]
+
+        def _emit_url_progress(i_pos: int, total_n: int, name_hint: str) -> None:
+            if not progress_cb or total_n <= 0:
+                return
+            now_p = _time.time()
+            step = max(1, total_n // 120) if total_n > 120 else 1
+            min_dt = 0.95 if total_n > 500 else 0.5
+            last_t, last_ip = _prog_emit[0], _prog_emit[1]
+            at_end = (i_pos + 1) >= total_n
+            at_start = i_pos <= 0
+            due_time = (now_p - last_t) >= min_dt
+            due_step = (i_pos - last_ip) >= step
+            if not (at_start or at_end or (due_time and due_step)):
+                return
+            _prog_emit[0] = now_p
+            _prog_emit[1] = i_pos
+            try:
+                progress_cb(
+                    i_pos + 1,
+                    total_n,
+                    name_hint[:80] if name_hint else "جاري البحث...",
+                )
+            except Exception:
+                logger.exception("progress_cb failed i_pos=%s total=%s", i_pos, total_n)
 
         def _consume_row(u: str, row: dict[str, Any] | None, i_pos: int):
             nonlocal last_name
@@ -1006,12 +1103,11 @@ async def _run_scraper_async(
                         logger.exception(
                             "on_incremental_flush failed rows=%s", len(rows)
                         )
-            if progress_cb:
-                progress_cb(
-                    i_pos + 1,
-                    total_urls,
-                    last_name[:80] if last_name else "جاري البحث...",
-                )
+            _emit_url_progress(
+                i_pos,
+                total_urls,
+                last_name if last_name else "جاري البحث...",
+            )
             if len(rows) % _CHECKPOINT_EVERY == 0 and rows:
                 _save_checkpoint(seeds_fp, processed_urls, rows)
             if _max_product_rows_reached(len(rows)):
