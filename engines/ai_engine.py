@@ -11,9 +11,23 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 ✅ v26.0: بحث أشمل في المتاجر السعودية مع تحليل JSON دقيق
 """
 import base64
+import logging
 import os as _os
 import requests, json, re, time, traceback
 from config import get_gemini_api_keys, get_openrouter_api_key, get_cohere_api_key
+
+_logger = logging.getLogger(__name__)
+
+# رسائل للواجهة — صياغة محايدة (بدون إلقاء اللوم على مزوّد معيّن)
+USER_MSG_AI_UNAVAILABLE = (
+    "تعذّر إكمال الطلب الآن — جرّب إعادة المحاولة أو تحقق من الاتصال والمفاتيح."
+)
+USER_MSG_VERIFY_UNAVAILABLE = (
+    "تعذّر إكمال التحقق من المطابقة — يمكنك المراجعة يدوياً أو إعادة المحاولة لاحقاً."
+)
+USER_MSG_VISION_UNAVAILABLE = (
+    "تعذّر إكمال مقارنة الصور — راجع المنتج يدوياً عند الحاجة."
+)
 
 try:
     from engines.engine import _clean_ai_json
@@ -223,6 +237,7 @@ def _vision_fetch_image(url: str):
             return r.content, "image/webp"
         return r.content, "image/jpeg"
     except Exception:
+        _logger.debug("vision image fetch failed url=%s", str(url)[:80], exc_info=True)
         return None, "image/jpeg"
 
 
@@ -242,7 +257,7 @@ def vision_match_court(
     out: dict = {"same_product": False, "reason": "", "ok": False}
     keys = get_gemini_api_keys() or []
     if not keys:
-        out["reason"] = "لا يوجد مفتاح Gemini"
+        out["reason"] = "لم يُضبط مفتاح API للمقارنة البصرية — راجع إعدادات المفاتيح."
         return out
 
     b1, m1 = _vision_fetch_image(our_img_url)
@@ -293,7 +308,7 @@ def vision_match_court(
             _log_err("vision_match_court", str(e)[:120])
             continue
 
-    out["reason"] = "فشل كل مفاتيح Gemini للمحكمة البصرية"
+    out["reason"] = USER_MSG_VISION_UNAVAILABLE
     return out
 
 
@@ -605,7 +620,7 @@ def _search_ddg(query, num_results=5):
                     results.append({"snippet": rel.get("Text",""), "url": rel.get("FirstURL","")})
             return results
     except Exception:
-        pass
+        _logger.debug("DuckDuckGo search failed", exc_info=True)
     return []
 
 def call_ai(prompt, page="general"):
@@ -623,7 +638,7 @@ def call_ai(prompt, page="general"):
     ]:
         r = fn()
         if r: return {"success":True,"response":r,"source":src}
-    return {"success":False,"response":"فشل الاتصال بجميع مزودي AI","source":"none"}
+    return {"success": False, "response": USER_MSG_AI_UNAVAILABLE, "source": "none"}
 
 # ══ Gemini Chat ══════════════════════════════════════════════════════════════
 def gemini_chat(message, history=None, system_extra=""):
@@ -656,7 +671,7 @@ def gemini_chat(message, history=None, system_extra=""):
         except: continue
     r = _call_openrouter(message, sys)
     if r: return {"success":True,"response":r,"source":"OpenRouter"}
-    return {"success":False,"response":"فشل الاتصال","source":"none"}
+    return {"success": False, "response": USER_MSG_AI_UNAVAILABLE, "source": "none"}
 
 # ══ جلب صور المنتج من مصادر متعددة ══════════════════════════════════════════
 def fetch_product_images(product_name, brand=""):
@@ -905,7 +920,8 @@ def verify_match(p1, p2, pr1=0, pr2=0):
     sys = PAGE_PROMPTS["verify"]
     txt = _call_gemini(prompt, sys, temperature=0.1) or _call_openrouter(prompt, sys)
     if not txt:
-        return {"success":False,"match":False,"confidence":0,"reason":"فشل AI","correct_section":"تحت المراجعة","suggested_price":0,
+        return {"success": False, "match": False, "confidence": 0, "reason": USER_MSG_VERIFY_UNAVAILABLE,
+                "correct_section": "تحت المراجعة", "suggested_price": 0,
                 "ui_decision": ui_decision_from_verify_section("تحت المراجعة", False)}
     data = _parse_json(txt)
     if data:
@@ -968,6 +984,7 @@ def apply_gemini_reclassify_to_analysis_df(analysis_df, min_confidence: float = 
     try:
         mask = analysis_df["القرار"].astype(str).str.contains("مراجعة", na=False)
     except Exception:
+        _logger.warning("apply_gemini_reclassify: failed to build review mask", exc_info=True)
         return analysis_df
     row_indices = analysis_df.index[mask].tolist()
     if not row_indices:
@@ -995,6 +1012,7 @@ def apply_gemini_reclassify_to_analysis_df(analysis_df, min_confidence: float = 
         try:
             results = reclassify_review_items(items)
         except Exception:
+            _logger.exception("reclassify_review_items failed batch start=%s", start)
             continue
         if not results:
             continue
@@ -1082,7 +1100,7 @@ def ai_deep_analysis(our_product, our_price, comp_product, comp_price, section="
 اجب بتقرير مختصر: هل المطابقة صحيحة؟ السعر المقترح بالرقم؟ الاجراء الفوري؟"""
     txt = _call_gemini(prompt, grounding=bool(web_ctx)) or _call_openrouter(prompt)
     if txt: return {"success":True,"response":txt,"source":"Gemini" + (" + ويب" if web_ctx else "")}
-    return {"success":False,"response":"فشل التحليل"}
+    return {"success": False, "response": USER_MSG_AI_UNAVAILABLE}
 
 # ══ بحث mahwous.com ══════════════════════════════════════════════════════════
 def search_mahwous(product_name):
