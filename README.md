@@ -156,16 +156,34 @@ chmod +x scripts/verify_all.sh && ./scripts/verify_all.sh
 
 ---
 
+## 📁 هيكل المستودع (للنشر على Streamlit)
+
+ضع المشروع بحيث يكون **جذر المستودع** هو مجلد يحتوي مباشرةً على:
+
+| في الجذر | الغرض |
+|----------|--------|
+| `app.py` | نقطة دخول Streamlit (إلزامي في Cloud) |
+| `requirements.txt` | تبعيات بايثون |
+| `runtime.txt` | إصدار بايثون لـ Streamlit Community Cloud (`python-3.11`) |
+| `.streamlit/config.toml` | إعدادات الواجهة والخادم |
+| `engines/`، `utils/`، `mahwous_ui/` | الكود المنظم — **لا تنسخ** ملفات بايثون منها إلى الجذر |
+| `audit_tools_core.py` | منطق التدقيق بجانب الواجهة |
+| `data/` | مراجع ثابتة مثل `brands.csv`، `categories.csv`؛ ملفات الجلسة والسجلات مُستبعدة عبر `.gitignore` |
+
+إذا كان التطبيق داخل مجلد فرعي، في Streamlit Cloud اختر **App path** يشير إلى ذلك المجلد؛ الافتراضي هنا **الجذر** مع `app.py`.
+
+---
+
 ## 🚀 التشغيل السريع
 
-### 1️⃣ الرفع على Streamlit Cloud
-```bash
-# فك الضغط
-unzip mahwous_COMPLETE.zip
+### 1️⃣ نشر Streamlit Community Cloud (GitHub)
 
-# ارفع كل الملفات على:
-https://share.streamlit.io
-```
+1. ادخل [share.streamlit.io](https://share.streamlit.io) واربط مستودع GitHub.
+2. **Main file**: `app.py` (من جذر المستودع).
+3. **Branch**: `main` أو `master` (حسب فرعك).
+4. **Secrets**: من إعدادات التطبيق → *Secrets* — انسخ الحقول من `.streamlit/secrets.toml.example` (مفاتيح API، Webhooks، إلخ).
+
+بعد أول نشر، يُعاد البناء تلقائياً عند كل دفع إلى الفرع المربوط.
 
 ### 2️⃣ إضافة Secrets
 ```toml
