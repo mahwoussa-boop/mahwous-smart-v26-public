@@ -1,16 +1,1 @@
-{
-  "running": false,
-  "started_at": null,
-  "finished_at": null,
-  "last_error": null,
-  "urls_total": 0,
-  "urls_processed": 0,
-  "rows_in_csv": 0,
-  "current_sitemap": null,
-  "mode": "idle",
-  "urls_completed": 0,
-  "urls_failed": 0,
-  "urls_pending": 0,
-  "phase": "idle",
-  "last_sync_started_at": null
-}
+{"running":false,"started_at":null,"finished_at":null,"last_error":null,"urls_total":0,"urls_processed":0,"rows_in_csv":0,"current_sitemap":null,"mode":"idle","urls_completed":0,"urls_failed":0,"urls_pending":0,"phase":"idle","last_sync_started_at":null}

@@ -1,0 +1,28 @@
+{
+  "running": false,
+  "done": false,
+  "success": false,
+  "error": null,
+  "scrape": {
+    "current": 0,
+    "total": 1,
+    "label": "",
+    "elapsed_sec": 0,
+    "urls_per_min": 0.0,
+    "products_per_min": 0.0
+  },
+  "analysis": {
+    "phase": "🔄 فرز يدوي — كل الصفوف في النقطة",
+    "progress_pct": 1.0,
+    "ai_mode": "محرك + Gemini — يدوي (كامل النقطة)",
+    "counts": {
+      "price_raise": 22,
+      "price_lower": 30,
+      "approved": 10,
+      "review": 26,
+      "missing": 2037
+    },
+    "scraped_rows": 100
+  },
+  "updated_at": "2026-04-02T03:17:21.877624"
+}
