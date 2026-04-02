@@ -1,4 +1,4 @@
-# 🧪 مهووس v19 Complete — نظام التسعير الذكي
+# 🧪 مهووس v26 — نظام التسعير الذكي
 
 ## ✅ الميزات الكاملة
 
@@ -91,28 +91,68 @@ CompIndex:
 
 ---
 
-## 📦 الملفات
+## 📦 هيكل المشروع (v26)
 
 ```
-mahwous_COMPLETE/
-├── app.py                  ← التطبيق الرئيسي (1376 سطر)
-├── config.py               ← الإعدادات
-├── styles.py               ← التنسيقات
-├── requirements.txt        ← المكتبات
-├── README.md               ← هذا الملف
+mahwous-smart-v26-public/
+├── app.py                  ← نقطة الدخول Streamlit + كشط/شريط جانبي
+├── config.py               ← إعدادات و SECTIONS
+├── styles.py               ← تنسيقات CSS
+├── requirements.txt
+├── .env.example            ← قالب متغيرات البيئة (انسخ إلى .env محلياً)
+│
+├── mahwous_ui/             ← صفحات الواجهة المستخرجة من app
+│   ├── pro_table.py        ← جدول المقارنة المشترك (سعر أعلى/أقل/موافق/مراجعة)
+│   ├── analysis_redistribute.py  ← إعادة توزيع يدوية (جلسة Streamlit)
+│   └── …                   ← dashboard, upload, ai_page, …
 │
 ├── engines/
-│   ├── engine.py           ← v21 محرك سريع (530 سطر)
-│   └── ai_engine.py        ← Gemini + Fragrantica (312 سطر)
+│   ├── engine.py           ← تحليل ومطابقة
+│   └── ai_engine.py        ← Gemini وواجهات AI
 │
 ├── utils/
-│   ├── make_helper.py      ← Make.com + "no"
-│   ├── helpers.py          ← دوال مساعدة
-│   └── db_manager.py       ← قاعدة البيانات
+│   ├── analysis_sections.py ← split_analysis_results (بدون Streamlit)
+│   ├── make_helper.py      ← Make.com
+│   ├── helpers.py
+│   └── db_manager.py
+│
+├── tests/                  ← unittest (استيراد صفحات، split_analysis، safe_float، SECTIONS)
+├── .github/workflows/
+│   └── ci.yml              ← CI على GitHub (Python 3.11 و 3.12)
+├── scripts/
+│   ├── verify_all.ps1      ← نفس فحوصات CI على Windows
+│   └── verify_all.sh       ← نفس فحوصات CI على Linux/macOS
 │
 └── .streamlit/
-    └── config.toml         ← تنسيق الواجهة
+    └── config.toml
 ```
+
+### جودة الكود والتحقق المحلي
+
+```bash
+cd mahwous-smart-v26-public
+python -m pip install -r requirements.txt
+python -m compileall -q .
+python -m unittest discover -s tests -v
+streamlit run app.py
+```
+
+أو سكربت واحد (يطابق ما يُشغَّل في CI):
+
+```powershell
+# Windows (PowerShell)
+.\scripts\verify_all.ps1
+```
+
+```bash
+# Linux / macOS
+chmod +x scripts/verify_all.sh && ./scripts/verify_all.sh
+```
+
+**GitHub Actions:** عند الدفع إلى `main` / `master` / `develop` يُشغَّل تلقائياً: تثبيت `requirements.txt`، `compileall`، و`unittest discover`.
+
+- **`utils/analysis_sections`**: منطق تقسيم أقسام التحليل فقط؛ أي منطق يعتمد على `st.session_state` يبقى تحت **`mahwous_ui/`** (مثل `analysis_redistribute.py`).
+- **`mahwous_ui/audit_tools_page.py`** و**`audit_tools_core.py`**: واجهة ومنطق «التدقيق والتحسين» (مقارنة ذكية، مدقق متجر، SEO)؛ تُفتح من الشريط الجانبي وتعمل بجانب التطبيق الرئيسي دون الخلط مع محرك التحليل المركزي.
 
 ---
 
@@ -129,13 +169,17 @@ https://share.streamlit.io
 
 ### 2️⃣ إضافة Secrets
 ```toml
-# Settings → Secrets
+# Settings → Secrets (أو محلياً: انسخ .streamlit/secrets.toml.example إلى secrets.toml)
 
-GEMINI_API_KEYS = '["AIzaSyD4PLzzy8GTmqtLtEhTecUKHZ7pPPhtv3s","AIzaSyCzMKz1dcEExSTUoOx-dXFAVaxlgvy1SYo","AIzaSyDQwXq-SqqGiyZzjrQIpDRDjOBr7CfCifY","AIzaSyCM_7dJ-0mq4H81CHBYAIA1MkDbj8lk7Ko"]'
+GEMINI_API_KEY = "ضع_مفتاحك_من_Google_AI_Studio"
 
-WEBHOOK_UPDATE_PRICES = "https://hook.eu2.make.com/99oljy0d6r3chwg6bdfsptcf6bk8htsd"
+# أو عدة مفاتيح:
+# GEMINI_API_KEYS = '["KEY1","KEY2"]'
 
-WEBHOOK_NEW_PRODUCTS = "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
+WEBHOOK_UPDATE_PRICES = "https://hook.eu2.make.com/مسار_الويب_هوك_الخاص_بك"
+
+WEBHOOK_MISSING_PRODUCTS = "https://hook.eu2.make.com/مسار_الويب_هوك_للمفقودات"
+# (اسم قديم مدعوم: WEBHOOK_NEW_PRODUCTS)
 ```
 
 ### 3️⃣ جرّب!

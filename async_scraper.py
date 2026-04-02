@@ -673,6 +673,7 @@ def get_checkpoint_recovery_status() -> dict[str, Any]:
             raw_rows = raw if isinstance(raw, list) else []
             fp_match = bool(seeds_fp) and (ck_fp == seeds_fp)
         except Exception:
+            logger.exception("get_checkpoint_recovery_status: read checkpoint failed path=%s", CHECKPOINT_JSON)
             raw_rows = []
     usable = (
         [r for r in raw_rows if isinstance(r, dict)]
