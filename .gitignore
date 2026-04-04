@@ -1,21 +1,5 @@
-.env
 __pycache__/
 *.pyc
 *.pyo
 *.db
-data/scrape_events.ndjson
 .streamlit/secrets.toml
-
-# وقت التشغيل والسجلات (لا تُرفع إلى GitHub — تُنشأ على السيرفر أو محلياً)
-data/logs/
-*.log
-data/*.pkl
-data/scrape_live_snapshot.json
-data/scraper_bg_state.json
-data/scraper_checkpoint.json
-data/scraper_last_run.json
-data/scraper_progress.json
-data/final_priced_latest.csv
-data/final_priced_latest_meta.json
-data/competitors_checkpoint.csv
-data/competitors_latest.csv

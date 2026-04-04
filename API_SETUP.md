@@ -1,22 +1,24 @@
 # 🤖 كيفية ربط الذكاء الاصطناعي (Google Gemini) بالمشروع
 
-الكود يقرأ المفاتيح من `secrets.toml` أو متغيرات البيئة. **لا تضع مفاتيحاً حقيقية في هذا الملف عند المشاركة.**
+لقد قمت بإعداد الكود ليدعم مفتاح API الخاص بك بشكل تلقائي. إليك الصيغة الصحيحة والطرق المتاحة لإضافته:
 
 ### 1️⃣ الطريقة الأولى: عبر ملف `secrets.toml` (للتشغيل المحلي)
-أنشئ مجلد `.streamlit` وانسخ `secrets.toml.example` إلى `secrets.toml` ثم عدّل القيم:
+قم بإنشاء مجلد باسم `.streamlit` (إذا لم يكن موجوداً) وبداخله ملف باسم `secrets.toml` وضع فيه الكود التالي:
 ```toml
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+GEMINI_API_KEY = "AIzaSyAnq3hKTSS0-lS8MTeYWRMAl-eVVwTw3Jc"
 ```
-*ملاحظة: `secrets.toml` مستبعد من Git عبر `.gitignore`.*
+*ملاحظة: هذا الملف مستبعد من GitHub تلقائياً لحماية خصوصيتك.*
 
-### 2️⃣ الطريقة الثانية: عبر متغيرات البيئة (Railway / Docker / إلخ)
+### 2️⃣ الطريقة الثانية: عبر متغيرات البيئة (Environment Variables)
+إذا كنت ترفع المشروع على منصات مثل **Railway** أو **Streamlit Cloud**، قم بإضافة متغير بيئة جديد:
 - **Key:** `GEMINI_API_KEY`
-- **Value:** مفتاحك من Google AI Studio
+- **Value:** `AIzaSyAnq3hKTSS0-lS8MTeYWRMAl-eVVwTw3Jc`
 
-### 3️⃣ الطريقة الثالثة: عدة مفاتيح (لتقليل حدود الاستخدام)
+### 3️⃣ الطريقة الثالثة: دعم عدة مفاتيح (لتجنب الحظر)
+إذا كان لديك أكثر من مفتاح، يمكنك إضافتها بصيغة مصفوفة في `secrets.toml`:
 ```toml
-GEMINI_API_KEYS = ["key1", "key2", "key3"]
+GEMINI_API_KEYS = ["key1", "key2", "AIzaSyAnq3hKTSS0-lS8MTeYWRMAl-eVVwTw3Jc"]
 ```
 
 ---
-**✅ `config.py` يقرأ هذه القيم بالترتيب الموثّق في الكود.**
+**✅ تم التأكد من أن الكود في `config.py` يقرأ هذه القيم بالترتيب الصحيح.**

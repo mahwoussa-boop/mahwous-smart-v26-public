@@ -1,11 +1,9 @@
 """
-config.py - الإعدادات المركزية (v26.0)
-المفاتيح عبر Streamlit Secrets / متغيرات البيئة
+config.py - الإعدادات المركزية v19.0
+المفاتيح محمية عبر Streamlit Secrets
 """
 import json as _json
 import os as _os
-import shutil as _shutil
-import tempfile
 
 # ===== معلومات التطبيق =====
 APP_TITLE   = "نظام التسعير الذكي - مهووس"
@@ -73,9 +71,6 @@ def _parse_gemini_keys():
 
     # ─── المحاولة 2: GEMINI_API_KEY (مفتاح واحد) ───
     single = _s("GEMINI_API_KEY", "")
-    # Railway/UI أحياناً يحفظان Gemini_API_Key (حالة أحرف مختلفة؛ Linux حساس)
-    if not single:
-        single = (_os.environ.get("Gemini_API_Key", "") or _os.environ.get("GEMINI_KEY", "")).strip()
     if single and single not in keys:
         keys.append(single)
 
@@ -86,29 +81,9 @@ def _parse_gemini_keys():
         if k and k not in keys:
             keys.append(k)
 
-    # ─── أسماء بديلة شائعة (Railway / Google AI Studio) ───
-    for n in ("GOOGLE_API_KEY", "GOOGLE_AI_API_KEY", "GENERATIVE_AI_API_KEY"):
-        k = _s(n, "")
-        if k and k not in keys:
-            keys.append(k)
-
-    # تنظيف نهائي: مفاتيح Google عادة ≥30 حرفاً؛ الحد الأدنى 12 لتجنب القيم الوهمية
-    keys = [k.strip() for k in keys if k and len(k.strip()) >= 12]
+    # تنظيف نهائي: إزالة المفاتيح الفارغة أو القصيرة
+    keys = [k.strip() for k in keys if k and len(k) > 20]
     return keys
-
-
-def get_gemini_api_keys():
-    """إعادة قراءة المفاتيح من البيئة (مفيد للعرض بعد تغيير Variables دون إعادة تشغيل العملية)."""
-    return _parse_gemini_keys()
-
-
-def get_openrouter_api_key() -> str:
-    """إعادة قراءة المفتاح من البيئة (Railway / Secrets دون إعادة تشغيل العملية)."""
-    return _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
-
-
-def get_cohere_api_key() -> str:
-    return _s("COHERE_API_KEY") or ""
 
 
 # ══════════════════════════════════════════════
@@ -116,65 +91,29 @@ def get_cohere_api_key() -> str:
 # ══════════════════════════════════════════════
 GEMINI_API_KEYS    = _parse_gemini_keys()
 GEMINI_API_KEY     = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
-OPENROUTER_API_KEY = get_openrouter_api_key()
-COHERE_API_KEY     = get_cohere_api_key()
+OPENROUTER_API_KEY = _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
+COHERE_API_KEY     = _s("COHERE_API_KEY") or ""
 EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 
 # ══════════════════════════════════════════════
-#  Make Webhooks (يُفضَّل الدوال — تقرأ البيئة/Secrets بعد مزامنة الجلسة في app.py)
+#  Make Webhooks
 # ══════════════════════════════════════════════
-def get_webhook_update_prices() -> str:
-    return (_s("WEBHOOK_UPDATE_PRICES") or "").strip()
-
-
-def get_webhook_missing_products() -> str:
-    """
-    سيناريو «أتمتة التسعير» / إضافة المفقودات في سلة فقط.
-    يفضّل WEBHOOK_MISSING_PRODUCTS؛ إن وُجد WEBHOOK_NEW_PRODUCTS قديماً يُستخدم كاحتياط.
-    """
-    v = (_s("WEBHOOK_MISSING_PRODUCTS") or "").strip()
-    if v:
-        return v
-    return (_s("WEBHOOK_NEW_PRODUCTS") or "").strip()
-
-
-def get_webhook_new_products() -> str:
-    """توافق خلفي — نفس دالة المفقودات."""
-    return get_webhook_missing_products()
-
-
-# توثيق روابط سيناريوهات Make المشتركة (الاستنساخ من المتصفح — الرابط الفعلي للـ Webhook من لوحتك)
-MAKE_DOCS_SCENARIO_UPDATE_PRICES = (
-    "https://eu2.make.com/public/shared-scenario/9uue7ENfzO5/integration-webhooks-salla"
+WEBHOOK_UPDATE_PRICES = (
+    _s("WEBHOOK_UPDATE_PRICES") or
+    "https://hook.eu2.make.com/8jia6gc7s1cpkeg6catlrvwck768sbfk"
 )
-MAKE_DOCS_SCENARIO_PRICING_AUTOMATION = (
-    "https://eu2.make.com/public/shared-scenario/UsesKnA62xy/mahwous-pricing-automation-salla"
+WEBHOOK_NEW_PRODUCTS = (
+    _s("WEBHOOK_NEW_PRODUCTS") or
+    "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
 )
-
-# ══════════════════════════════════════════════
-#  كشط (async_scraper.py) — تُقرأ من os.environ على التشغيل
-#  • SCRAPER_MAX_CONCURRENT_FETCH (افتراضي 28، حد أعلى 64) — تزيد السرعة؛ خفّضها عند الحظر
-#  • SCRAPER_PIPELINE_EVERY — فاصل لقطات الفرز أثناء الكشط (افتراضي 100 صف)
-#  • MAHWOUS_UI_LIVE_REFRESH_MS — تبطئة تحديث واجهة Streamlit أثناء الكشط الطويل
-#  • MAHWOUS_SCRAPE_UI_MIN_INTERVAL_SEC — أقل فاصل (ثوانٍ) بين كتابات لقطة JSON للتقدم الحي (افتراضي حسب حجم الطابور)
-#  • MAHWOUS_DB_PATH — مسار ملف SQLite كاملاً (تجاوز data/pricing_v18.db الافتراضي)
-#  • MAHWOUS_LOG_LEVEL — مستوى التسجيل: DEBUG / INFO / WARNING / ERROR (افتراضي INFO)
-#  استيراد سلة (utils/helpers.py export_missing_products_to_salla_csv_bytes):
-#  • SALLA_IMPORT_DEFAULT_CATEGORY — مسار تصنيف افتراضي يطابق categories.csv / لوحة سلة
-#  • SALLA_IMPORT_FALLBACK_BRAND — ماركة احتياط عند «غير محدد» (نص كما في brands.csv)
-#  • WEBHOOK_UPDATE_PRICES — تعديل أسعار (🔴 أعلى 🟢 أقل ✅ موافق)؛ WEBHOOK_MISSING_PRODUCTS — مفقودات فقط
-#  • WEBHOOK_NEW_PRODUCTS — اسم قديم؛ يُقرأ كاحتياط إن لم يُضبط WEBHOOK_MISSING_PRODUCTS
-#  AI (engines/ai_engine.py):
-#  • OPENROUTER_MODELS — معرّفات نماذج OpenRouter مفصولة بفواصل (تجاوز القائمة الافتراضية)
-#  • احذف COHERE_API_KEY من Secrets إذا كان 401 لتقليل الضوضاء (Cohere اختياري)
-# ══════════════════════════════════════════════
 
 # ══════════════════════════════════════════════
 #  ألوان
 # ══════════════════════════════════════════════
 COLORS = {
     "raise": "#dc3545", "lower": "#ffc107", "approved": "#28a745",
-    "missing": "#007bff", "review": "#ff9800", "primary": "#6C63FF",
+    "missing": "#007bff", "review": "#ff9800", "excluded": "#9e9e9e",
+    "primary": "#6C63FF",
 }
 
 # ══════════════════════════════════════════════
@@ -194,7 +133,6 @@ PRICE_DIFF_THRESHOLD = PRICE_TOLERANCE
 REJECT_KEYWORDS = [
     "sample","عينة","عينه","decant","تقسيم","تقسيمة",
     "split","miniature","0.5ml","1ml","2ml","3ml",
-    "vial","سمبل",
 ]
 TESTER_KEYWORDS = ["tester","تستر","تيستر"]
 SET_KEYWORDS    = ["set","gift set","طقم","مجموعة","coffret"]
@@ -274,70 +212,24 @@ AUTOMATION_RULES_DEFAULT = [
 # جدولة البحث الدوري (بالدقائق)
 AUTO_SEARCH_INTERVAL_MINUTES = 60 * 6   # كل 6 ساعات
 AUTO_PUSH_TO_MAKE = False               # إرسال تلقائي لـ Make.com (يتطلب تفعيل يدوي)
-AUTO_DECISION_CONFIDENCE = 92           # حد الثقة للقرار التلقائي (تسعير/رفع-خفض)
-# حاجز المفقودات: تطابق نصي مع كتالوجنا (token_set_ratio) — يُستبعد عند ≥88%
-SMART_MISSING_FUZZ_THRESHOLD = 88
-# تحقق AI لقسم المراجعة — واقعي مع مخرجات verify_match (غالباً 65–90)
-REVIEW_VERIFY_MIN_CONFIDENCE = 72
+AUTO_DECISION_CONFIDENCE = 92           # حد الثقة للقرار التلقائي
 
 # ══════════════════════════════════════════════
 #  أقسام التطبيق (v26.0 — مع لوحة الأتمتة)
 # ══════════════════════════════════════════════
 SECTIONS = [
     "📊 لوحة التحكم",
-    "📂 رفع الملفات",
-    "➕ منتج سريع",
     "🔴 سعر أعلى",
     "🟢 سعر أقل",
     "✅ موافق عليها",
     "🔍 منتجات مفقودة",
     "⚠️ تحت المراجعة",
+    "⚪ مستبعد (لا يوجد تطابق)",
     "✔️ تمت المعالجة",
-    "🤖 الذكاء الصناعي",
     "⚡ أتمتة Make",
     "🔄 الأتمتة الذكية",
     "⚙️ الإعدادات",
-    "📜 السجل",
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-
-
-def _project_root_dir() -> str:
-    """مجلد جذر المشروع (حيث يقع config.py)."""
-    return _os.path.dirname(_os.path.abspath(__file__))
-
-
-def _resolve_db_path() -> str:
-    """
-    مسار SQLite موحّد لكل الوحدات.
-    - الأولوية: متغير البيئة MAHWOUS_DB_PATH (مسار كامل للملف).
-    - الافتراضي: data/pricing_v18.db تحت جذر المشروع (دائم أكثر من مجلد temp).
-    - احتياطي: مجلد temp النظام إن تعذّر إنشاء/الكتابة في data/.
-    - ترحيل لمرة واحدة: إن وُجدت قاعدة قديمة في temp ولم يُنشأ الملف في data بعد، تُنسخ.
-    """
-    env = (_os.environ.get("MAHWOUS_DB_PATH") or "").strip()
-    if env:
-        return env
-    legacy_temp = _os.path.join(tempfile.gettempdir(), "pricing_v18.db")
-    data_dir = _os.path.join(_project_root_dir(), "data")
-    try:
-        _os.makedirs(data_dir, exist_ok=True)
-        candidate = _os.path.join(data_dir, "pricing_v18.db")
-        if not _os.path.isfile(candidate) and _os.path.isfile(legacy_temp):
-            try:
-                _shutil.copy2(legacy_temp, candidate)
-            except Exception:
-                pass
-        return candidate
-    except Exception:
-        return legacy_temp if _os.path.isfile(legacy_temp) else _os.path.join(
-            tempfile.gettempdir(), "pricing_v18.db"
-        )
-
-
-# نفس الاسم في config و db_manager (استورد من هنا فقط)
-DB_PATH = _resolve_db_path()
-
-# قائمة المنافسين الافتراضية للكشط — يُحمَّل من الملف؛ يمكن تعديل JSON دون المساس بالكود
-PRESET_COMPETITORS_PATH = _os.path.join("data", "preset_competitors.json")
+DB_PATH          = "perfume_pricing.db"

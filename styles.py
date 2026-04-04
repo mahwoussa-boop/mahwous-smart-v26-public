@@ -1,8 +1,125 @@
 """
 styles.py - التصميم v20.0 — بطاقات محسنة + عرض المنافسين
 """
-from html import escape as _html_escape
-from textwrap import dedent
+import html
+import re
+from urllib.parse import urlparse
+
+from utils.data_helpers import first_image_url_string
+
+_BAD_META = frozenset({"", "—", "-", "nan", "none", "na", "<na>"})
+
+
+def _strip_mahally_local_prefix(s: str) -> str:
+    """إزالة بادئة «محلي -» الشائعة في عناوين المتاجر."""
+    t = str(s or "").strip()
+    if not t:
+        return t
+    t = re.sub(r"^محلي\s*[-–—:،]\s*", "", t)
+    t = re.sub(r"^محلي\s+", "", t).strip()
+    return t
+
+
+def _is_upload_filename(s: str) -> bool:
+    """اسم ملف مرفوع (مفتاح comp_dfs) — لا يُعرض كاسم متجر."""
+    sl = str(s).strip().lower()
+    return bool(sl.endswith((".csv", ".xlsx", ".xls", ".tsv", ".ods")))
+
+
+def _lazy_img_tag(src, width=40, height=40, alt="", loading="lazy"):
+    """وسم صورة — lazy افتراضياً؛ eager للصور فوق الطي (مثل «تمت المعالجة»)."""
+    if not (src or "").strip():
+        return ""
+    s = html.escape(first_image_url_string(str(src).strip()), quote=True)
+    a = html.escape(alt or "", quote=True)
+    ld = "eager" if str(loading).lower().strip() == "eager" else "lazy"
+    return (
+        f'<img src="{s}" alt="{a}" loading="{ld}" decoding="async" '
+        f'style="width:{width}px;height:{height}px;object-fit:cover;'
+        f'border-radius:6px;flex-shrink:0;opacity:1;visibility:visible;display:block"/>'
+    )
+
+
+lazy_img_tag = _lazy_img_tag
+
+
+def _comp_url_footer(comp_url):
+    """ذيل بطاقة: رابط صفحة المنتج عند المنافس (يفتح في تاب جديد)."""
+    u = (comp_url or "").strip()
+    if not u.startswith("http"):
+        return ""
+    uh = html.escape(u, quote=True)
+    return (
+        f'<div style="text-align:center;padding:6px 10px 8px;border-top:1px solid rgba(51,51,68,.55);'
+        f'background:rgba(10,17,32,.85)">'
+        f'<a href="{uh}" target="_blank" rel="noopener noreferrer" '
+        f'style="display:inline-block;font-size:.8rem;color:#4fc3f7;font-weight:700;text-decoration:none">'
+        f'🔗 عرض عند المنافس</a></div>'
+    )
+
+
+def _miss_card_link_title(name, brand, comp, comp_url, size="", ptype=""):
+    """عنوان مقروء لبطاقة المفقود عندما يكون عمود الاسم مخزناً كرابطاً."""
+    n = str(name or "").strip()
+    nl = n.lower()
+    if not nl.startswith("http://") and not nl.startswith("https://"):
+        return n
+    b = str(brand or "").strip()
+    c = str(comp or "").strip()
+    sz = str(size or "").strip()
+    pt = str(ptype or "").strip()
+    parts = []
+    if b and b.lower() not in _BAD_META:
+        parts.append(b)
+    if c and c.lower() not in _BAD_META and not _is_upload_filename(c):
+        parts.append(c)
+    if len(parts) >= 2:
+        return f"{parts[0]} · {parts[1]}"
+    if len(parts) == 1:
+        return parts[0]
+    # الاسم كان رابطاً ولا يوجد ماركة+متجر كافية: صِف المنتج بالحجم/النوع إن وُجد
+    desc = [x for x in (b, sz, pt) if x and x.lower() not in _BAD_META]
+    if desc:
+        return " · ".join(desc[:4])
+    u = (comp_url or "").strip()
+    if u.startswith("http"):
+        try:
+            host = urlparse(u).netloc.replace("www.", "")
+            if host:
+                return f"منتج — {host}"
+        except Exception:
+            pass
+    return "🔗 عرض المنتج"
+
+
+def _linked_display_text(text, url) -> str:
+    """لا نعرض عنوان http كاملاً كنص الرابط — غالباً خطأ عمود (الاسم مكان الرابط)."""
+    t_raw = str(text or "").strip()
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return t_raw
+    tl = t_raw.lower()
+    if tl.startswith("http://") or tl.startswith("https://"):
+        return "🔗 عرض المنتج"
+    return t_raw
+
+
+def _linked_product_title(text, url, *, color, font_size, font_weight="700"):
+    """اسم المنتج كرابط إلى صفحة المنافس عند توفر URL."""
+    t_raw = _linked_display_text(text, url)
+    t = html.escape(t_raw, quote=False)
+    u = (url or "").strip()
+    if u.startswith("http"):
+        uh = html.escape(u, quote=True)
+        return (
+            f'<a href="{uh}" target="_blank" rel="noopener noreferrer" '
+            f'style="color:{color};font-weight:{font_weight};font-size:{font_size};'
+            f'text-decoration:underline;text-underline-offset:3px">{t}</a>'
+        )
+    return f'<span style="color:{color};font-weight:{font_weight};font-size:{font_size}">{t}</span>'
+
+
+linked_product_title = _linked_product_title
 
 
 def get_styles():
@@ -53,8 +170,7 @@ def get_main_css():
 /* ── بطاقة المنتج المفقود المحسنة ── */
 .miss-card{border-radius:10px;padding:14px;margin:6px 0;background:linear-gradient(135deg,#0a1628,#0e1a30)}
 .miss-card .miss-header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.miss-card .miss-info{flex:1;min-width:0}
-.miss-card .miss-thumb{flex-shrink:0}
+.miss-card .miss-info{flex:1}
 .miss-card .miss-name{font-weight:700;color:#4fc3f7;font-size:1rem}
 .miss-card .miss-meta{font-size:.75rem;color:#888;margin-top:4px}
 .miss-card .miss-prices{text-align:left;min-width:120px}
@@ -86,32 +202,6 @@ details summary span[data-testid] svg {
     direction: rtl;
     font-family: 'Tajawal', sans-serif !important;
 }
-/* ── زر «التدقيق والتحسين» — نفس إحساس صفوف الراديو (أقسام) ── */
-section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-secondary"],
-section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-tertiary"] {
-    background: transparent !important;
-    border: 1px solid rgba(51, 51, 68, 0.45) !important;
-    border-radius: 8px !important;
-    color: rgba(250, 250, 250, 0.95) !important;
-    font-weight: 400 !important;
-    font-size: 0.9375rem !important;
-    padding: 0.3rem 0.65rem !important;
-    min-height: 2.15rem !important;
-    box-shadow: none !important;
-    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease !important;
-}
-section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-secondary"]:hover,
-section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-secondary"]:focus-visible,
-section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-tertiary"]:hover,
-section[data-testid="stSidebar"] .st-key-nav_audit_tools button[data-testid="stBaseButton-tertiary"]:focus-visible {
-    background: rgba(108, 99, 255, 0.12) !important;
-    border-color: rgba(108, 99, 255, 0.45) !important;
-    color: #fff !important;
-}
-section[data-testid="stSidebar"] .st-key-nav_audit_tools button p {
-    font-family: 'Tajawal', sans-serif !important;
-    font-size: 0.9375rem !important;
-}
 /* ── زر القائمة الجانبية ── منقول إلى get_sidebar_toggle_js */
 </style>"""
 
@@ -139,82 +229,69 @@ def stat_card(icon, label, value, color="#6C63FF"):
     return f'<div class="stat-card" style="border-top:3px solid {color}"><div style="font-size:1.3rem">{icon}</div><div class="num" style="color:{color}">{value}</div><div class="lbl">{label}</div></div>'
 
 
-def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", product_id="", our_img="", comp_img=""):
-    """بطاقة VS الأساسية — المنافس الرئيسي (الأقل سعراً) + صور اختيارية"""
+def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", product_id="",
+            our_img="", comp_img="", comp_url="", our_url="",
+            accent_border=None, row_bg=None):
+    """بطاقة VS الأساسية — المنافس الرئيسي (الأقل سعراً). our_img/comp_img/comp_url/our_url اختياريان.
+    accent_border/row_bg: تنسيق اختياري لصفوف «مستبعد» (رمادي)."""
     dc = "#FF1744" if diff > 0 else "#00C853" if diff < 0 else "#FFD600"
     src = f'<div style="font-size:.65rem;color:#666">{comp_source}</div>' if comp_source else ""
     pid = str(product_id) if product_id and str(product_id) not in ("", "nan", "None", "0") else ""
     pid_html = f'<div style="font-size:.65rem;color:#6C63FF99;margin-top:1px">#{pid}</div>' if pid else ""
+    our_thumb = _lazy_img_tag(our_img, width=90, height=90, alt="منتجنا")
+    comp_thumb = _lazy_img_tag(comp_img, width=90, height=90, alt="المنافس")
     # السعر المقترح = أقل من أقل منافس بريال
     suggested = comp_price - 1 if comp_price > 0 else 0
     sugg_html = ""
     if suggested > 0 and diff > 10:
         sugg_html = f'<div style="font-size:.7rem;color:#4caf50;margin-top:2px">مقترح: {suggested:,.0f} ر.س</div>'
-    ou = str(our_img or "").strip()
-    cu = str(comp_img or "").strip()
-    our_img_html = (
-        f'<img src="{_html_escape(ou, quote=True)}" style="width:44px;height:44px;border-radius:6px;object-fit:cover;margin-bottom:6px;border:1px solid #6C63FF">'
-        if ou and ou.lower() not in ("nan", "none")
-        else ""
+    our_title_html = _linked_product_title(
+        our_name, our_url, color="#B8B4FF", font_size=".9rem",
     )
-    comp_img_html = (
-        f'<img src="{_html_escape(cu, quote=True)}" style="width:44px;height:44px;border-radius:6px;object-fit:cover;margin-bottom:6px;border:1px solid #ff9800">'
-        if cu and cu.lower() not in ("nan", "none")
-        else ""
+    our_block = (
+        f'<div class="our-s" style="display:flex;align-items:flex-start;gap:10px;flex-direction:row-reverse">'
+        f'{our_thumb}<div style="flex:1;min-width:0">'
+        f'<div style="font-size:.7rem;color:#8B8B8B">منتجنا</div>'
+        f'<div style="line-height:1.35">{our_title_html}</div>{pid_html}'
+        f'<div style="font-size:1.1rem;font-weight:900;color:#6C63FF;margin-top:2px">{our_price:.0f} ر.س</div>{sugg_html}</div></div>'
     )
-    return f'''<div class="vs-row">
-<div class="our-s">{our_img_html}<div style="font-size:.7rem;color:#8B8B8B">منتجنا</div><div style="font-weight:700;color:#B8B4FF;font-size:.9rem">{our_name}</div>{pid_html}<div style="font-size:1.1rem;font-weight:900;color:#6C63FF;margin-top:2px">{our_price:.0f} ر.س</div>{sugg_html}</div>
+    comp_title_html = _linked_product_title(
+        comp_name, comp_url, color="#FFD180", font_size=".9rem",
+    )
+    comp_block = (
+        f'<div class="comp-s" style="display:flex;align-items:flex-start;gap:10px">'
+        f'{comp_thumb}<div style="flex:1;min-width:0">'
+        f'<div style="font-size:.7rem;color:#8B8B8B">المنافس المتصدر</div>'
+        f'<div style="line-height:1.35">{comp_title_html}</div>'
+        f'<div style="font-size:1.1rem;font-weight:900;color:#ff9800;margin-top:2px">{comp_price:.0f} ر.س</div>{src}</div></div>'
+    )
+    _foot = _comp_url_footer(comp_url)
+    inner = f'''<div class="vs-row">
+{our_block}
 <div class="vs-badge">VS</div>
-<div class="comp-s">{comp_img_html}<div style="font-size:.7rem;color:#8B8B8B">المنافس المتصدر</div><div style="font-weight:700;color:#FFD180;font-size:.9rem">{comp_name}</div><div style="font-size:1.1rem;font-weight:900;color:#ff9800;margin-top:2px">{comp_price:.0f} ر.س</div>{src}</div>
-</div><div style="text-align:center;background:#1A1A2E;padding:4px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:.9rem">الفرق: {diff:+.0f} ر.س</span></div>'''
-
-
-def comp_strip(all_comps, our_price=None, rank_by_threat=False, show_threat_badge=False):
-    """شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم واسم المنتج لديهم.
-
-    - افتراضياً: ترتيب من **الأقل سعراً** (سلوك قديم).
-    - إذا ``rank_by_threat=True`` و``our_price`` > 0: ترتيب بـ **Threat Score** (WTI) عند توفر ``utils.threat_score``.
-    - يقبل ``list[dict]`` أو ``pandas.DataFrame`` (صفوف كمنافسين).
-    """
-    if all_comps is None:
-        return ""
-    try:
-        import pandas as pd
-
-        _has_pd = True
-    except ImportError:
-        pd = None
-        _has_pd = False
-    if _has_pd and isinstance(all_comps, pd.DataFrame):
-        if all_comps.empty:
-            return ""
-        work = all_comps.to_dict("records")
-    elif isinstance(all_comps, list):
-        if len(all_comps) == 0:
-            return ""
-        work = [dict(c) if isinstance(c, dict) else c for c in all_comps]
-    else:
-        return ""
-    if rank_by_threat and our_price is not None and float(our_price) > 0:
-        try:
-            from utils.threat_score import rank_competitors_for_ui
-
-            sorted_comps = rank_competitors_for_ui(work, float(our_price))
-        except Exception:
-            sorted_comps = sorted(
-                work, key=lambda c: float(c.get("price", c.get("comp_price", 0)) or 0)
-            )
-    else:
-        sorted_comps = sorted(
-            work, key=lambda c: float(c.get("price", c.get("comp_price", 0)) or 0)
+{comp_block}
+</div><div style="text-align:center;background:#1A1A2E;padding:4px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:.9rem">الفرق: {diff:+.0f} ر.س</span></div>{_foot}'''
+    if accent_border:
+        bg = row_bg if row_bg is not None else "rgba(158,158,158,.10)"
+        return (
+            f'<div style="border-top:3px solid {accent_border};background:{bg};'
+            f'border-radius:10px;padding:6px 6px 0;margin:8px 0">{inner}</div>'
         )
+    return inner
+
+
+def comp_strip(all_comps):
+    """شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم واسم المنتج لديهم مرتبين من الأقل"""
+    if not all_comps or not isinstance(all_comps, list) or len(all_comps) == 0:
+        return ""
+    # ترتيب من الأقل سعراً
+    sorted_comps = sorted(all_comps, key=lambda c: float(c.get("price", 0) or 0))
     rows = []
     for i, cm in enumerate(sorted_comps):
         c_store = str(cm.get("competitor", "")).strip()
-        c_price = float(cm.get("price", cm.get("comp_price", 0)) or 0)
+        c_price = float(cm.get("price", 0) or 0)
         c_pname = str(cm.get("name", "")).strip()
         c_score = float(cm.get("score", 0) or 0)
-        c_img = str(cm.get("image_url", "") or cm.get("image", "") or "").strip()
         is_leader = (i == 0)
         crown = "👑" if is_leader else ""
         bg = "rgba(255,152,0,.10)" if is_leader else "rgba(108,99,255,.05)"
@@ -223,34 +300,34 @@ def comp_strip(all_comps, our_price=None, rank_by_threat=False, show_threat_badg
         # اسم المنتج لدى المنافس (مختصر)
         short_pname = c_pname[:50] + ".." if len(c_pname) > 50 else c_pname
         score_html = f'<span style="color:#888;font-size:.62rem">{c_score:.0f}%</span>' if c_score > 0 else ""
-        threat_html = ""
-        if show_threat_badge and cm.get("threat_score") is not None:
-            try:
-                ts = float(cm["threat_score"])
-                threat_html = (
-                    f'<span style="color:#ff8a80;font-size:.58rem;margin-inline-start:4px" '
-                    f'title="Threat Score">⚡{ts:.1f}</span>'
-                )
-            except (TypeError, ValueError):
-                threat_html = ""
-        img_html = (
-            f'<img src="{_html_escape(c_img, quote=True)}" '
-            f'style="width:50px;height:50px;border-radius:10px;object-fit:cover;'
-            f'border:1px solid {border};background:#0e1628;flex:0 0 50px" '
-            f'onerror="this.style.display=\'none\'" />'
-            if c_img and c_img.lower() not in ("nan", "none")
-            else ""
-        )
+        _thumb_url = (cm.get("thumb") or cm.get("image_url") or cm.get("image") or "")
+        thumb_html = _lazy_img_tag(_thumb_url, width=24, height=24, alt="") if _thumb_url else ""
+        purl = str(cm.get("product_url") or cm.get("url") or "").strip()
+        title_esc = html.escape(c_pname, quote=True)
+        if purl.startswith("http"):
+            pu = html.escape(purl, quote=True)
+            pname_html = (
+                f'<a href="{pu}" target="_blank" rel="noopener noreferrer" '
+                f'style="color:#aaa;font-size:.7rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'
+                f'max-width:300px;display:inline-block;text-decoration:underline;text-underline-offset:2px" '
+                f'title="{title_esc}">{html.escape(short_pname, quote=False)}</a>'
+            )
+        else:
+            pname_html = (
+                f'<span style="color:#aaa;font-size:.7rem;overflow:hidden;text-overflow:ellipsis;'
+                f'white-space:nowrap;max-width:300px" title="{title_esc}">'
+                f'{html.escape(short_pname, quote=False)}</span>'
+            )
         rows.append(
             f'<div style="display:flex;justify-content:space-between;align-items:center;'
             f'padding:5px 10px;background:{bg};border:1px solid {border};border-radius:8px;'
             f'margin:2px 0;gap:8px;flex-wrap:wrap">'
             f'<div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">'
-            f'{img_html}'
+            f'{thumb_html}'
             f'<span style="font-weight:900;font-size:.8rem">{crown}</span>'
-            f'<span style="font-weight:700;color:{name_color};font-size:.75rem;white-space:nowrap">{c_store}</span>'
-            f'<span style="color:#aaa;font-size:.7rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px" title="{c_pname}">{short_pname}</span>'
-            f'{score_html}{threat_html}'
+            f'<span style="font-weight:700;color:{name_color};font-size:.75rem;white-space:nowrap">{html.escape(c_store, quote=False)}</span>'
+            f'{pname_html}'
+            f'{score_html}'
             f'</div>'
             f'<span style="font-weight:900;color:{"#ff9800" if is_leader else "#9e9eff"};font-size:.85rem;white-space:nowrap">{c_price:,.0f} ر.س</span>'
             f'</div>'
@@ -260,14 +337,11 @@ def comp_strip(all_comps, our_price=None, rank_by_threat=False, show_threat_badg
 
 def miss_card(name, price, brand, size, ptype, comp, suggested_price,
               note="", variant_html="", tester_badge="", border_color="#007bff44",
-              confidence_level="green", confidence_score=0, image_url=""):
-    """بطاقة المنتج المفقود — HTML بدون مسافات بادئة (تجنب تفسير Markdown ككتلة كود)."""
-    safe_name = _html_escape(str(name or ""))
-    safe_brand = _html_escape(str(brand or "—"))
-    safe_size = _html_escape(str(size or "—"))
-    safe_ptype = _html_escape(str(ptype or "—"))
-    safe_comp = _html_escape(str(comp or "—"))
-    safe_note = _html_escape(str(note or ""))
+              confidence_level="green", confidence_score=0, product_id="", image_url="",
+              comp_url="", title_override=""):
+    """بطاقة المنتج المفقود — image_url / comp_url اختياريان.
+    title_override: اسم عرض صريح (مثلاً من عمود آخر عندما يكون الاسم مخزناً كرابط)."""
+    # شارة الثقة
     trust_map = {
         "green":  ("trust-green",  "مؤكد"),
         "yellow": ("trust-yellow", "محتمل"),
@@ -276,32 +350,59 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
     t_cls, t_lbl = trust_map.get(confidence_level, ("trust-green", "مؤكد"))
     trust_html = f'<span class="trust-badge {t_cls}">{t_lbl}</span>' if confidence_level != "green" else ""
 
-    note_html = f'<div style="font-size:.72rem;color:#ff9800;margin-top:4px">{safe_note}</div>' if safe_note and "⚠️" in safe_note else ""
+    note_html = f'<div style="font-size:.72rem;color:#ff9800;margin-top:4px">{note}</div>' if note and "⚠️" in note else ""
 
-    u = str(image_url or "").strip()
-    img_html = ""
-    if u.lower().startswith("http"):
-        eu = _html_escape(u, quote=True)
-        img_html = (
-            f'<div class="miss-thumb"><img src="{eu}" alt="" '
-            'style="width:76px;height:76px;border-radius:10px;object-fit:cover;'
-            'border:1px solid #444466;background:#0e1628" loading="lazy" '
-            'referrerpolicy="no-referrer" onerror="this.style.display=\'none\'" /></div>'
+    # عرض المعرف فقط إن كان حقيقياً — لا تكرار اسم المنتج كـ «رمز»
+    pid_html = ""
+    _name_s = str(name).strip()
+    _pid_s = str(product_id).strip() if product_id else ""
+    if (
+        _pid_s
+        and _pid_s not in ("nan", "none", "0")
+        and _pid_s.lower() != _name_s.lower()
+        and len(_pid_s) <= 64
+    ):
+        _pid_show = html.escape(_pid_s, quote=False)
+        pid_html = (
+            f'<span style="font-size:.7rem;padding:2px 8px;border-radius:8px;'
+            f'background:#1a237e44;color:#90caf9;margin-right:6px;font-family:monospace;letter-spacing:1px">'
+            f"📌 {_pid_show}</span>&nbsp;"
         )
 
-    inner = f"""<div class="miss-card" style="border:1px solid {border_color};margin:8px 0;border-radius:10px;padding:12px;background:linear-gradient(135deg,#0a1628,#0e1a30)">
-<div style="display:flex;gap:14px;align-items:flex-start;direction:rtl;flex-wrap:wrap">
-{img_html}
-<div style="flex:1;min-width:0">
-<div class="miss-name" style="font-weight:700;color:#4fc3f7;font-size:1rem;line-height:1.35">{trust_html}{tester_badge}{safe_name}</div>
-<div class="miss-meta" style="font-size:.75rem;color:#888;margin-top:6px;line-height:1.5">🏷️ {safe_brand} &nbsp;|&nbsp; 📏 {safe_size} &nbsp;|&nbsp; 🧴 {safe_ptype} &nbsp;|&nbsp; 🏪 {safe_comp}</div>
-{variant_html}
-{note_html}
-</div>
-<div class="miss-prices" style="text-align:left;min-width:108px;flex-shrink:0">
-<div class="miss-comp-price" style="font-size:1.15rem;font-weight:900;color:#ff9800">{price:,.0f} ر.س</div>
-<div class="miss-suggested" style="font-size:.72rem;color:#4caf50;margin-top:4px">مقترح: {suggested_price:,.0f} ر.س</div>
-</div>
-</div>
-</div>"""
-    return dedent(inner).strip()
+    _ov = str(title_override or "").strip()
+    if _ov and not _ov.lower().startswith(("http://", "https://")):
+        _link_title = _ov
+    else:
+        _link_title = _miss_card_link_title(name, brand, comp, comp_url, size=size, ptype=ptype)
+    _link_title = _strip_mahally_local_prefix(_link_title)
+    _alt_name = (_link_title[:80] if _link_title else "")[:40]
+    miss_img = _lazy_img_tag(image_url, width=72, height=72, alt=_alt_name) if image_url else ""
+    miss_img_block = (
+        f'<div style="flex-shrink:0;margin-left:10px">{miss_img}</div>' if miss_img else ""
+    )
+
+    _nm_html = _linked_product_title(_link_title, comp_url, color="#4fc3f7", font_size=".95rem")
+    _br = html.escape(str(brand or "—"), quote=False)
+    _sz = html.escape(str(size or "—"), quote=False)
+    _pt = html.escape(str(ptype or "—"), quote=False)
+    _cp = html.escape(str(comp), quote=False)
+    # الرابط يبقى في عنوان المنتج القابل للنقر — بدون شريط إضافي أسفل البطاقة
+    _foot = ""
+
+    # بدون مسافات بادئة في بداية الأسطر — وإلا Markdown يعرضها كـ <pre><code>
+    return (
+        f'<div class="miss-card" style="border:1px solid {border_color}">'
+        f'<div class="miss-header">'
+        f"{miss_img_block}"
+        f'<div class="miss-info">'
+        f'<div class="miss-name">{trust_html}{tester_badge}{pid_html}{_nm_html}</div>'
+        f'<div class="miss-meta">🏷️ {_br} &nbsp;|&nbsp; 📏 {_sz} &nbsp;|&nbsp; '
+        f"🧴 {_pt} &nbsp;|&nbsp; 🏪 {_cp}</div>"
+        f"{variant_html}"
+        f"{note_html}"
+        f"</div>"
+        f'<div class="miss-prices">'
+        f'<div class="miss-comp-price">{price:,.0f} ر.س</div>'
+        f'<div class="miss-suggested">مقترح: {suggested_price:,.0f} ر.س</div>'
+        f"</div></div>{_foot}</div>"
+    )

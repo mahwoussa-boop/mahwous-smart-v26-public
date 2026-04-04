@@ -1,4 +1,4 @@
-# 🧪 مهووس v26 — نظام التسعير الذكي
+# 🧪 مهووس v19 Complete — نظام التسعير الذكي
 
 ## ✅ الميزات الكاملة
 
@@ -91,113 +91,51 @@ CompIndex:
 
 ---
 
-## 📦 هيكل المشروع (v26)
+## 📦 الملفات
 
 ```
-mahwous-smart-v26-public/
-├── app.py                  ← نقطة الدخول Streamlit + كشط/شريط جانبي
-├── config.py               ← إعدادات و SECTIONS
-├── styles.py               ← تنسيقات CSS
-├── requirements.txt
-├── .env.example            ← قالب متغيرات البيئة (انسخ إلى .env محلياً)
-│
-├── mahwous_ui/             ← صفحات الواجهة المستخرجة من app
-│   ├── pro_table.py        ← جدول المقارنة المشترك (سعر أعلى/أقل/موافق/مراجعة)
-│   ├── analysis_redistribute.py  ← إعادة توزيع يدوية (جلسة Streamlit)
-│   └── …                   ← dashboard, upload, ai_page, …
+mahwous_COMPLETE/
+├── app.py                  ← التطبيق الرئيسي (1376 سطر)
+├── config.py               ← الإعدادات
+├── styles.py               ← التنسيقات
+├── requirements.txt        ← المكتبات
+├── README.md               ← هذا الملف
 │
 ├── engines/
-│   ├── engine.py           ← تحليل ومطابقة
-│   └── ai_engine.py        ← Gemini وواجهات AI
+│   ├── engine.py           ← v21 محرك سريع (530 سطر)
+│   └── ai_engine.py        ← Gemini + Fragrantica (312 سطر)
 │
 ├── utils/
-│   ├── analysis_sections.py ← split_analysis_results (بدون Streamlit)
-│   ├── make_helper.py      ← Make.com
-│   ├── helpers.py
-│   └── db_manager.py
-│
-├── tests/                  ← unittest (استيراد صفحات، split_analysis، safe_float، SECTIONS)
-├── .github/workflows/
-│   └── ci.yml              ← CI على GitHub (Python 3.11 و 3.12)
-├── scripts/
-│   ├── verify_all.ps1      ← نفس فحوصات CI على Windows
-│   └── verify_all.sh       ← نفس فحوصات CI على Linux/macOS
+│   ├── make_helper.py      ← Make.com + "no"
+│   ├── helpers.py          ← دوال مساعدة
+│   └── db_manager.py       ← قاعدة البيانات
 │
 └── .streamlit/
-    └── config.toml
+    └── config.toml         ← تنسيق الواجهة
 ```
-
-### جودة الكود والتحقق المحلي
-
-```bash
-cd mahwous-smart-v26-public
-python -m pip install -r requirements.txt
-python -m compileall -q .
-python -m unittest discover -s tests -v
-streamlit run app.py
-```
-
-أو سكربت واحد (يطابق ما يُشغَّل في CI):
-
-```powershell
-# Windows (PowerShell)
-.\scripts\verify_all.ps1
-```
-
-```bash
-# Linux / macOS
-chmod +x scripts/verify_all.sh && ./scripts/verify_all.sh
-```
-
-**GitHub Actions:** عند الدفع إلى `main` / `master` / `develop` يُشغَّل تلقائياً: تثبيت `requirements.txt`، `compileall`، و`unittest discover`.
-
-- **`utils/analysis_sections`**: منطق تقسيم أقسام التحليل فقط؛ أي منطق يعتمد على `st.session_state` يبقى تحت **`mahwous_ui/`** (مثل `analysis_redistribute.py`).
-- **`mahwous_ui/audit_tools_page.py`** و**`audit_tools_core.py`**: واجهة ومنطق «التدقيق والتحسين» (مقارنة ذكية، مدقق متجر، SEO)؛ تُفتح من الشريط الجانبي وتعمل بجانب التطبيق الرئيسي دون الخلط مع محرك التحليل المركزي.
-
----
-
-## 📁 هيكل المستودع (للنشر على Streamlit)
-
-ضع المشروع بحيث يكون **جذر المستودع** هو مجلد يحتوي مباشرةً على:
-
-| في الجذر | الغرض |
-|----------|--------|
-| `app.py` | نقطة دخول Streamlit (إلزامي في Cloud) |
-| `requirements.txt` | تبعيات بايثون |
-| `runtime.txt` | إصدار بايثون لـ Streamlit Community Cloud (`python-3.11`) |
-| `.streamlit/config.toml` | إعدادات الواجهة والخادم |
-| `engines/`، `utils/`، `mahwous_ui/` | الكود المنظم — **لا تنسخ** ملفات بايثون منها إلى الجذر |
-| `audit_tools_core.py` | منطق التدقيق بجانب الواجهة |
-| `data/` | مراجع ثابتة مثل `brands.csv`، `categories.csv`؛ ملفات الجلسة والسجلات مُستبعدة عبر `.gitignore` |
-
-إذا كان التطبيق داخل مجلد فرعي، في Streamlit Cloud اختر **App path** يشير إلى ذلك المجلد؛ الافتراضي هنا **الجذر** مع `app.py`.
 
 ---
 
 ## 🚀 التشغيل السريع
 
-### 1️⃣ نشر Streamlit Community Cloud (GitHub)
+### 1️⃣ الرفع على Streamlit Cloud
+```bash
+# فك الضغط
+unzip mahwous_COMPLETE.zip
 
-1. ادخل [share.streamlit.io](https://share.streamlit.io) واربط مستودع GitHub.
-2. **Main file**: `app.py` (من جذر المستودع).
-3. **Branch**: `main` أو `master` (حسب فرعك).
-4. **Secrets**: من إعدادات التطبيق → *Secrets* — انسخ الحقول من `.streamlit/secrets.toml.example` (مفاتيح API، Webhooks، إلخ).
-
-بعد أول نشر، يُعاد البناء تلقائياً عند كل دفع إلى الفرع المربوط.
+# ارفع كل الملفات على:
+https://share.streamlit.io
+```
 
 ### 2️⃣ إضافة Secrets
 ```toml
-# Settings → Secrets (أو محلياً: انسخ .streamlit/secrets.toml.example إلى secrets.toml)
+# Settings → Secrets
 
-GEMINI_API_KEY = "ضع_مفتاحك_من_Google_AI_Studio"
+GEMINI_API_KEYS = '["AIzaSyD4PLzzy8GTmqtLtEhTecUKHZ7pPPhtv3s","AIzaSyCzMKz1dcEExSTUoOx-dXFAVaxlgvy1SYo","AIzaSyDQwXq-SqqGiyZzjrQIpDRDjOBr7CfCifY","AIzaSyCM_7dJ-0mq4H81CHBYAIA1MkDbj8lk7Ko"]'
 
-# أو عدة مفاتيح:
-# GEMINI_API_KEYS = '["KEY1","KEY2"]'
+WEBHOOK_UPDATE_PRICES = "https://hook.eu2.make.com/99oljy0d6r3chwg6bdfsptcf6bk8htsd"
 
-WEBHOOK_UPDATE_PRICES = "https://hook.eu2.make.com/مسار_الويب_هوك_الخاص_بك"
-
-WEBHOOK_MISSING_PRODUCTS = "https://hook.eu2.make.com/مسار_الويب_هوك_للمفقودات"
-# (اسم قديم مدعوم: WEBHOOK_NEW_PRODUCTS)
+WEBHOOK_NEW_PRODUCTS = "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
 ```
 
 ### 3️⃣ جرّب!
