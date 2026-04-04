@@ -1,36 +1,38 @@
 """
 utils/make_helper.py v24.0 — إرسال صحيح لـ Make.com
 ══════════════════════════════════════════════════════
-• WEBHOOK_UPDATE_PRICES — Integration Webhooks, Salla: 🔴 سعر أعلى / 🟢 سعر أقل / ✅ موافق عليها فقط
-  Webhook → BasicFeeder {{2.products}} → UpdateProduct
-  Payload: {"products": [{"product_id","name","price", ...}]}
+سيناريو تحديث الأسعار (Integration Webhooks, Salla):
+  Webhook → BasicFeeder يقرأ {{2.products}} → UpdateProduct
+  Payload المطلوب: {"products": [{"product_id":"...","name":"...","price":...}]}
 
-• WEBHOOK_MISSING_PRODUCTS — أتمتة التسعير (mahwous-pricing-automation-salla): قسم «مفقودة» وبطاقات المفقودات فقط
-  Payload: {"data": [{"أسم المنتج","سعر المنتج",...}]}
-  احتياط: WEBHOOK_NEW_PRODUCTS إن لم يُضبط MISSING.
+سيناريو المنتجات الجديدة (Mahwous - إضافة منتجات جديدة لسلة):
+  Webhook → BasicFeeder يقرأ {{1.data}} → CreateProduct
+  Payload المطلوب: {"data": [{"أسم المنتج":"...","سعر المنتج":...,"الوصف":"..."}]}
+
+⚠️ الإصلاح الحرج v24:
+   تحديث الأسعار → {"products": [{product_id, name, price, ...}]}
+   المنتجات الجديدة/المفقودة → {"data": [{أسم المنتج, سعر المنتج, ...}]}
 """
 
-import logging
 import requests
 import json
 import os
 import time
 from typing import List, Dict, Any, Optional
 
-_logger = logging.getLogger("mahwous.make")
 
+# ── Webhook URLs ───────────────────────────────────────────────────────────
+def _get_webhook_url(key: str, default: str) -> str:
+    return os.environ.get(key, "") or default
 
-# ── Webhook URLs (قراءة من os.environ في كل استدعاء — تُحدَّث من جلسة Streamlit في app.py) ──
-def _webhook_update_url() -> str:
-    return (os.environ.get("WEBHOOK_UPDATE_PRICES") or "").strip()
-
-
-def _webhook_missing_url() -> str:
-    """مفقودات / إضافة لسلة — ليس لتعديل أسعار الأقسام الثلاثة."""
-    u = (os.environ.get("WEBHOOK_MISSING_PRODUCTS") or "").strip()
-    if u:
-        return u
-    return (os.environ.get("WEBHOOK_NEW_PRODUCTS") or "").strip()
+WEBHOOK_UPDATE_PRICES = _get_webhook_url(
+    "WEBHOOK_UPDATE_PRICES",
+    "https://hook.eu2.make.com/8jia6gc7s1cpkeg6catlrvwck768sbfk"
+)
+WEBHOOK_NEW_PRODUCTS = _get_webhook_url(
+    "WEBHOOK_NEW_PRODUCTS",
+    "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
+)
 
 TIMEOUT = 15  # ثانية
 
@@ -67,7 +69,6 @@ def _post_to_webhook(url: str, payload: Any) -> Dict:
     except requests.exceptions.ConnectionError:
         return {"success": False, "message": "❌ فشل الاتصال بـ Make — تحقق من الإنترنت", "status_code": 0}
     except Exception as e:
-        _logger.exception("Make webhook POST failed url=%s", url[:80] if url else "")
         return {"success": False, "message": f"❌ خطأ غير متوقع: {str(e)}", "status_code": 0}
 
 
@@ -222,7 +223,7 @@ def send_single_product(product: Dict) -> Dict:
         }]
     }
 
-    result = _post_to_webhook(_webhook_update_url(), payload)
+    result = _post_to_webhook(WEBHOOK_UPDATE_PRICES, payload)
     if result["success"]:
         pid_info = f" [ID: {product_id}]" if product_id else ""
         result["message"] = f"✅ تم تحديث «{name}»{pid_info} ← {price:,.0f} ر.س"
@@ -276,7 +277,7 @@ def send_price_updates(products: List[Dict]) -> Dict:
 
     # ── Payload مطابق لما يقرأه Make: {{2.products}} ─────────────────────
     payload = {"products": valid_products}
-    result = _post_to_webhook(_webhook_update_url(), payload)
+    result = _post_to_webhook(WEBHOOK_UPDATE_PRICES, payload)
 
     if result["success"]:
         skip_msg = f" (تم تخطي {skipped})" if skipped else ""
@@ -327,7 +328,7 @@ def send_new_products(products: List[Dict]) -> Dict:
         if p.get("image_url"):
             item["صورة المنتج"] = str(p["image_url"])
 
-        result = _post_to_webhook(_webhook_missing_url(), {"data": [item]})
+        result = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, {"data": [item]})
         if result["success"]:
             sent += 1
         else:
@@ -384,7 +385,7 @@ def send_missing_products(products: List[Dict]) -> Dict:
         if p.get("image_url"):
             item["صورة المنتج"] = str(p["image_url"])
 
-        result = _post_to_webhook(_webhook_missing_url(), {"data": [item]})
+        result = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, {"data": [item]})
         if result["success"]:
             sent += 1
         else:
@@ -409,7 +410,7 @@ def send_batch_smart(products: list, batch_type: str = "update",
                      progress_cb=None, confidence_filter: str = "") -> Dict:
     """
     إرسال بدفعات ذكية مع retry تلقائي و progress callback.
-    batch_type: "update" | "auto_update" (أسعار → WEBHOOK_UPDATE_PRICES) | "new" (مفقودات → WEBHOOK_MISSING_PRODUCTS)
+    batch_type: "update" (تحديث أسعار) | "new" (منتجات جديدة/مفقودة)
     confidence_filter: "green" | "yellow" | "" (كل المستويات)
     progress_cb: callable(sent, failed, total, current_name)
     """
@@ -438,7 +439,7 @@ def send_batch_smart(products: list, batch_type: str = "update",
 
         for attempt in range(1, max_retries + 1):
             try:
-                if batch_type in ("update", "auto_update"):
+                if batch_type == "update":
                     result = send_price_updates(batch)
                 else:
                     result = send_new_products(batch)
@@ -453,10 +454,6 @@ def send_batch_smart(products: list, batch_type: str = "update",
                     fail_count += len(batch)
                     error_names.extend([p.get("name", p.get("منتج_المنافس", "?"))[:30] for p in batch])
             except Exception:
-                _logger.exception(
-                    "send_batch_smart: batch failed type=%s attempt=%s/%s",
-                    batch_type, attempt, max_retries,
-                )
                 if attempt >= max_retries:
                     fail_count += len(batch)
                     error_names.extend([p.get("name", "?")[:30] for p in batch])
@@ -469,7 +466,7 @@ def send_batch_smart(products: list, batch_type: str = "update",
                 progress_cb(sent_count, fail_count, total,
                            batch[-1].get("name", "")[:30] if batch else "")
             except Exception:
-                _logger.exception("send_batch_smart: progress_cb failed")
+                pass
 
         # تأخير بين الدفعات
         if i + batch_size < total:
@@ -500,7 +497,6 @@ def verify_webhook_connection() -> Dict:
     """
     فحص حالة الاتصال بجميع Webhooks.
     يُعيد dict: {"update_prices": {...}, "new_products": {...}, "all_connected": bool}
-    (المفتاح new_products = اختبار WEBHOOK_MISSING_PRODUCTS / المفقودات)
     """
     # فحص Webhook تحديث الأسعار — Payload المطابق للـ Parameters
     test_price_payload = {
@@ -511,7 +507,7 @@ def verify_webhook_connection() -> Dict:
             "section":    "test",
         }]
     }
-    r1 = _post_to_webhook(_webhook_update_url(), test_price_payload)
+    r1 = _post_to_webhook(WEBHOOK_UPDATE_PRICES, test_price_payload)
 
     # فحص Webhook المنتجات الجديدة
     test_new_payload = {
@@ -526,18 +522,18 @@ def verify_webhook_connection() -> Dict:
             "الوصف":          "test",
         }]
     }
-    r2 = _post_to_webhook(_webhook_missing_url(), test_new_payload)
+    r2 = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, test_new_payload)
 
     return {
         "update_prices": {
             "success": r1["success"],
             "message": r1["message"],
-            "url": (_u := _webhook_update_url())[:55] + "..." if len(_u) > 55 else _u,
+            "url": WEBHOOK_UPDATE_PRICES[:55] + "..." if len(WEBHOOK_UPDATE_PRICES) > 55 else WEBHOOK_UPDATE_PRICES,
         },
         "new_products": {
             "success": r2["success"],
             "message": r2["message"],
-            "url": (_n := _webhook_missing_url())[:55] + "..." if len(_n) > 55 else _n,
+            "url": WEBHOOK_NEW_PRODUCTS[:55] + "..." if len(WEBHOOK_NEW_PRODUCTS) > 55 else WEBHOOK_NEW_PRODUCTS,
         },
         "all_connected": r1["success"] and r2["success"],
     }
