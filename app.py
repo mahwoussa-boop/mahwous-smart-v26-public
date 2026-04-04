@@ -64,6 +64,7 @@ from styles import get_styles, stat_card, vs_card, comp_strip, miss_card, get_si
 from utils.analysis_sections import split_analysis_results
 from utils.results_io import restore_results_from_json, safe_results_for_json
 from mahwous_ui.sidebar_nav import focus_sidebar_on_analysis_results
+from mahwous_ui.results_summary import render_sidebar_results_summary
 from mahwous_ui.dashboard_page import render_dashboard_page
 from utils.api_providers_ui import api_badges_html
 from mahwous_ui.upload_page import UploadPageDeps, render_upload_page
@@ -104,10 +105,11 @@ from utils.helpers import safe_float
 from utils.make_helper import (send_price_updates, send_new_products,
                                 send_single_product,
                                 export_to_make_format)
+from utils.session_restore import maybe_auto_restore_last_job
 from utils.db_manager import (init_db, log_event, log_decision,
                                log_analysis, upsert_price_history,
                                get_price_history,
-                               save_job_progress, get_job_progress, get_last_job,
+                               save_job_progress, get_job_progress,
                                save_hidden_product, get_hidden_product_keys,
                                init_db_v26, upsert_our_catalog, upsert_comp_catalog,
                                merged_comp_dfs_for_analysis, load_all_comp_catalog_as_comp_dfs,
@@ -393,26 +395,7 @@ if os.path.isfile(_LIVE_SNAP_PATH):
     except Exception:
         pass
 
-if st.session_state.results is None and not st.session_state.job_running and not _skip_last_job:
-    _auto_job = get_last_job()
-    if _auto_job and _auto_job["status"] == "done" and _auto_job.get("results"):
-        _auto_records = restore_results_from_json(_auto_job["results"])
-        _auto_df = pd.DataFrame(_auto_records)
-        if not _auto_df.empty:
-            _auto_miss = pd.DataFrame(_auto_job.get("missing", [])) if _auto_job.get("missing") else pd.DataFrame()
-            _auto_r = split_analysis_results(_auto_df)
-            _auto_r["missing"] = _auto_miss
-            st.session_state.results     = _auto_r
-            st.session_state.analysis_df = _auto_df
-            st.session_state.job_id      = _auto_job.get("job_id")
-            try:
-                _cdf_all = load_all_comp_catalog_as_comp_dfs()
-                if _cdf_all:
-                    st.session_state.comp_dfs = _cdf_all
-            except Exception:
-                _logger.exception(
-                    "restore comp_dfs from load_all_comp_catalog_as_comp_dfs failed"
-                )
+maybe_auto_restore_last_job(skip_due_to_live_scrape=_skip_last_job)
 
 
 # ── دوال مساعدة ───────────────────────────
@@ -1828,28 +1811,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    if st.session_state.results:
-        r = st.session_state.results
-        st.markdown("**📊 ملخص:**")
-        for key, icon, label in [
-            ("price_raise","🔴","أعلى"), ("price_lower","🟢","أقل"),
-            ("approved","✅","موافق"), ("missing","🔍","مفقود"),
-            ("review","⚠️","مراجعة")
-        ]:
-            cnt = len(r.get(key, pd.DataFrame()))
-            st.caption(f"{icon} {label}: **{cnt}**")
-        # ملخص الثقة للمفقودات
-        _miss_df = r.get("missing", pd.DataFrame())
-        if not _miss_df.empty and "مستوى_الثقة" in _miss_df.columns:
-            _gc = len(_miss_df[_miss_df["مستوى_الثقة"] == "green"])
-            _yc = len(_miss_df[_miss_df["مستوى_الثقة"] == "yellow"])
-            _rc = len(_miss_df[_miss_df["مستوى_الثقة"] == "red"])
-            st.markdown(
-                f'<div style="background:#1a1a2e;border-radius:6px;padding:6px;margin-top:4px;font-size:.75rem">'
-                f'🟢 مؤكد: <b>{_gc}</b> &nbsp; '
-                f'🟡 محتمل: <b>{_yc}</b> &nbsp; '
-                f'🔴 مشكوك: <b>{_rc}</b></div>',
-                unsafe_allow_html=True)
+    render_sidebar_results_summary()
 
     # قرارات معلقة
     pending_cnt = len(st.session_state.decisions_pending)

@@ -727,6 +727,8 @@ def load_comp_catalog_grouped(exclude_competitors: set[str] | None = None) -> di
     by: dict[str, list] = {}
     for tup in rows:
         competitor, product_name, price = tup[0], tup[1], tup[2]
+        # مفتاح فارغ في SQLite يجعل كل الصفوف تحت "" فيُفقد عمود «المنافس» في الواجهة
+        competitor = str(competitor or "").strip() or "Scraped_Competitor"
         img_v = str(tup[3] or "") if len(tup) > 3 else ""
         pid_v = str(tup[4] or "") if len(tup) > 4 else ""
         try:
